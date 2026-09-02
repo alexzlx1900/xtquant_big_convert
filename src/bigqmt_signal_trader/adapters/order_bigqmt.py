@@ -52,6 +52,16 @@ CREDIT_OPTYPE_BY_ORDER_TYPE = {
     _XC.CREDIT_DIRECT_CASH_REPAY_SPECIAL: 75,  # 专项直接还款
 }
 
+ORDER_TYPE_BY_CREDIT_OPTYPE = dict(
+    (op_type, order_type)
+    for order_type, op_type in CREDIT_OPTYPE_BY_ORDER_TYPE.items()
+)
+ORDER_TYPE_BY_OPTYPE = dict(ORDER_TYPE_BY_CREDIT_OPTYPE)
+ORDER_TYPE_BY_OPTYPE.update({
+    23: _XC.STOCK_BUY,
+    24: _XC.STOCK_SELL,
+})
+
 # Which side of the book each one is, for bookkeeping only -- the opType above
 # is what actually goes to passorder. Repayment operations that move securities
 # are classified by what they do to the holding.
@@ -88,6 +98,14 @@ def credit_optype_of(order_type):
     """passorder opType for a MiniQMT credit order_type, or None."""
     try:
         return CREDIT_OPTYPE_BY_ORDER_TYPE.get(int(order_type))
+    except (TypeError, ValueError):
+        return None
+
+
+def order_type_of_optype(op_type):
+    """Translate passorder opType back to the MiniQMT order_type contract."""
+    try:
+        return ORDER_TYPE_BY_OPTYPE.get(int(op_type))
     except (TypeError, ValueError):
         return None
 
@@ -297,6 +315,7 @@ class BigQmtOrderGateway:
             except Exception as exc:
                 skip_unparsable_row("ORDER", row, exc)
                 continue
+            op_type = _attr(row, ("m_nOpType", "op_type", "order_type"))
             result.append(
                 OrderSnapshot(
                     order_sys_id=str(_attr(row, ("m_strOrderSysID", "order_sys_id"), "") or ""),
@@ -315,6 +334,8 @@ class BigQmtOrderGateway:
                     traded_price=float(
                         _attr(row, ("m_dTradedPrice", "traded_price", "avg_traded_price"), 0.0) or 0.0
                     ),
+                    op_type=op_type,
+                    order_type=order_type_of_optype(op_type),
                 )
             )
         return result

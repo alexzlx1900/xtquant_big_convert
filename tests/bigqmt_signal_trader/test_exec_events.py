@@ -10,6 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.exec_events import (
+    date_time_seconds,
     enrich_order_identity,
     format_raw_snapshot,
     normalize_cancel_error_event,
@@ -179,6 +180,14 @@ class RecordingCallback(XtQuantTraderCallback):
 
 
 class ExecEventsServerTest(unittest.TestCase):
+    def test_date_time_seconds_left_pads_live_five_digit_morning_times(self):
+        for raw_time, expected_text in (
+            ("93042", "20260902093042"),
+            ("93405", "20260902093405"),
+        ):
+            expected = int(time.mktime(time.strptime(expected_text, "%Y%m%d%H%M%S")))
+            self.assertEqual(date_time_seconds("20260902", raw_time), expected)
+
     def test_normalize_trade_event_maps_thinktrader_fields(self):
         ev = normalize_trade_event(FakeDeal(), "acct")
 

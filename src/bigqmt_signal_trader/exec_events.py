@@ -150,7 +150,10 @@ def date_time_seconds(raw_date, raw_time):
         date_digits, time_digits = time_digits[:8], time_digits[8:14]
     if not date_digits or len(date_digits) < 8:
         return 0
-    time_digits = (time_digits + "000000")[:6]  # pad to HHMMSS, drop ms
+    # QMT may omit the leading zero before 10:00 (for example 09:30:42 is
+    # returned as "93042"). Right-padding turns that into the invalid
+    # 93:04:20; short clock values must be left-padded instead.
+    time_digits = time_digits.zfill(6) if len(time_digits) < 6 else time_digits[:6]
     try:
         parsed = time.strptime(date_digits[:8] + time_digits, "%Y%m%d%H%M%S")
         return int(time.mktime(parsed))

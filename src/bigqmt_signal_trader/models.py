@@ -371,6 +371,8 @@ class OrderSnapshot:
         status_msg="",
         traded_price=0.0,
         price_type=None,
+        op_type=None,
+        order_type=None,
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -392,6 +394,10 @@ class OrderSnapshot:
         self.status_msg = status_msg
         # 完整 QMT 的不同版本可能不提供 price_type；追加在末尾保持旧位置参数兼容。
         self.price_type = price_type
+        # passorder 的原始 opType 与 MiniQMT order_type 在普通股票上同为
+        # 23/24，但专项两融使用不同编号；两者必须分别保留。
+        self.op_type = op_type
+        self.order_type = order_type
 
 
 class TradeSnapshot:

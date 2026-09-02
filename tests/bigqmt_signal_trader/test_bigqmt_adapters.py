@@ -7,9 +7,14 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
+from xtquant import xtconstant as _xtconstant
+
 from bigqmt_signal_trader.adapter_factory import build_app
 from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
-from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway
+from bigqmt_signal_trader.adapters.order_bigqmt import (
+    BigQmtOrderGateway,
+    order_type_of_optype,
+)
 from bigqmt_signal_trader.adapters.position_bigqmt import BigQmtPositionProvider
 from bigqmt_signal_trader.adapters.position_bigqmt import _full_code
 from bigqmt_signal_trader.models import OrderRef, OrderRequest
@@ -324,6 +329,7 @@ class BigQmtAdaptersTest(unittest.TestCase):
                     m_strInstrumentID="000001",
                     m_strExchangeID="SZ",
                     m_nOffsetFlag=49,
+                    m_nOpType=24,
                     m_nVolumeTotalOriginal=1000,
                     m_nVolumeTraded=200,
                     m_nOrderStatus=50,
@@ -352,6 +358,49 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(orders[0].price, 10.12)
         self.assertEqual(orders[0].price_type, 44)
         self.assertEqual(orders[0].traded_price, 10.05)
+        self.assertEqual(orders[0].op_type, 24)
+        self.assertEqual(orders[0].order_type, 24)
+
+    def test_query_orders_preserves_plain_stock_order_types(self):
+        def fake_query(*_args):
+            return [
+                Obj(
+                    m_strOrderSysID="buy-1",
+                    m_strInstrumentID="600000",
+                    m_strExchangeID="SH",
+                    m_nOffsetFlag=48,
+                    m_nOpType=23,
+                    m_nVolumeTotalOriginal=100,
+                    m_nVolumeTraded=0,
+                    m_nOrderStatus=50,
+                ),
+                Obj(
+                    m_strOrderSysID="sell-1",
+                    m_strInstrumentID="000001",
+                    m_strExchangeID="SZ",
+                    m_nOffsetFlag=49,
+                    m_nOpType=24,
+                    m_nVolumeTotalOriginal=100,
+                    m_nVolumeTraded=0,
+                    m_nOrderStatus=50,
+                ),
+            ]
+
+        orders = BigQmtOrderGateway(
+            context_info=object(),
+            get_trade_detail_data_func=fake_query,
+        ).query_orders_strict("acct", "")
+
+        self.assertEqual(
+            [(order.action, order.op_type, order.order_type) for order in orders],
+            [("BUY", 23, 23), ("SELL", 24, 24)],
+        )
+
+    def test_special_credit_optype_translates_back_to_miniqmt_order_type(self):
+        self.assertEqual(
+            order_type_of_optype(70),
+            _xtconstant.CREDIT_FIN_BUY_SPECIAL,
+        )
 
     def test_query_orders_optional_price_fields_keep_old_qmt_compatible(self):
         """旧 QMT 不返回可选价格字段时保持 None。"""
@@ -361,6 +410,8 @@ class BigQmtAdaptersTest(unittest.TestCase):
         order = BigQmtOrderGateway(context_info=object(), get_trade_detail_data_func=fake_query).query_orders_strict("acct", "")[0]
 
         self.assertIsNone(order.price_type)
+        self.assertIsNone(order.op_type)
+        self.assertIsNone(order.order_type)
         self.assertEqual(order.traded_price, 0.0)
 
     def test_query_trades_without_strategy_omits_strategy_filter(self):

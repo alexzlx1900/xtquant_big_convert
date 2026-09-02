@@ -349,6 +349,8 @@ class QueryPathSerializationContractTest(unittest.TestCase):
             order_time=1755655200,
             traded_price=10.05,
             price_type=11,
+            op_type=24,
+            order_type=24,
         )
         item = to_jsonable(snapshot)
         order = self._trader()._order_from_dict("acct", item)
@@ -359,6 +361,7 @@ class QueryPathSerializationContractTest(unittest.TestCase):
         self.assertEqual(order.strategy_name, "strat-a")
         self.assertEqual(order.order_remark, "rmk-9")
         self.assertEqual(order.price_type, 11)
+        self.assertEqual(order.order_type, 24)
 
 
     def test_query_trade_snapshot_with_official_fields_reaches_client(self):
