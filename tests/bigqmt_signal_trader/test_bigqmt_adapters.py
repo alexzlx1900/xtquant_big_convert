@@ -396,6 +396,66 @@ class BigQmtAdaptersTest(unittest.TestCase):
             [("BUY", 23, 23), ("SELL", 24, 24)],
         )
 
+    def test_query_orders_recovers_stock_order_type_from_invalid_optype_sentinel(self):
+        def fake_query(*_args):
+            return [
+                Obj(
+                    m_strOrderSysID="buy-sentinel",
+                    m_strInstrumentID="600000",
+                    m_strExchangeID="SH",
+                    m_nOffsetFlag=48,
+                    m_nOpType=2147483647,
+                    m_nVolumeTotalOriginal=100,
+                    m_nVolumeTraded=100,
+                    m_nOrderStatus=56,
+                ),
+                Obj(
+                    m_strOrderSysID="sell-sentinel",
+                    m_strInstrumentID="000001",
+                    m_strExchangeID="SZ",
+                    m_nOffsetFlag=49,
+                    m_nOpType=2147483647,
+                    m_nVolumeTotalOriginal=100,
+                    m_nVolumeTraded=0,
+                    m_nOrderStatus=50,
+                ),
+            ]
+
+        orders = BigQmtOrderGateway(
+            context_info=object(),
+            account_type="STOCK",
+            get_trade_detail_data_func=fake_query,
+        ).query_orders_strict("acct", "")
+
+        self.assertEqual(
+            [(order.action, order.op_type, order.order_type) for order in orders],
+            [("BUY", 2147483647, 23), ("SELL", 2147483647, 24)],
+        )
+
+    def test_query_orders_keeps_invalid_optype_unknown_for_non_stock_account(self):
+        def fake_query(*_args):
+            return [
+                Obj(
+                    m_strOrderSysID="credit-sentinel",
+                    m_strInstrumentID="600000",
+                    m_strExchangeID="SH",
+                    m_nOffsetFlag=48,
+                    m_nOpType=2147483647,
+                    m_nVolumeTotalOriginal=100,
+                    m_nVolumeTraded=0,
+                    m_nOrderStatus=50,
+                )
+            ]
+
+        order = BigQmtOrderGateway(
+            context_info=object(),
+            account_type="CREDIT",
+            get_trade_detail_data_func=fake_query,
+        ).query_orders_strict("acct", "")[0]
+
+        self.assertEqual(order.op_type, 2147483647)
+        self.assertIsNone(order.order_type)
+
     def test_special_credit_optype_translates_back_to_miniqmt_order_type(self):
         self.assertEqual(
             order_type_of_optype(70),

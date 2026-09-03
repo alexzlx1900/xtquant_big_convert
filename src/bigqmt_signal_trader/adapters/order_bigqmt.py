@@ -110,6 +110,31 @@ def order_type_of_optype(op_type):
         return None
 
 
+def _query_order_type(account_type, op_type, action):
+    """Return MiniQMT order_type for a queried Big QMT order.
+
+    The live stock-account ORDER object can expose ``m_nOpType`` as the C-int
+    sentinel 2147483647 even though ``m_nOffsetFlag`` still carries a verified
+    BUY/SELL direction. Only that exact stock-account case is losslessly
+    recoverable. Missing values and non-stock accounts stay unknown so credit,
+    futures and option operations are never collapsed to plain stock trades.
+    """
+    mapped = order_type_of_optype(op_type)
+    if mapped is not None:
+        return mapped
+    try:
+        invalid_sentinel = int(op_type) == 2147483647
+    except (TypeError, ValueError):
+        invalid_sentinel = False
+    if not invalid_sentinel or str(account_type or "").upper() != "STOCK":
+        return None
+    if action == SignalAction.BUY.value:
+        return _XC.STOCK_BUY
+    if action == SignalAction.SELL.value:
+        return _XC.STOCK_SELL
+    return None
+
+
 def _action_from_offset_flag(offset_flag):
     return SignalAction.BUY.value if int(offset_flag or 0) == 48 else SignalAction.SELL.value
 
@@ -316,12 +341,13 @@ class BigQmtOrderGateway:
                 skip_unparsable_row("ORDER", row, exc)
                 continue
             op_type = _attr(row, ("m_nOpType", "op_type", "order_type"))
+            action = _action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0))
             result.append(
                 OrderSnapshot(
                     order_sys_id=str(_attr(row, ("m_strOrderSysID", "order_sys_id"), "") or ""),
                     user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
                     stock_code=stock_code,
-                    action=_action_from_offset_flag(_attr(row, ("m_nOffsetFlag", "offset_flag"), 0)),
+                    action=action,
                     volume=int(_attr(row, ("m_nVolumeTotalOriginal", "volume"), 0) or 0),
                     traded_volume=int(_attr(row, ("m_nVolumeTraded", "traded_volume"), 0) or 0),
                     status=str(_attr(row, ("m_nOrderStatus", "status"), "") or ""),
@@ -335,7 +361,7 @@ class BigQmtOrderGateway:
                         _attr(row, ("m_dTradedPrice", "traded_price", "avg_traded_price"), 0.0) or 0.0
                     ),
                     op_type=op_type,
-                    order_type=order_type_of_optype(op_type),
+                    order_type=_query_order_type(self.account_type, op_type, action),
                 )
             )
         return result

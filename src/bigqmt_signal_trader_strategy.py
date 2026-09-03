@@ -1117,14 +1117,17 @@ def adjust(ContextInfo, _source="timer"):
 
 
 def handlebar(ContextInfo):
-    """Standard Big QMT bar callback.
+    """Use the bar callback only as a fallback when no timer was scheduled.
 
-    Documented as tick-driven during live trading ("再在每个tick数据来后驱动运行
-    一次"), but the observed cadence is a flat ~50/10s -- the run_time timer
-    alone. Tagging the source tells us whether this ever fires once the
-    historical replay ends; the strategy subscribes to no quote, which is the
-    leading suspect.
+    Some broker QMT builds invoke ``handlebar`` hundreds of times per second
+    even after ``run_time("adjust", ...)`` is active. Running the full app from
+    both sources floods Redis with duplicate position snapshots and can starve
+    RPC responses. Once the timer is registered it is the sole full-adjust
+    driver; if scheduling is unavailable or fails, ``handlebar`` retains the
+    original fallback behavior.
     """
+    if _scheduled_adjust:
+        return None
     return adjust(ContextInfo, _source="handlebar")
 
 

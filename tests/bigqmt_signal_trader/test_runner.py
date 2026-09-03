@@ -109,6 +109,16 @@ class BigQmtStrategyRunnerTest(unittest.TestCase):
         self.assertEqual(len(self.app.ticks), 1)
         self.assertIsInstance(self.app.ticks[0], datetime.datetime)
 
+    def test_handlebar_skips_duplicate_tick_when_adjust_timer_is_scheduled(self):
+        strategy_module.init(FakeContext())
+        strategy_module._scheduled_adjust = True
+
+        strategy_module.handlebar(FakeContext())
+
+        self.assertEqual(self.app.ticks, [])
+        strategy_module.adjust(FakeContext())
+        self.assertEqual(len(self.app.ticks), 1)
+
     def test_adjust_skips_history_bars_when_bigqmt_exposes_is_last_bar(self):
         strategy_module.init(FakeContext())
 

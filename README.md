@@ -834,6 +834,21 @@ cd xtquant_big_convert
 pip install -e .
 ```
 
+如果客户端 Python 环境已经安装券商官方 MiniQMT `xtquant`，不要直接安装上面的
+完整包：完整包的顶层 `xtquant` shim 会与券商原生包占用相同模块路径。应构建并
+安装不含 shim 的 Gateway client-only wheel：
+
+```powershell
+python tools/build_gateway_client_wheel.py --source-ref HEAD --output-dir dist/gateway-client
+$wheel = Get-ChildItem dist/gateway-client/xtquant_big_convert_client-*.whl | Select-Object -First 1
+python -m pip install ($wheel.FullName + "[redis]")
+```
+
+构建器只从 `--source-ref` 指定的 Git 提交读取 `src/bigqmt_signal_trader`，不会混入
+该目录的工作区未提交改动，并在输出前验证 wheel 不包含任何 `xtquant/` 文件。该制品仍通过
+`bigqmt_signal_trader.xtquant_compat` 调用大 QMT RPC，同时复用环境中已有的券商
+原生 `xtquant.xtconstant` 和 `xtquant.xttype`。
+
 安装后可直接 import：
 
 ```python
