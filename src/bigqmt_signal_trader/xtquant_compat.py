@@ -3841,6 +3841,10 @@ class BigQmtXtTrader:
         if not amount:
             # 服务端未取到金额（缺失或 0）时按 价格 * 数量 估算，保证盈亏统计不为 0。
             amount = traded_price * traded_volume
+        broker_time = _to_unix_seconds(item.get("traded_time"))
+        if not 1_000_000_000 < broker_time < 10_000_000_000:
+            broker_time = 0
+        received_time = _to_unix_seconds(item.get("created_at_ts"))
         return CompatObject(
             account_id=account_id,
             stock_code=_full_a_share_code(item.get("stock_code")),
@@ -3859,6 +3863,9 @@ class BigQmtXtTrader:
             ),
             traded_amount=_safe_float(amount, 0.0),
             traded_at=str(item.get("traded_at") or ""),
+            broker_trade_time=broker_time,
+            report_received_at=received_time,
+            trade_time_source=("broker" if broker_time else "callback_received_at" if received_time else "unknown"),
             strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("user_order_id") or item.get("remark") or ""),
         )

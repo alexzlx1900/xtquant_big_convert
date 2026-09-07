@@ -282,7 +282,19 @@
 | `get_last_order_id` | `account_id`(可选) | 最近委托号 |
 | `get_ipo_data` | `account_id`(可选) | 新股数据 |
 | `get_new_purchase_limit` | `account_id`(可选) | 新股申购额度 |
-| `get_history_trade_detail_data` | `account_id`(可选) `detail_type`("DEAL"/"ORDER") `start_date` `end_date` | 历史成交明细 |
+| `get_history_trade_detail_data` | `account_id`(可选) `detail_type`("DEAL"/"ORDER"/"POSITION") `start_date` `end_date` | 历史日期分组成交/委托/持仓明细 |
+
+历史查询必须明确给出 `YYYYMMDD` 起止日期，且起日不晚于止日。服务端调用原生接口时按
+`account_id, account_type, detail_type, start_date, end_date` 传参，其中账户类型取实际配置。
+返回结构为 `[{"timetag": "20260904", "records": [{...}]}]`，保留原生日分组；接口缺失、
+异常、`None` 或未知分组结构均显式报错，不转换成“无历史记录”。
+
+2026-09-07 故障修复补充：RPC 启动入口透传 `BIGQMT_REDIS_CONFIG["position_publish_events"]`。
+设为 `False` 时继续更新 `bigqmt:positions:{account_id}` 最新缓存，但停止追加高频持仓事件流；
+订单和成交事件不受此开关影响。此配置用于隔离已知 Memurai Stream 崩溃触发路径，不代表底层缺陷已修复。
+客户端成交对象增加 `trade_time_source`、`broker_trade_time`、`report_received_at`，缺少真实成交时间
+时明确标记 `unknown` 或 `callback_received_at`，不得将旧兼容字段的回退时间直接作为入账日期。
+以上为本地修复，Windows 部署状态需单独验收。
 | `get_assure_contract` | `account_id`(可选) | 融资标的（担保品）合约 |
 | `get_enable_short_contract` | `account_id`(可选) | 融券标的合约 |
 | `get_unclosed_compacts` | `account_id`(可选) | 未平仓合约（负债）|

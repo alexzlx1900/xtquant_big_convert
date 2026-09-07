@@ -260,6 +260,7 @@ def _apply_config(account_id):
             "password": REDIS_PASSWORD,
             "position_key_template": "bigqmt:positions:{account_id}",
             "position_event_stream_template": "bigqmt:position_events:{account_id}",
+            "position_publish_events": BIGQMT_REDIS_CONFIG.get("position_publish_events", True),
         },
         rpc={
             "enabled": True,

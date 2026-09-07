@@ -986,12 +986,33 @@ class BigQmtRpcHandlers:
 
     def _handle_get_history_trade_detail_data(self, params):
         account_id = self._request_account_id(params)
-        detail_type = str(params.get("detail_type") or params.get("datatype") or "DEAL")
+        detail_type = str(params.get("detail_type") or params.get("datatype") or "DEAL").upper()
         start_date = str(params.get("start_date") or params.get("start_time") or "")
         end_date = str(params.get("end_date") or params.get("end_time") or "")
-        result = self._call_qmt_global(
-            "get_history_trade_detail_data", account_id, detail_type, start_date, end_date
-        )
+        if detail_type not in ("ORDER", "DEAL", "POSITION"):
+            raise ValueError("Unsupported historical detail_type: %s" % detail_type)
+        for value in (start_date, end_date):
+            if len(value) != 8 or not value.isdigit():
+                raise ValueError("Historical query requires explicit YYYYMMDD dates")
+            _dt.datetime.strptime(value, "%Y%m%d")
+        if start_date > end_date:
+            raise ValueError("Historical start_date must not exceed end_date")
+        func = self.qmt_api.get("get_history_trade_detail_data")
+        if not callable(func):
+            raise RuntimeError("QMT historical trade query is unavailable")
+        # Native result is [(timetag, [row, ...]), ...], not a flat row list.
+        # Do not hide missing permissions or signature errors as empty history.
+        groups = func(account_id, self._configured_account_type(), detail_type, start_date, end_date)
+        if groups is None:
+            raise RuntimeError("QMT historical trade query returned no result")
+        result = []
+        for group in groups:
+            if not isinstance(group, (tuple, list)) or len(group) != 2:
+                raise ValueError("Unexpected QMT historical date-group format")
+            timetag, rows = group
+            if not isinstance(rows, (tuple, list)):
+                raise ValueError("Unexpected QMT historical records format")
+            result.append({"timetag": str(timetag), "records": _normalize_detail_rows(rows)})
         return result
 
     def _handle_get_assure_contract(self, params):

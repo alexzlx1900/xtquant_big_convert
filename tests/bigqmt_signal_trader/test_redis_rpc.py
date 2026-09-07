@@ -3,6 +3,7 @@ import time
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -100,6 +101,50 @@ class CreditCompactQueryTest(unittest.TestCase):
                 ("acct", "CREDIT"),
             ],
         )
+
+
+class HistoricalDetailQueryTest(unittest.TestCase):
+    def handlers(self, query):
+        gateway = DryRunOrderGateway()
+        gateway.account_type = "STOCK"
+        return BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            qmt_api={"get_history_trade_detail_data": query} if query else {},
+        )
+
+    def test_history_preserves_dates_and_passes_all_five_native_arguments(self):
+        calls = []
+
+        def query(*args):
+            calls.append(args)
+            return [("20260904", [SimpleNamespace(m_strOrderSysID="9130", m_nOrderStatus=56)]),
+                    ("20260905", [])]
+
+        result = self.handlers(query)._handle_get_history_trade_detail_data(
+            {"detail_type": "ORDER", "start_date": "20260904", "end_date": "20260905"})
+        self.assertEqual(calls, [("acct", "STOCK", "ORDER", "20260904", "20260905")])
+        self.assertEqual(result[0]["records"][0]["m_strOrderSysID"], "9130")
+        self.assertEqual(result[1], {"timetag": "20260905", "records": []})
+
+    def test_unavailable_and_native_errors_are_not_empty_history(self):
+        params = {"start_date": "20260904", "end_date": "20260904"}
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            self.handlers(None)._handle_get_history_trade_detail_data(params)
+
+        def denied(*args):
+            raise RuntimeError("permission denied")
+
+        with self.assertRaisesRegex(RuntimeError, "permission denied"):
+            self.handlers(denied)._handle_get_history_trade_detail_data(params)
+        self.assertEqual(self.handlers(lambda *args: [])._handle_get_history_trade_detail_data(params), [])
+
+    def test_missing_dates_and_malformed_groups_fail(self):
+        with self.assertRaises(ValueError):
+            self.handlers(lambda *args: [])._handle_get_history_trade_detail_data({})
+        with self.assertRaisesRegex(ValueError, "date-group"):
+            self.handlers(lambda *args: [{}])._handle_get_history_trade_detail_data(
+                {"start_date": "20260904", "end_date": "20260904"})
 
 
 def _service(allow_order_methods=False, process_in_listener=False):
