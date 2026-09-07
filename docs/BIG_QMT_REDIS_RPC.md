@@ -26,6 +26,19 @@
 
 ## MiniQMT 兼容方法名
 
+### 2026-09-07：分钟历史查询填充参数修复
+
+实机 `C:\国金证券QMT交易端\python\_PyContextInfo.py` 中，`get_market_data_ex` 与
+`get_market_data_ex_ori` 均支持 `fill_data`，默认值为 `True`。
+此前适配器优先调用的 BigQMT 关键字参数形态遗漏该字段，导致调用方传入 `False` 仍启用默认填充。
+修复将该值传入所有扩展接口调用形态；显式要求不填充时，不降级到无法表达该参数的旧接口。
+
+9 月 4 日迁移 Shadow 的 691 股中，17 股出现全天固定价格、零成交，而 MiniQMT 同日有交易；
+上述参数丢失已由部署文件和实机 API 定义确认，但其对具体异常股票的影响仍需同路由样本验证。
+公式服务器和策略 RPC 是不同读取路径，预检必须使用与生产 Gateway 一致的 `use_formula=False`。
+本次本地针对性测试 38 项通过；修复尚未部署，不能声称正式数据已修好。
+本次晚间诊断的策略 RPC 安全心跳超时，Redis 本身可连接，真实样本验证等待通道恢复。
+
 RPC 服务端会把以下 MiniQMT 常用方法名映射到大 QMT 适配器：
 
 | MiniQMT 方法名 | RPC 内部方法 | 说明 |
@@ -407,4 +420,3 @@ python -B -m unittest discover -s tests\bigqmt_signal_trader
 Ran 68 tests
 OK
 ```
-

@@ -23,6 +23,7 @@ class RawMarketContext:
         end_time="",
         count=-1,
         dividend_type="none",
+        fill_data=True,
     ):
         self.calls.append(
             {
@@ -33,6 +34,7 @@ class RawMarketContext:
                 "end_time": end_time,
                 "count": count,
                 "dividend_type": dividend_type,
+                "fill_data": fill_data,
             }
         )
         return self.payload
@@ -42,6 +44,25 @@ class RawMarketContext:
 
 
 class BigQmtRawMarketBridgeTest(unittest.TestCase):
+    def test_raw_market_data_preserves_explicit_no_fill(self):
+        context = RawMarketContext()
+        provider = BigQmtMarketDataProvider(context)
+        provider.get_market_data_ex(
+            field_list=["close"], stock_list=["002144.SZ"],
+            period="1m", start_time="20260904093000",
+            end_time="20260904150100", fill_data=False,
+        )
+        self.assertIs(False, context.calls[0]["fill_data"])
+
+    def test_market_data_shapes_never_drop_extended_fill_flag(self):
+        provider = BigQmtMarketDataProvider(RawMarketContext())
+        for name in ("get_market_data_ex", "get_market_data_ex_ori"):
+            for _, args, kwargs in provider._market_data_shapes(name, fill_data=False):
+                if len(args) == 8:
+                    self.assertIs(False, args[7])
+                else:
+                    self.assertIs(False, kwargs["fill_data"])
+
     def test_market_data_ex_uses_raw_context_api(self):
         rows = [[1784014200000, 55.1], [1784014260000, 55.2]]
         context = RawMarketContext({"600276.SH": rows})

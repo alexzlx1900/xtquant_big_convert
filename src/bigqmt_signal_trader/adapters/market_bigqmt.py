@@ -413,6 +413,14 @@ class BigQmtMarketDataProvider:
             "count": count,
             "dividend_type": dividend_type,
         }
+        # ContextInfo's extended APIs default to fill_data=True. Preserve the
+        # caller's explicit False, including the raw API used by this bridge.
+        extended_kwargs = (
+            {"fill_data": fill_data}
+            if method_name in ("get_market_data_ex", "get_market_data_ex_ori")
+            else {}
+        )
+        big_kwargs.update(extended_kwargs)
         if method_name == "get_local_data" and data_dir is not None:
             mini_kwargs["data_dir"] = data_dir
             big_kwargs["data_dir"] = data_dir
@@ -423,6 +431,7 @@ class BigQmtMarketDataProvider:
             "count": count,
             "dividend_type": dividend_type,
         }
+        positional_tail_kwargs.update(extended_kwargs)
         if method_name == "get_local_data" and data_dir is not None:
             positional_tail_kwargs["data_dir"] = data_dir
 
@@ -445,6 +454,7 @@ class BigQmtMarketDataProvider:
                     "end_time": end_time,
                     "count": count,
                     "dividend_type": dividend_type,
+                    **extended_kwargs,
                 },
             ),
             (
@@ -652,7 +662,7 @@ class BigQmtMarketDataProvider:
                 kwargs.get("stock_list") or kwargs.get("stock_code"),
             )
         shapes = self._market_data_shapes("get_market_data_ex", **kwargs)
-        if hasattr(self.context_info, "get_market_data"):
+        if hasattr(self.context_info, "get_market_data") and kwargs.get("fill_data") is not False:
             shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
         return self._call_first_supported(shapes)
 

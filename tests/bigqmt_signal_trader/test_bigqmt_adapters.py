@@ -53,6 +53,7 @@ class FakeMarketDataContext(FakeContext):
         end_time="",
         count=-1,
         dividend_type="none",
+        fill_data=True,
     ):
         self.market_calls.append(
             {
@@ -64,6 +65,7 @@ class FakeMarketDataContext(FakeContext):
                 "end_time": end_time,
                 "count": count,
                 "dividend_type": dividend_type,
+                "fill_data": fill_data,
             }
         )
         return {"600000.SH": {"close": [10.0]}}
@@ -237,6 +239,9 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(context.market_calls[0]["fields"], ["close"])
         self.assertEqual(context.market_calls[0]["stock_code"], ["600000.SH"])
         self.assertEqual(context.market_calls[0]["count"], 1)
+        self.assertIs(True, context.market_calls[0]["fill_data"])
+        provider.get_market_data_ex(field_list=["close"], stock_list=["600000.SH"], fill_data=False)
+        self.assertIs(False, context.market_calls[1]["fill_data"])
 
     def test_market_provider_falls_back_to_market_data_when_ex_is_missing(self):
         context = FakeMarketDataFallbackContext()
@@ -248,6 +253,14 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(data["fields"], ["close"])
         self.assertEqual(data["stock_code"], ["600000.SH"])
         self.assertEqual(data["period"], "1m")
+
+    def test_market_provider_does_not_drop_no_fill_for_legacy_fallback(self):
+        provider = BigQmtMarketDataProvider(FakeMarketDataFallbackContext())
+        with self.assertRaises(NotImplementedError):
+            provider.get_market_data_ex(
+                field_list=["close"], stock_list=["600000.SH"],
+                period="1m", fill_data=False,
+            )
 
     def test_position_provider_maps_qmt_position_objects(self):
         calls = []
