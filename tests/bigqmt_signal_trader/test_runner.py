@@ -102,6 +102,20 @@ class BigQmtStrategyRunnerTest(unittest.TestCase):
         self.assertEqual(len(self.app.ticks), 1)
         self.assertIsInstance(self.app.ticks[0], datetime.datetime)
 
+    def test_rpc_only_adjust_keeps_drain_without_periodic_app_sync(self):
+        strategy_module.configure(run_app_tick=False)
+        try:
+            strategy_module.init(FakeContext())
+            service = FakeRpcService()
+            with mock.patch.object(strategy_module, "_rpc_service", service):
+                strategy_module.adjust(FakeContext())
+            self.assertTrue(service.drained)
+            self.assertEqual(self.app.ticks, [])
+            strategy_module.sync_positions(FakeContext())
+            self.assertEqual(self.app.sync_reasons, ["manual"])
+        finally:
+            strategy_module.configure(run_app_tick=True)
+
     def test_handlebar_forwards_to_app_tick(self):
         strategy_module.init(FakeContext())
         strategy_module.handlebar(FakeContext())

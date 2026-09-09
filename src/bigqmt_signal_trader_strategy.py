@@ -1099,6 +1099,8 @@ def adjust(ContextInfo, _source="timer"):
     _adjust_phase("drain", _drain_rpc_service, config)
     _adjust_phase("full_tick", _refresh_full_tick_cache, ContextInfo, config)
     _adjust_phase("download", _pump_download_jobs, ContextInfo, config)
+    if not config.get("run_app_tick", True):
+        return None
     try:
         if hasattr(ContextInfo, "is_last_bar") and not ContextInfo.is_last_bar():
             return None

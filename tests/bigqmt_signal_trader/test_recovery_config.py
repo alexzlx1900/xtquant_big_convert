@@ -29,6 +29,7 @@ class RecoveryConfigTest(unittest.TestCase):
         module = ast.Module(body=[apply_config], type_ignores=[])
         exec(compile(module, path, "exec"), namespace)
         namespace["_apply_config"]("acct")
+        self.assertIs(captured["run_app_tick"], False)
         r = FakeRedis()
         app = build_app(config={"mode": "dryrun", "account_id": "acct", "position_sync_type": "redis",
                          "redis": captured["redis"], "redis_client": r})

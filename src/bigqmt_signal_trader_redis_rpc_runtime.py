@@ -250,6 +250,9 @@ def _apply_config(account_id):
         account_type=ACCOUNT_TYPE,
         position_sync_type="redis" if RPC_TRANSPORT in ("redis", "", "default") else "",
         enable_rpc=True,
+        # RPC 专用模型不消费交易信号，不在查询回调后反复同步整账户持仓。
+        # 显式 sync_positions 和成交回报入口仍保留；普通信号策略不受影响。
+        run_app_tick=False,
         schedule_adjust=SCHEDULE_ADJUST_ENABLED,
         schedule_adjust_interval=SCHEDULE_ADJUST_INTERVAL,
         redis={

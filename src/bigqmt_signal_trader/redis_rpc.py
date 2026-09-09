@@ -29,6 +29,14 @@ _monotonic = time.monotonic
 RPC_REVISION = "20260715-execution-snapshot-v1"
 
 
+# 仅对 Gateway 的无副作用查询丢弃排队过期请求；历史 READ_METHODS
+# 还包含下载、订阅和显式同步，不能整体套用读取取消语义。
+EXPIRABLE_READ_METHODS = frozenset({
+    "ping", "get_asset", "get_positions", "get_position_statistics",
+    "query_orders", "query_trades", "query_execution_snapshot",
+    "get_ticks", "get_market_data", "get_market_data_ex", "get_local_data",
+})
+
 READ_METHODS = {
     "ping",
     "get_deployment_info",
@@ -1891,6 +1899,9 @@ class RedisPubSubRpcService:
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
+            expires_at = request.get("read_expires_at_unix")
+            if method in EXPIRABLE_READ_METHODS and expires_at is not None and time.time() >= float(expires_at):
+                raise TimeoutError("read RPC expired before execution")
             _t0 = time.perf_counter() if method == "ping" else 0.0
             result = self.handlers.handle(method, request.get("params") or {})
             _t1 = time.perf_counter() if method == "ping" else 0.0
@@ -2043,6 +2054,10 @@ def call_redis_rpc(
         "reply_key": response_key,
         "ttl_seconds": ttl_seconds,
     }
+    if method in EXPIRABLE_READ_METHODS:
+        # Gateway 与桥接部署在同一 Windows；只对读取请求设置执行期限。
+        # 报单/撤单不得按读取超时自动取消或丢弃。
+        request["read_expires_at_unix"] = time.time() + max(0.0, float(timeout_seconds))
     payload = encode_rpc_request_payload(request)
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):
         redis_client.rpush(request_queue, payload)

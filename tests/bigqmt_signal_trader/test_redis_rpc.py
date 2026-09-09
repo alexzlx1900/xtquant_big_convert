@@ -431,6 +431,19 @@ class AsyncOrderSettlementTest(unittest.TestCase):
 
 
 class RedisRpcTest(unittest.TestCase):
+    def test_expired_read_is_rejected_but_order_still_reaches_permission_gate(self):
+        redis_client, service = _service()
+        for method in ("get_asset", "submit_order"):
+            service.enqueue_payload({
+                "request_id": method, "account_id": "acct", "method": method,
+                "params": {}, "read_expires_at_unix": time.time() - 10,
+            })
+        service.drain_pending()
+        read = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:get_asset"])
+        order = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:submit_order"])
+        self.assertIn("expired before execution", read["error"])
+        self.assertIn("not allowed", order["error"])
+
     def test_execution_snapshot_queries_orders_and_all_trades_once(self):
         gateway = CapturingExecutionGateway()
         handlers = BigQmtRpcHandlers(
