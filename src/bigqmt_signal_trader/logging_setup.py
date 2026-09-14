@@ -39,6 +39,9 @@ except ImportError:
     logging = None
 
 _LOGGER_NAME = "bigqmt"
+_HANDLER_KIND_ATTR = "_bigqmt_managed_handler_kind"
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
+_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _initialized = False
 
 
@@ -158,53 +161,160 @@ def _cleanup_old_logs(log_dir, retention_days):
         pass
 
 
+def _uses_legacy_formatter(handler):
+    try:
+        formatter = handler.formatter
+        return (
+            formatter is not None
+            and getattr(getattr(formatter, "_style", None), "_fmt", None)
+            == _LOG_FORMAT
+            and formatter.datefmt == _LOG_DATE_FORMAT
+        )
+    except Exception:
+        return False
+
+
+def _is_legacy_handler(handler, kind, file_path=None, retention_days=None):
+    """Match only the exact handler shape created before ownership tagging."""
+    try:
+        if kind == "file":
+            if type(handler) is not logging.handlers.TimedRotatingFileHandler:
+                return False
+            existing_path = os.path.normcase(os.path.abspath(handler.baseFilename))
+            wanted_path = os.path.normcase(os.path.abspath(file_path))
+            return (
+                existing_path == wanted_path
+                and handler.when == "MIDNIGHT"
+                and handler.interval == 86400
+                and handler.backupCount == retention_days
+                and handler.utc is False
+                and handler.delay is False
+                and handler.level == logging.NOTSET
+                and not handler.filters
+                and _uses_legacy_formatter(handler)
+            )
+        if kind == "stdout":
+            return (
+                handler.__class__.__name__ == "_SafeStreamHandler"
+                and handler.__class__.__module__.startswith(
+                    "bigqmt_signal_trader.logging_setup"
+                )
+                and handler.__class__.__bases__ == (logging.Handler,)
+                and handler.level == logging.INFO
+                and not handler.filters
+                and _uses_legacy_formatter(handler)
+            )
+    except Exception:
+        return False
+    return False
+
+
+def _reconcile_managed_handlers(
+    logger, kind, file_path=None, retention_days=None
+):
+    """Keep one owned handler and close duplicate handlers left by reloads."""
+    candidates = []
+    for handler in list(logger.handlers):
+        try:
+            handler_kind = getattr(handler, _HANDLER_KIND_ATTR, None)
+            if handler_kind == kind or (
+                handler_kind is None
+                and _is_legacy_handler(
+                    handler,
+                    kind,
+                    file_path=file_path,
+                    retention_days=retention_days,
+                )
+            ):
+                candidates.append(handler)
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    kept_handler = candidates[0]
+    setattr(kept_handler, _HANDLER_KIND_ATTR, kind)
+    for duplicate in candidates[1:]:
+        logger.removeHandler(duplicate)
+        try:
+            duplicate.close()
+        except Exception:
+            pass
+    return kept_handler
+
+
+def _add_managed_handler(logger, handler, kind):
+    setattr(handler, _HANDLER_KIND_ATTR, kind)
+    logger.addHandler(handler)
+
+
 def _setup():
     global _initialized
     if _initialized:
         return
-    _initialized = True
     if logging is None:
+        _initialized = True
         return
-    logger = logging.getLogger(_LOGGER_NAME)
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False
-    if not _env_bool("BIGQMT_LOG_ENABLED", True):
-        logger.addHandler(logging.NullHandler())
-        return
+    # The logging registry outlives a QMT module reload.  Its own lock makes
+    # handler discovery/addition atomic even when two module instances overlap.
+    logging._acquireLock()
+    try:
+        if _initialized:
+            return
+        logger = logging.getLogger(_LOGGER_NAME)
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        if not _env_bool("BIGQMT_LOG_ENABLED", True):
+            if _reconcile_managed_handlers(logger, "null") is None:
+                _add_managed_handler(logger, logging.NullHandler(), "null")
+            _initialized = True
+            return
 
-    fmt = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+        fmt = logging.Formatter(
+            fmt=_LOG_FORMAT,
+            datefmt=_LOG_DATE_FORMAT,
+        )
 
-    # File handler: rotate at midnight, keep the last 7 days only.
-    log_dir = _resolve_log_dir()
-    if log_dir is not None:
-        try:
-            fname = os.path.join(log_dir, "bigqmt.log")
-            file_handler = logging.handlers.TimedRotatingFileHandler(
-                fname,
-                when="midnight",
-                interval=1,
-                backupCount=int(os.environ.get("BIGQMT_LOG_RETENTION_DAYS", 7)),
-                encoding="utf-8",
-                utc=False,
-            )
-            file_handler.setFormatter(fmt)
-            logger.addHandler(file_handler)
-            _cleanup_old_logs(log_dir, int(os.environ.get("BIGQMT_LOG_RETENTION_DAYS", 7)))
-        except Exception:
-            pass
+        # File handler: rotate at midnight, keep the last 7 days only.
+        log_dir = _resolve_log_dir()
+        if log_dir is not None:
+            try:
+                fname = os.path.join(log_dir, "bigqmt.log")
+                retention_days = int(os.environ.get("BIGQMT_LOG_RETENTION_DAYS", 7))
+                if _reconcile_managed_handlers(
+                    logger,
+                    "file",
+                    file_path=fname,
+                    retention_days=retention_days,
+                ) is None:
+                    file_handler = logging.handlers.TimedRotatingFileHandler(
+                        fname,
+                        when="midnight",
+                        interval=1,
+                        backupCount=retention_days,
+                        encoding="utf-8",
+                        utc=False,
+                    )
+                    file_handler.setFormatter(fmt)
+                    _add_managed_handler(logger, file_handler, "file")
+                _cleanup_old_logs(log_dir, retention_days)
+            except Exception:
+                pass
 
-    # Stdout handler so the QMT panel still shows logs.
-    if _env_bool("BIGQMT_LOG_TO_STDOUT", True):
-        stream = _SafeStreamHandler()
-        stream.setLevel(logging.INFO)
-        stream.setFormatter(fmt)
-        logger.addHandler(stream)
+        # Stdout handler so the QMT panel still shows logs.
+        if (
+            _env_bool("BIGQMT_LOG_TO_STDOUT", True)
+            and _reconcile_managed_handlers(logger, "stdout") is None
+        ):
+            stream = _SafeStreamHandler()
+            stream.setLevel(logging.INFO)
+            stream.setFormatter(fmt)
+            _add_managed_handler(logger, stream, "stdout")
 
-    if not logger.handlers:
-        logger.addHandler(logging.NullHandler())
+        if not logger.handlers:
+            _add_managed_handler(logger, logging.NullHandler(), "null")
+        _initialized = True
+    finally:
+        logging._releaseLock()
 
 
 def get_logger(name=""):
