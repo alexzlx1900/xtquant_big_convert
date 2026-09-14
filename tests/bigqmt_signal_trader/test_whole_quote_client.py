@@ -74,6 +74,9 @@ class FakePushChannel:
     def stop(self):
         self.stopped = True
 
+    def subscriber_thread_alive(self):
+        return self.started and not self.stopped
+
 
 class FakePushChannelWithTopics(FakePushChannel):
     """Like FakePushChannel but tracks the currently subscribed topic set, so
@@ -178,6 +181,176 @@ class WholeQuoteSessionTest(unittest.TestCase):
         session.subscribe_whole_quote(["SH"], callback=lambda d: None)
         sub_params = [p for m, p in rpc.calls if m == "subscribe_whole_quote"][0]
         self.assertEqual(sub_params["client_id"], "client-test")
+
+    def test_replay_exception_does_not_kill_heartbeat(self):
+        class ReplayFails(FakeRpc):
+            def __call__(self, method, params):
+                if method == "subscribe_whole_quote" and self.methods().count(method):
+                    with self._lock:
+                        self.calls.append((method, dict(params)))
+                    raise RuntimeError("subscribe timeout")
+                return super().__call__(method, params)
+
+        rpc = ReplayFails()
+        session = WholeQuoteClientSession(
+            rpc, FakePushChannel(), "client-test", heartbeat_interval_seconds=0.01,
+            push_silence_replay_heartbeats=1,
+        )
+        session.subscribe_whole_quote(["SH"], callback=lambda data: None)
+        session.start()
+        try:
+            deadline = time.time() + 1.0
+            while time.time() < deadline and session.subscription_health()["recovery_attempts"] == 0:
+                time.sleep(0.01)
+            health = session.subscription_health()
+            self.assertTrue(health["heartbeat_thread_alive"])
+            self.assertEqual(health["last_error"]["stage"], "replay")
+            self.assertEqual(health["last_error"]["type"], "RuntimeError")
+            self.assertEqual(health["recovery_state"], "BACKING_OFF")
+        finally:
+            session.stop()
+
+    def test_start_replaces_dead_heartbeat_when_started_flag_is_stale(self):
+        session, _rpc, _channel = self._session()
+        dead = threading.Thread(target=lambda: None)
+        dead.start()
+        dead.join()
+        session._started = True
+        session._heartbeat_thread = dead
+        session.start()
+        try:
+            self.assertIsNot(session._heartbeat_thread, dead)
+            self.assertTrue(session._heartbeat_thread.is_alive())
+        finally:
+            session.stop()
+
+    def test_stop_then_start_uses_a_new_live_generation(self):
+        session, _rpc, _channel = self._session()
+        session.start()
+        old_thread = session._heartbeat_thread
+        old_generation = session._heartbeat_generation
+        session.stop()
+        session.start()
+        try:
+            self.assertGreater(session._heartbeat_generation, old_generation)
+            self.assertIsNot(session._heartbeat_thread, old_thread)
+            self.assertTrue(session.subscription_health()["heartbeat_thread_alive"])
+        finally:
+            session.stop()
+
+    def test_blocked_old_heartbeat_cannot_update_health_after_restart(self):
+        class BlockingFirstKeepalive(FakeRpc):
+            def __init__(self):
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.keepalive_calls = 0
+
+            def __call__(self, method, params):
+                if method == "quote_keepalive":
+                    self.keepalive_calls += 1
+                    if self.keepalive_calls == 1:
+                        self.entered.set()
+                        self.release.wait(2.0)
+                        raise RuntimeError("obsolete generation failure")
+                return super().__call__(method, params)
+
+        rpc = BlockingFirstKeepalive()
+        session = WholeQuoteClientSession(
+            rpc, FakePushChannel(), "client-test", heartbeat_interval_seconds=0.01)
+        session.subscribe_whole_quote(["SH"], callback=lambda data: None)
+        session.start()
+        self.assertTrue(rpc.entered.wait(1.0))
+        stopper = threading.Thread(target=session.stop)
+        stopper.start()
+        stopper.join(1.5)
+        session.start()
+        rpc.release.set()
+        try:
+            deadline = time.time() + 1.0
+            while time.time() < deadline and rpc.keepalive_calls < 2:
+                time.sleep(0.01)
+            self.assertIsNone(session.subscription_health()["last_error"])
+        finally:
+            session.stop()
+
+    def test_blocked_old_replay_cannot_update_health_or_continue_entries(self):
+        class BlockingFirstReplay(FakeRpc):
+            def __init__(self):
+                super().__init__()
+                self.initial_subscribes = 0
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.replay_threads = []
+
+            def __call__(self, method, params):
+                if method == "subscribe_whole_quote":
+                    self.initial_subscribes += 1
+                    if self.initial_subscribes > 2:
+                        self.replay_threads.append(threading.get_ident())
+                    if self.initial_subscribes == 3:
+                        self.entered.set()
+                        self.release.wait(2.0)
+                        raise RuntimeError("obsolete replay failure")
+                return super().__call__(method, params)
+
+        rpc = BlockingFirstReplay()
+        session = WholeQuoteClientSession(
+            rpc, FakePushChannel(), "client-test", heartbeat_interval_seconds=0.01,
+            push_silence_replay_heartbeats=1)
+        session.subscribe_whole_quote(["SH"], callback=lambda data: None)
+        session.subscribe_whole_quote(["SZ"], callback=lambda data: None)
+        session.start()
+        old_ident = session._heartbeat_thread.ident
+        self.assertTrue(rpc.entered.wait(1.0))
+        stopper = threading.Thread(target=session.stop)
+        stopper.start()
+        stopper.join(1.5)
+        session.start()
+        rpc.release.set()
+        try:
+            deadline = time.time() + 1.0
+            while time.time() < deadline and rpc.replay_threads.count(old_ident) < 1:
+                time.sleep(0.01)
+            self.assertEqual(rpc.replay_threads.count(old_ident), 1)
+            self.assertIsNone(session.subscription_health()["last_error"])
+        finally:
+            session.stop()
+
+    def test_same_topics_restart_a_dead_push_thread(self):
+        session, _rpc, channel = self._session()
+        session.subscribe_whole_quote(["SH"], callback=lambda data: None)
+        channel.stopped = True
+        session.subscribe_whole_quote(["SH"], callback=lambda data: None)
+        self.assertEqual(len(channel.subscriptions), 2)
+
+    def test_cancel_during_replay_compensates_late_subscribe(self):
+        class BlockingReplay(FakeRpc):
+            def __init__(self):
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def __call__(self, method, params):
+                if method == "subscribe_whole_quote" and self.methods().count(method):
+                    self.entered.set()
+                    self.release.wait(1.0)
+                return super().__call__(method, params)
+
+        rpc = BlockingReplay()
+        channel = FakePushChannel()
+        received = []
+        session = WholeQuoteClientSession(rpc, channel, "client-test")
+        sub_id = session.subscribe_whole_quote(["SH"], callback=received.append)
+        replay = threading.Thread(target=session.replay_subscriptions)
+        replay.start()
+        self.assertTrue(rpc.entered.wait(1.0))
+        session.unsubscribe_quote(sub_id)
+        channel.inject("SH", {"x": 1})
+        rpc.release.set()
+        replay.join(1.0)
+        self.assertEqual(received, [])
+        self.assertEqual(rpc.methods().count("unsubscribe_whole_quote"), 2)
 
     def test_auto_replay_after_server_restart(self):
         """服务端重启后, 心跳线程应检测到 keepalive 失败并在服务端恢复后

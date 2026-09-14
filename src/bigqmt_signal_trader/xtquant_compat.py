@@ -1849,6 +1849,32 @@ class BigQmtXtData:
                 pass
         return sub_id
 
+    def subscription_health(self):
+        """Return local whole-quote lifecycle evidence without creating RPC state."""
+        session = self._quote_session
+        if session is None:
+            return {
+                "supported": True, "status": "NOT_STARTED", "started": False,
+                "active_subscription_count": 0,
+                "heartbeat_thread_alive": False, "push_thread_alive": False,
+                "last_heartbeat_monotonic": None, "last_push_monotonic": None,
+                "last_error": None, "recovery_state": "IDLE", "recovery_attempts": 0,
+                "last_recovery_monotonic": None,
+                "last_recovery_success_monotonic": None,
+            }
+        health = getattr(session, "subscription_health", None)
+        if not callable(health):
+            return {
+                "supported": False, "status": "UNKNOWN", "started": None,
+                "active_subscription_count": None,
+                "heartbeat_thread_alive": None, "push_thread_alive": None,
+                "last_heartbeat_monotonic": None, "last_push_monotonic": None,
+                "last_error": None, "recovery_state": None, "recovery_attempts": None,
+                "last_recovery_monotonic": None,
+                "last_recovery_success_monotonic": None,
+            }
+        return health()
+
     def unsubscribe_quote(self, seq):
         # Three kinds of handle now: whole-quote / tick subscriptions owned by
         # the push session, K-line pollers owned here, and legacy seqs that only

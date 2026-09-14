@@ -39,6 +39,14 @@ class FakeSession:
     def stop(self):
         pass
 
+    def subscription_health(self):
+        return {"supported": True, "status": "HEALTHY", "started": True,
+                "active_subscription_count": len(self._active),
+                "heartbeat_thread_alive": True, "push_thread_alive": True,
+                "last_heartbeat_monotonic": 1.0, "last_push_monotonic": 2.0,
+                "last_error": None, "recovery_state": "HEALTHY", "recovery_attempts": 0,
+                "last_recovery_monotonic": None, "last_recovery_success_monotonic": None}
+
 
 class FakeClient:
     def __init__(self):
@@ -95,6 +103,22 @@ class XtDataWholeQuoteDelegationTest(unittest.TestCase):
         data.subscribe_whole_quote(["SH"], callback=lambda d: None)
         data.subscribe_whole_quote(["SZ"], callback=lambda d: None)
         self.assertEqual(len(session.subscribed), 2)
+
+    def test_health_without_session_is_idle_and_lazy(self):
+        data, _client = self._xtdata(FakeSession())
+        health = data.subscription_health()
+        self.assertEqual(health["status"], "NOT_STARTED")
+        self.assertEqual(health["active_subscription_count"], 0)
+        self.assertIsNone(data._quote_session)
+
+    def test_health_delegates_live_thread_evidence(self):
+        session = FakeSession()
+        data, _client = self._xtdata(session)
+        data.subscribe_whole_quote(["SH"], callback=lambda data: None)
+        health = data.subscription_health()
+        self.assertTrue(health["heartbeat_thread_alive"])
+        self.assertTrue(health["push_thread_alive"])
+        self.assertEqual(health["active_subscription_count"], 1)
 
 
 if __name__ == "__main__":

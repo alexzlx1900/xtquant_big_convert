@@ -18,6 +18,7 @@ channel stays usable without the optional dependency.
 
 import json
 import threading
+import time
 
 try:
     import msgpack
@@ -87,6 +88,10 @@ class ZmqQuotePushChannel(QuotePushChannel):
         self._sub = None
         self._sub_thread = None
         self._running = False
+        self._sub_lock = threading.RLock()
+        self._sub_stop = None
+        self._sub_generation = 0
+        self.last_error = None
 
     def _ensure_context(self):
         if self._zmq is None:
@@ -126,18 +131,26 @@ class ZmqQuotePushChannel(QuotePushChannel):
         zmq, ctx = self._ensure_context()
         if not self.connect_address:
             raise ValueError("connect_address is required to start a subscriber")
-        sub = ctx.socket(zmq.SUB)
-        sub.connect(self.connect_address)
-        for topic in topics or []:
-            sub.setsockopt(zmq.SUBSCRIBE, str(topic).encode("utf-8"))
-        self._sub = sub
-        self._running = True
-        self._sub_thread = threading.Thread(
-            target=self._sub_loop, args=(sub, on_msg), name="bigqmt-quote-push-sub", daemon=True
-        )
-        self._sub_thread.start()
+        with self._sub_lock:
+            if (self._sub_thread is not None and self._sub_thread.is_alive() and
+                    self._sub_stop is not None and not self._sub_stop.is_set()):
+                return
+            self._sub_generation += 1
+            generation = self._sub_generation
+            stop_event = threading.Event()
+            self._sub_stop = stop_event
+            sub = ctx.socket(zmq.SUB)
+            sub.connect(self.connect_address)
+            for topic in topics or []:
+                sub.setsockopt(zmq.SUBSCRIBE, str(topic).encode("utf-8"))
+            self._sub = sub
+            self._running = True
+            self._sub_thread = threading.Thread(
+                target=self._sub_loop, args=(sub, on_msg, stop_event, generation),
+                name="bigqmt-quote-push-sub", daemon=True)
+            self._sub_thread.start()
 
-    def _sub_loop(self, sub, on_msg):
+    def _sub_loop(self, sub, on_msg, stop_event, generation):
         # The SUB socket is owned by THIS thread; it must be closed HERE (in a
         # finally) and never from another thread. Closing a ZMQ socket cross-
         # thread trips a Windows signaler assertion and aborts the whole QMT
@@ -145,7 +158,10 @@ class ZmqQuotePushChannel(QuotePushChannel):
         poller = self._zmq.Poller()
         poller.register(sub, self._zmq.POLLIN)
         try:
-            while self._running:
+            while not stop_event.is_set():
+                with self._sub_lock:
+                    if generation != self._sub_generation:
+                        return
                 try:
                     events = dict(poller.poll(200))
                 except Exception:
@@ -159,8 +175,15 @@ class ZmqQuotePushChannel(QuotePushChannel):
                 if len(frames) < 2:
                     continue
                 topic = frames[0].decode("utf-8", errors="ignore")
-                data = decode_push_payload(frames[-1])
+                try:
+                    data = decode_push_payload(frames[-1])
+                except Exception as exc:
+                    self._set_error("decode", exc, "invalid push payload")
+                    continue
                 payload_data = data.get("data") if isinstance(data, dict) else data
+                with self._sub_lock:
+                    if generation != self._sub_generation or stop_event.is_set():
+                        return
                 try:
                     on_msg(topic, payload_data)
                 except Exception as exc:
@@ -175,12 +198,20 @@ class ZmqQuotePushChannel(QuotePushChannel):
         # Signal the sub thread to exit and let IT close its own socket (see
         # _sub_loop). Closing the SUB socket from this (foreign) thread would
         # trip the Windows ZMQ signaler abort and crash QMT.
-        self._running = False
-        thread = self._sub_thread
+        with self._sub_lock:
+            self._running = False
+            thread = self._sub_thread
+            stop_event = self._sub_stop
+            self._sub_generation += 1
+            if stop_event is not None:
+                stop_event.set()
         if thread is not None and thread.is_alive():
             thread.join(1.0)
-        self._sub_thread = None
-        self._sub = None
+        with self._sub_lock:
+            if self._sub_thread is thread and (thread is None or not thread.is_alive()):
+                self._sub_thread = None
+                self._sub_stop = None
+                self._sub = None
         # The PUB socket is only touched by publisher threads under _pub_lock;
         # null it first so a racing publish() sees None and bails, then close.
         with self._pub_lock:
@@ -192,6 +223,14 @@ class ZmqQuotePushChannel(QuotePushChannel):
             except Exception:
                 pass
 
+    def subscriber_thread_alive(self):
+        with self._sub_lock:
+            return bool(self._sub_thread and self._sub_thread.is_alive())
+
+    def _set_error(self, stage, exc, message):
+        self.last_error = {"stage": stage, "type": type(exc).__name__,
+                           "message": message, "monotonic": time.monotonic()}
+
 
 class RedisQuotePushChannel(QuotePushChannel):
     def __init__(self, redis_client, account_id="", channel_template="bigqmt:quote_push:{account_id}:{topic}", print_prefix="[bigqmt_quote_push]"):
@@ -202,6 +241,10 @@ class RedisQuotePushChannel(QuotePushChannel):
         self._running = False
         self._pubsub = None
         self._thread = None
+        self._lock = threading.RLock()
+        self._stop_event = None
+        self._generation = 0
+        self.last_error = None
 
     def _channel(self, topic):
         return self.channel_template.format(account_id=self.account_id, topic=topic)
@@ -220,51 +263,100 @@ class RedisQuotePushChannel(QuotePushChannel):
 
     # -- client side ---------------------------------------------------------
     def start_subscriber(self, topics, on_msg):
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._sub_loop, args=(list(topics or []), on_msg), name="bigqmt-quote-push-sub", daemon=True
-        )
-        self._thread.start()
+        with self._lock:
+            if (self._thread is not None and self._thread.is_alive() and
+                    self._stop_event is not None and not self._stop_event.is_set()):
+                return
+            self._generation += 1
+            generation = self._generation
+            stop_event = threading.Event()
+            self._stop_event = stop_event
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._sub_loop,
+                args=(list(topics or []), on_msg, stop_event, generation),
+                name="bigqmt-quote-push-sub", daemon=True)
+            self._thread.start()
 
-    def _sub_loop(self, topics, on_msg):
+    def _sub_loop(self, topics, on_msg, stop_event, generation):
         # The pubsub connection is owned by THIS thread and closed HERE so a
         # concurrent stop() can't close it out from under us.
-        pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
-        self._pubsub = pubsub
         channels = [self._channel(topic) for topic in topics]
-        try:
-            pubsub.subscribe(*channels)
-        except Exception as exc:
-            print("%s redis subscribe failed: %s" % (self.print_prefix, exc))
-            return
-        try:
-            while self._running:
-                try:
-                    message = pubsub.get_message(timeout=0.2)
-                except Exception:
-                    break
-                if not message or message.get("type") != "message":
-                    continue
-                channel = message.get("channel")
-                if isinstance(channel, bytes):
-                    channel = channel.decode("utf-8", errors="ignore")
-                topic = str(channel).rsplit(":", 1)[-1]
-                data = decode_push_payload(message.get("data"))
-                payload_data = data.get("data") if isinstance(data, dict) else data
-                try:
-                    on_msg(topic, payload_data)
-                except Exception as exc:
-                    print("%s subscriber callback failed: %s" % (self.print_prefix, exc))
-        finally:
+        attempt = 0
+        while not stop_event.is_set():
+            with self._lock:
+                if generation != self._generation:
+                    return
+            pubsub = None
             try:
-                pubsub.close()
-            except Exception:
-                pass
+                pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
+                with self._lock:
+                    if generation != self._generation:
+                        return
+                    self._pubsub = pubsub
+                pubsub.subscribe(*channels)
+                while not stop_event.is_set():
+                    with self._lock:
+                        if generation != self._generation:
+                            return
+                    try:
+                        message = pubsub.get_message(timeout=0.2)
+                    except Exception as exc:
+                        self._set_error("receive", exc, "redis receive failed")
+                        break
+                    if not message or message.get("type") != "message":
+                        continue
+                    channel = message.get("channel")
+                    if isinstance(channel, bytes):
+                        channel = channel.decode("utf-8", errors="ignore")
+                    topic = str(channel).rsplit(":", 1)[-1]
+                    try:
+                        data = decode_push_payload(message.get("data"))
+                    except Exception as exc:
+                        self._set_error("decode", exc, "invalid push payload")
+                        continue
+                    payload_data = data.get("data") if isinstance(data, dict) else data
+                    with self._lock:
+                        if generation != self._generation or stop_event.is_set():
+                            return
+                    try:
+                        on_msg(topic, payload_data)
+                        attempt = 0
+                    except Exception as exc:
+                        self._set_error("callback", exc, "subscriber callback failed")
+            except Exception as exc:
+                self._set_error("subscribe", exc, "redis subscribe failed")
+            finally:
+                try:
+                    if pubsub is not None:
+                        pubsub.close()
+                except Exception:
+                    pass
+            if stop_event.is_set():
+                return
+            attempt += 1
+            stop_event.wait(min(0.1 * (2 ** min(attempt - 1, 5)), 2.0))
 
     def stop(self):
-        self._running = False
-        thread = self._thread
+        with self._lock:
+            self._running = False
+            thread = self._thread
+            stop_event = self._stop_event
+            self._generation += 1
+            if stop_event is not None:
+                stop_event.set()
         if thread is not None and thread.is_alive():
             thread.join(1.0)
-        self._thread = None
-        self._pubsub = None
+        with self._lock:
+            if self._thread is thread and (thread is None or not thread.is_alive()):
+                self._thread = None
+                self._stop_event = None
+                self._pubsub = None
+
+    def subscriber_thread_alive(self):
+        with self._lock:
+            return bool(self._thread and self._thread.is_alive())
+
+    def _set_error(self, stage, exc, message):
+        self.last_error = {"stage": stage, "type": type(exc).__name__,
+                           "message": message, "monotonic": time.monotonic()}

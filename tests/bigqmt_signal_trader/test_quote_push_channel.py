@@ -59,6 +59,45 @@ class FakeRedis:
         return FakePubSub(self)
 
 
+class DisconnectOncePubSub(FakePubSub):
+    def get_message(self, timeout=0.1):
+        raise ConnectionError("temporary disconnect")
+
+
+class DisconnectOnceRedis(FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.pubsub_calls = 0
+
+    def pubsub(self, ignore_subscribe_messages=True):
+        self.pubsub_calls += 1
+        if self.pubsub_calls == 1:
+            return DisconnectOncePubSub(self)
+        return FakePubSub(self)
+
+
+class BlockingMessagePubSub(FakePubSub):
+    def __init__(self, redis_client):
+        super().__init__(redis_client)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def get_message(self, timeout=0.1):
+        self.entered.set()
+        self.release.wait(2.0)
+        return {"type": "message", "channel": self._channels[0],
+                "data": encode_push_payload({"combo_key": "SH", "data": {"late": 1}})}
+
+
+class BlockingMessageRedis(FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.blocking_pubsub = BlockingMessagePubSub(self)
+
+    def pubsub(self, ignore_subscribe_messages=True):
+        return self.blocking_pubsub
+
+
 class PayloadCodecTest(unittest.TestCase):
     def test_roundtrip(self):
         payload = {"combo_key": "SH,SZ", "data": {"000001.SZ": {"lastPrice": 10.5}}, "ts": 1.5}
@@ -184,6 +223,54 @@ class RedisPushChannelTest(unittest.TestCase):
         server.publish("SH", {"x": 1})
         server.stop()
         self.assertIn("bigqmt:quote_push:acct:SH", redis_client.messages)
+
+    def test_bad_message_is_skipped_and_next_message_is_delivered(self):
+        redis_client = FakeRedis()
+        received = []
+        done = threading.Event()
+        client = RedisQuotePushChannel(redis_client, account_id="acct")
+        client.start_subscriber(["SH"], lambda topic, data: (received.append(data), done.set()))
+        try:
+            redis_client.publish("bigqmt:quote_push:acct:SH", b"not-json-or-msgpack")
+            redis_client.publish("bigqmt:quote_push:acct:SH",
+                                 encode_push_payload({"combo_key": "SH", "data": {"ok": 1}}))
+            self.assertTrue(done.wait(2.0))
+            self.assertEqual(received, [{"ok": 1}])
+            self.assertEqual(client.last_error["stage"], "decode")
+            self.assertEqual(client.last_error["message"], "invalid push payload")
+        finally:
+            client.stop()
+
+    def test_disconnect_recreates_pubsub_and_restores_topics(self):
+        redis_client = DisconnectOnceRedis()
+        received = []
+        done = threading.Event()
+        client = RedisQuotePushChannel(redis_client, account_id="acct")
+        client.start_subscriber(["SH"], lambda topic, data: (received.append(data), done.set()))
+        try:
+            deadline = time.time() + 2.0
+            while time.time() < deadline and redis_client.pubsub_calls < 2:
+                time.sleep(0.01)
+            redis_client.publish("bigqmt:quote_push:acct:SH",
+                                 encode_push_payload({"combo_key": "SH", "data": {"recovered": 1}}))
+            self.assertTrue(done.wait(2.0))
+            self.assertEqual(received, [{"recovered": 1}])
+        finally:
+            client.stop()
+
+    def test_stop_generation_drops_message_returned_after_stop(self):
+        redis_client = BlockingMessageRedis()
+        received = []
+        client = RedisQuotePushChannel(redis_client, account_id="acct")
+        client.start_subscriber(["SH"], lambda topic, data: received.append(data))
+        self.assertTrue(redis_client.blocking_pubsub.entered.wait(1.0))
+        stopper = threading.Thread(target=client.stop)
+        stopper.start()
+        time.sleep(0.02)
+        redis_client.blocking_pubsub.release.set()
+        stopper.join(1.0)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(received, [])
 
 
 if __name__ == "__main__":
