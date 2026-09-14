@@ -11,6 +11,7 @@ import datetime as _dt
 import json
 import math
 import queue
+import re
 import threading
 import time
 import traceback
@@ -18,12 +19,117 @@ import uuid
 
 from .adapters.redis_common import decode_text
 from .code_utils import normalize_stock_code
+from .logging_setup import get_logger
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
 
 # time.monotonic: unaffected by wall-clock jumps, so a settle deadline
 # survives an NTP correction mid-session. Python 3.3+, fine on QMT's 3.6.
 _monotonic = time.monotonic
+
+
+_rpc_logger = get_logger("rpc")
+_SUBSCRIPTION_TRACE_PREFIX = "qmt.subscription_rpc_trace "
+_SUBSCRIPTION_TRACE_MAX_BYTES = 2048
+_SUBSCRIPTION_TRACE_METHODS = frozenset(("subscribe_whole_quote", "quote_keepalive"))
+_TRACE_SENSITIVE_VALUE = re.compile(
+    r'''(?i)((?:["']?)(?:password|shared_secret|token|credential)(?:["']?)\s*[:=]\s*)'''
+    r'''(?:"[^"]*"|'[^']*'|[^\s,;}]+)'''
+)
+_TRACE_URL_CREDENTIALS = re.compile(r"(?i)\b(redis(?:s)?://)([^@\s]+)@")
+
+
+def _trace_text(value, limit, unknown="UNKNOWN"):
+    """Return a bounded, single-line scalar without leaking common secrets."""
+
+    if value is None:
+        return unknown
+    if not isinstance(value, (str, int, float, bool)):
+        return unknown
+    try:
+        text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+        text = _TRACE_SENSITIVE_VALUE.sub(r"\1<redacted>", text)
+        text = _TRACE_URL_CREDENTIALS.sub(r"\1<redacted>@", text)
+        return text[: int(limit)] or unknown
+    except Exception:
+        return unknown
+
+
+def _trace_subscription_id(request=None, response=None):
+    params = (request or {}).get("params")
+    if isinstance(params, dict):
+        value = params.get("subscription_id")
+        if value is None:
+            value = params.get("sub_id")
+        normalized = _trace_text(value, 64)
+        if normalized != "UNKNOWN":
+            return normalized
+    data = response.get("data") if isinstance(response, dict) else None
+    if isinstance(data, dict):
+        value = data.get("subscription_id")
+        if value is None:
+            value = data.get("sub_id")
+        return _trace_text(value, 64)
+    return "UNKNOWN"
+
+
+def _trace_subscription_rpc(
+    stage,
+    method,
+    request_id,
+    account_id,
+    timeout_seconds=None,
+    duration_ms=None,
+    outcome="SUCCESS",
+    error=None,
+    error_type=None,
+    error_message=None,
+    request=None,
+    response=None,
+):
+    """Best-effort structured trace for the bounded subscription RPC methods."""
+
+    method = _trace_text(method, 64)
+    if method not in _SUBSCRIPTION_TRACE_METHODS:
+        return
+    # A healthy keepalive runs every few seconds. Preserve only its failures so
+    # the diagnostic itself cannot flood the broker-side rotating log.
+    if method == "quote_keepalive" and outcome in ("STARTED", "SUCCESS"):
+        return
+    try:
+        event = {
+            "timestamp": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "method": method,
+            "request_id": _trace_text(request_id, 128),
+            "account_id": _trace_text(account_id, 128),
+            "subscription_id": _trace_subscription_id(request=request, response=response),
+            "timeout_seconds": None if timeout_seconds is None else float(timeout_seconds),
+            "stage": _trace_text(stage, 64),
+            "duration_ms": None if duration_ms is None else round(float(duration_ms), 3),
+            "outcome": _trace_text(outcome, 32),
+        }
+        if error is not None:
+            error_type = error.__class__.__name__
+            try:
+                error_message = str(error)
+            except Exception:
+                error_message = ""
+        if error_type is not None or error_message is not None:
+            event["error_type"] = _trace_text(error_type, 128, unknown="")
+            event["error_message"] = _trace_text(error_message, 512, unknown="")
+        message = json.dumps(event, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        # Keep valid JSON under the byte ceiling. ensure_ascii makes character
+        # count equal byte count while avoiding broker console encoding issues.
+        byte_budget = _SUBSCRIPTION_TRACE_MAX_BYTES - len(_SUBSCRIPTION_TRACE_PREFIX.encode("ascii"))
+        for field in ("error_message", "account_id", "request_id", "subscription_id", "method"):
+            while len(message.encode("ascii")) > byte_budget and event.get(field):
+                event[field] = event[field][:-max(1, len(event[field]) // 4)]
+                message = json.dumps(event, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        if len(message.encode("ascii")) <= byte_budget:
+            _rpc_logger.info("qmt.subscription_rpc_trace %s", message)
+    except Exception:
+        # Diagnostics must never change request execution or exception flow.
+        pass
 
 
 RPC_REVISION = "20260715-execution-snapshot-v1"
@@ -1739,6 +1845,14 @@ class RedisPubSubRpcService:
 
     def enqueue_payload(self, raw_payload):
         payload = self._loads(raw_payload)
+        _trace_subscription_rpc(
+            "server_receive",
+            payload.get("method"),
+            payload.get("request_id") or payload.get("id"),
+            payload.get("account_id") or self.account_id,
+            outcome="SUCCESS",
+            request=payload,
+        )
         if self._should_process_in_listener(payload):
             self.process_request(payload)
             return
@@ -1872,7 +1986,16 @@ class RedisPubSubRpcService:
             item = self.listen_redis.lpop(self.request_queue)
             if not item:
                 break
-            self.process_request(self._loads(item))
+            request = self._loads(item)
+            _trace_subscription_rpc(
+                "server_receive",
+                request.get("method"),
+                request.get("request_id") or request.get("id"),
+                request.get("account_id") or self.account_id,
+                outcome="SUCCESS",
+                request=request,
+            )
+            self.process_request(request)
             processed += 1
         return processed
 
@@ -1896,6 +2019,12 @@ class RedisPubSubRpcService:
             "server_error": "",
             "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        _handler_started = time.perf_counter()
+        _trace_subscription_rpc(
+            "server_handle_start", method, request_id, account_id,
+            outcome="STARTED", request=request,
+        )
+        _handler_error = None
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
@@ -1932,10 +2061,30 @@ class RedisPubSubRpcService:
                 self._deferred_count += 1
                 return response
         except Exception as exc:
+            _handler_error = exc
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        _trace_subscription_rpc(
+            "server_handle_finish", method, request_id, account_id,
+            duration_ms=(time.perf_counter() - _handler_started) * 1000.0,
+            outcome="ERROR" if _handler_error is not None else "SUCCESS",
+            error=_handler_error,
+            request=request,
+            response=response,
+        )
+        _publish_started = time.perf_counter()
         try:
             self._publish_response(request, response)
-        except Exception:
+            _trace_subscription_rpc(
+                "server_response_publish", method, request_id, account_id,
+                duration_ms=(time.perf_counter() - _publish_started) * 1000.0,
+                outcome="SUCCESS", request=request, response=response,
+            )
+        except Exception as exc:
+            _trace_subscription_rpc(
+                "server_response_publish", method, request_id, account_id,
+                duration_ms=(time.perf_counter() - _publish_started) * 1000.0,
+                outcome="ERROR", error=exc, request=request, response=response,
+            )
             # A response-publish failure (e.g. redis outage) must not propagate
             # to the adjust thread — QMT stops the strategy on a callback raise.
             # The request already ran; the client will just see a timeout.
@@ -2054,19 +2203,90 @@ def call_redis_rpc(
         "reply_key": response_key,
         "ttl_seconds": ttl_seconds,
     }
+    request_started = time.perf_counter()
+
+    def _client_failure(stage, exc, started_at=None):
+        _trace_subscription_rpc(
+            stage, method, request_id, account_id,
+            timeout_seconds=timeout_seconds,
+            duration_ms=(time.perf_counter() - (started_at or request_started)) * 1000.0,
+            outcome="ERROR", error=exc, request=request,
+        )
+
+    def _decode_client_response(raw_response):
+        try:
+            return loads_rpc_response(raw_response)
+        except Exception as exc:
+            _client_failure("client_response", exc)
+            raise
+
+    def _client_response(raw_response):
+        response = _decode_client_response(raw_response)
+        response_ok = bool(response.get("ok")) if isinstance(response, dict) else True
+        response_error_value = response.get("error") if isinstance(response, dict) else ""
+        response_error = response_error_value if isinstance(response_error_value, str) else ""
+        _trace_subscription_rpc(
+            "client_response", method, request_id, account_id,
+            timeout_seconds=timeout_seconds,
+            duration_ms=(time.perf_counter() - request_started) * 1000.0,
+            outcome="SUCCESS" if response_ok else "ERROR",
+            error_type=None if response_ok else "RpcResponseError",
+            error_message=None if response_ok else response_error,
+            request=request, response=response,
+        )
+        return response
+
+    def _get_response():
+        try:
+            return redis_client.get(response_key)
+        except Exception as exc:
+            _client_failure("client_response", exc)
+            raise
+
+    def _client_timeout(message):
+        if method in _SUBSCRIPTION_TRACE_METHODS:
+            message = "%s request_id=%s" % (message, request_id)
+        exc = TimeoutError(message)
+        _trace_subscription_rpc(
+            "client_timeout", method, request_id, account_id,
+            timeout_seconds=timeout_seconds,
+            duration_ms=(time.perf_counter() - request_started) * 1000.0,
+            outcome="TIMEOUT", error=exc, request=request,
+        )
+        raise exc
+
     if method in EXPIRABLE_READ_METHODS:
         # Gateway 与桥接部署在同一 Windows；只对读取请求设置执行期限。
         # 报单/撤单不得按读取超时自动取消或丢弃。
         request["read_expires_at_unix"] = time.time() + max(0.0, float(timeout_seconds))
-    payload = encode_rpc_request_payload(request)
+    try:
+        payload = encode_rpc_request_payload(request)
+    except Exception as exc:
+        _client_failure("client_send_failure", exc)
+        raise
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):
-        redis_client.rpush(request_queue, payload)
-        redis_client.expire(request_queue, max(60, int(ttl_seconds)))
+        _send_started = time.perf_counter()
+        try:
+            redis_client.rpush(request_queue, payload)
+        except Exception as exc:
+            _client_failure("client_send_failure", exc, _send_started)
+            raise
+        _trace_subscription_rpc(
+            "client_send_success", method, request_id, account_id,
+            timeout_seconds=timeout_seconds,
+            duration_ms=(time.perf_counter() - _send_started) * 1000.0,
+            outcome="SUCCESS", request=request,
+        )
+        try:
+            redis_client.expire(request_queue, max(60, int(ttl_seconds)))
+        except Exception as exc:
+            _client_failure("client_response", exc)
+            raise
         deadline = time.time() + float(timeout_seconds)
         while True:
-            raw_response = redis_client.get(response_key)
+            raw_response = _get_response()
             if raw_response:
-                return loads_rpc_response(raw_response)
+                return _client_response(raw_response)
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
@@ -2076,6 +2296,7 @@ def call_redis_rpc(
             except Exception as exc:
                 if _is_redis_timeout(exc):
                     continue
+                _client_failure("client_response", exc)
                 raise
             if item:
                 raw_response = item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
@@ -2083,33 +2304,68 @@ def call_redis_rpc(
                     redis_client.delete(response_list)
                 except Exception:
                     pass
-                return loads_rpc_response(raw_response)
-        raw_response = redis_client.get(response_key)
+                return _client_response(raw_response)
+        raw_response = _get_response()
         if raw_response:
-            return loads_rpc_response(raw_response)
-        raise TimeoutError(
+            return _client_response(raw_response)
+        _client_timeout(
             "redis rpc timeout: %s account_id=%s request_queue=%s" % (method, account_id, request_queue)
         )
 
-    pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+    _send_started = time.perf_counter()
     try:
-        pubsub.subscribe(response_channel)
-        redis_client.publish(request_channel, payload)
+        pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+    except Exception as exc:
+        _client_failure("client_send_failure", exc, _send_started)
+        raise
+    try:
+        try:
+            pubsub.subscribe(response_channel)
+        except Exception as exc:
+            _client_failure("client_send_failure", exc, _send_started)
+            raise
+        try:
+            redis_client.publish(request_channel, payload)
+        except Exception as exc:
+            _client_failure("client_send_failure", exc, _send_started)
+            raise
+        _trace_subscription_rpc(
+            "client_send_success", method, request_id, account_id,
+            timeout_seconds=timeout_seconds,
+            duration_ms=(time.perf_counter() - _send_started) * 1000.0,
+            outcome="SUCCESS", request=request,
+        )
         deadline = time.time() + float(timeout_seconds)
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
-            message = pubsub.get_message(timeout=remaining)
+            try:
+                message = pubsub.get_message(timeout=remaining)
+            except Exception as exc:
+                _client_failure("client_response", exc)
+                raise
             if not message or message.get("type") != "message":
                 continue
-            response = loads_rpc_response(message.get("data"))
+            response = _decode_client_response(message.get("data"))
             if response.get("request_id") == request_id:
+                response_ok = bool(response.get("ok"))
+                response_error_value = response.get("error")
+                response_error = response_error_value if isinstance(response_error_value, str) else ""
+                _trace_subscription_rpc(
+                    "client_response", method, request_id, account_id,
+                    timeout_seconds=timeout_seconds,
+                    duration_ms=(time.perf_counter() - request_started) * 1000.0,
+                    outcome="SUCCESS" if response_ok else "ERROR",
+                    error_type=None if response_ok else "RpcResponseError",
+                    error_message=None if response_ok else response_error,
+                    request=request, response=response,
+                )
                 return response
-        raw_response = redis_client.get(response_key)
+        raw_response = _get_response()
         if raw_response:
-            return loads_rpc_response(raw_response)
-        raise TimeoutError("redis rpc timeout: %s" % method)
+            return _client_response(raw_response)
+        _client_timeout("redis rpc timeout: %s" % method)
     finally:
         try:
             pubsub.close()

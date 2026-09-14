@@ -1,14 +1,25 @@
+import json
 import os
 import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.whole_quote_session import WholeQuoteClientSession
+from bigqmt_signal_trader import whole_quote_session as whole_quote_session_module
+
+
+class CapturingLogger:
+    def __init__(self):
+        self.lines = []
+
+    def warning(self, template, value):
+        self.lines.append(template % value)
 
 
 class FakeRpc:
@@ -209,6 +220,75 @@ class WholeQuoteSessionTest(unittest.TestCase):
             self.assertEqual(health["recovery_state"], "BACKING_OFF")
         finally:
             session.stop()
+
+    def test_replay_error_log_preserves_request_correlation_and_behavior(self):
+        class ReplayFails(FakeRpc):
+            def __call__(self, method, params):
+                if method == "subscribe_whole_quote" and self.methods().count(method):
+                    with self._lock:
+                        self.calls.append((method, dict(params)))
+                    raise TimeoutError(
+                        "redis rpc timeout request_id=req-replay-123 password=do-not-log")
+                return super().__call__(method, params)
+
+        captured = CapturingLogger()
+        session = WholeQuoteClientSession(ReplayFails(), FakePushChannel(), "client-test")
+        session.subscribe_whole_quote(["SH"], callback=lambda data: None)
+        with mock.patch.object(whole_quote_session_module, "log", captured):
+            with self.assertRaises(TimeoutError):
+                session.replay_subscriptions()
+
+        self.assertEqual(len(captured.lines), 1)
+        event = json.loads(captured.lines[0])
+        self.assertEqual(event["event"], "qmt.subscription_rpc_trace")
+        self.assertEqual(event["method"], "subscribe_whole_quote")
+        self.assertEqual(event["request_id"], "req-replay-123")
+        self.assertEqual(event["subscription_id"], "1")
+        self.assertEqual(event["topic"], "SH")
+        self.assertEqual(event["outcome"], "TIMEOUT")
+        self.assertEqual(event["stage"], "client_timeout")
+        self.assertEqual(event["error_type"], "TimeoutError")
+        self.assertTrue(event["timestamp"].endswith("Z"))
+        self.assertNotIn("do-not-log", captured.lines[0])
+        self.assertLessEqual(len(event["error_message"]), 512)
+
+    def test_replay_log_format_failure_preserves_original_exception(self):
+        class UnprintableError(RuntimeError):
+            def __str__(self):
+                raise RuntimeError("format failed")
+
+        class ReplayFails(FakeRpc):
+            def __call__(self, method, params):
+                if method == "subscribe_whole_quote" and self.methods().count(method):
+                    with self._lock:
+                        self.calls.append((method, dict(params)))
+                    raise UnprintableError()
+                return super().__call__(method, params)
+
+        session = WholeQuoteClientSession(ReplayFails(), FakePushChannel(), "client-test")
+        session.subscribe_whole_quote(["SH"], callback=lambda data: None)
+        with self.assertRaises(UnprintableError):
+            session.replay_subscriptions()
+
+    def test_replay_error_message_redacts_quoted_and_spaced_credentials(self):
+        cases = [
+            ("password=abc request_id=req-1", "abc"),
+            ("{'password': 'a b', 'detail': 'safe'} request_id=req-2", "a b"),
+            ('token="c d" request_id=req-3', "c d"),
+            ("credential='e f' request_id=req-4", "e f"),
+            ('shared_secret="unterminated secret value request_id=req-5',
+             "unterminated secret value"),
+        ]
+        for raw, secret in cases:
+            with self.subTest(raw=raw):
+                sanitized = whole_quote_session_module._safe_error_message(raw)
+                self.assertNotIn(secret, sanitized)
+                self.assertIn("***", sanitized)
+                expected_request_id = raw.rsplit("request_id=", 1)[-1]
+                self.assertEqual(
+                    whole_quote_session_module._request_id_from_error(raw),
+                    expected_request_id,
+                )
 
     def test_start_replaces_dead_heartbeat_when_started_flag_is_stale(self):
         session, _rpc, _channel = self._session()

@@ -16,9 +16,15 @@ Wire encoding is msgpack when available (smaller + faster for the
 channel stays usable without the optional dependency.
 """
 
+import datetime
 import json
 import threading
 import time
+
+from .logging_setup import get_logger
+
+
+log = get_logger("quote_push_channel")
 
 try:
     import msgpack
@@ -36,7 +42,7 @@ def encode_push_payload(payload):
     return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
 
 
-def decode_push_payload(blob):
+def _decode_push_payload(blob, attempts=None):
     """Inverse of :func:`encode_push_payload`. Accepts bytes or str.
 
     Encoding is not symmetric across deployments: a server without msgpack
@@ -52,10 +58,118 @@ def decode_push_payload(blob):
         blob = blob.encode("utf-8")
     if _HAS_MSGPACK:
         try:
-            return msgpack.unpackb(blob, raw=False)
-        except Exception:
-            pass
-    return json.loads(blob.decode("utf-8"))
+            result = msgpack.unpackb(blob, raw=False)
+            if attempts is not None:
+                attempts.append({"codec": "msgpack", "outcome": "SUCCESS"})
+            return result
+        except Exception as exc:
+            if attempts is not None:
+                attempts.append({"codec": "msgpack", "outcome": "ERROR",
+                                 "error_type": type(exc).__name__[:128]})
+    try:
+        result = json.loads(blob.decode("utf-8"))
+        if attempts is not None:
+            attempts.append({"codec": "json", "outcome": "SUCCESS"})
+        return result
+    except Exception as exc:
+        if attempts is not None:
+            attempts.append({"codec": "json", "outcome": "ERROR",
+                             "error_type": type(exc).__name__[:128]})
+        raise
+
+
+def decode_push_payload(blob):
+    return _decode_push_payload(blob)
+
+
+def _wire_bytes(blob):
+    if isinstance(blob, bytes):
+        return blob
+    if isinstance(blob, bytearray):
+        return bytes(blob)
+    if isinstance(blob, str):
+        return blob.encode("utf-8")
+    return None
+
+
+def _single_line_error(exc, limit=512):
+    text = str(exc)
+    text = text.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    return text.encode("ascii", "backslashreplace").decode("ascii")[:limit]
+
+
+def _error_location(exc):
+    if isinstance(exc, json.JSONDecodeError):
+        return "char=%d,line=%d,column=%d" % (exc.pos, exc.lineno, exc.colno)
+    if isinstance(exc, UnicodeDecodeError):
+        return "byte_start=%d,byte_end=%d" % (exc.start, exc.end)
+    return "UNKNOWN"
+
+
+def _redact_sensitive_bytes(value):
+    # Snippets may begin in the middle of a secret value, outside the reach of
+    # a key-based redactor. Preserve only JSON framing punctuation/whitespace;
+    # mask all content bytes so arbitrary credentials cannot be reconstructed.
+    safe = bytearray(b'{}[],:."\'\\-+ \t\r\n')
+    return bytes(value if value in safe else ord("*") for value in bytearray(value))
+
+
+def _escape_bytes(value):
+    return "".join("\\x%02x" % item for item in bytearray(_redact_sensitive_bytes(value)))
+
+
+def _error_context_bytes(exc):
+    if not isinstance(exc, json.JSONDecodeError):
+        return b""
+    start = max(0, exc.pos - 16)
+    return exc.doc[start:exc.pos + 16].encode("utf-8")[:32]
+
+
+def _log_decode_failure(channel, blob, attempts, exc):
+    try:
+        raw = _wire_bytes(blob)
+        prefix = raw[:64] if raw is not None else b""
+        tail = raw[-32:] if raw is not None and len(raw) > 64 else b""
+        error_context = _error_context_bytes(exc)
+        channel_text = str(channel).replace("\r", "\\r").replace("\n", "\\n")
+        channel_text = channel_text.encode("ascii", "backslashreplace").decode("ascii")[:96]
+        event = {
+            "event": "qmt.quote_push_decode_failed",
+            "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "channel": channel_text,
+            "wire_bytes": len(raw) if raw is not None else None,
+            "codec_strategy": "msgpack_then_json" if _HAS_MSGPACK else "json",
+            "codec_attempts": list(attempts),
+            "error_type": type(exc).__name__[:128],
+            "error_location": _error_location(exc),
+            "error_message": _single_line_error(exc, limit=192),
+            "wire_prefix_escaped": _escape_bytes(prefix),
+            "wire_prefix_bytes": len(prefix),
+            "wire_tail_escaped": _escape_bytes(tail),
+            "wire_tail_bytes": len(tail),
+            "error_context_escaped": _escape_bytes(error_context),
+            "error_context_bytes": len(error_context),
+            "error_context_position_unit": "character" if error_context else "UNKNOWN",
+            "snippet_source_bytes": len(prefix) + len(tail) + len(error_context),
+            "snippet_truncated": bool(raw is not None and len(raw) > len(prefix)),
+            "snippet_limit_bytes": 256,
+        }
+        line = json.dumps(event, ensure_ascii=True, separators=(",", ":"))
+        if len(line.encode("utf-8")) > 2048:
+            event["error_message"] = event["error_message"][:64]
+            event["channel"] = event["channel"][:32]
+            for attempt in event["codec_attempts"]:
+                if "error_type" in attempt:
+                    attempt["error_type"] = attempt["error_type"][:32]
+            line = json.dumps(event, ensure_ascii=True, separators=(",", ":"))
+        if len(line.encode("utf-8")) > 2048:
+            event["error_message"] = ""
+            event["error_type"] = event["error_type"][:32]
+            event["channel"] = event["channel"][:16]
+            line = json.dumps(event, ensure_ascii=True, separators=(",", ":"))
+        log.warning("%s", line)
+    except Exception:
+        pass
 
 
 class QuotePushChannel(object):
@@ -175,10 +289,12 @@ class ZmqQuotePushChannel(QuotePushChannel):
                 if len(frames) < 2:
                     continue
                 topic = frames[0].decode("utf-8", errors="ignore")
+                attempts = []
                 try:
-                    data = decode_push_payload(frames[-1])
+                    data = _decode_push_payload(frames[-1], attempts)
                 except Exception as exc:
                     self._set_error("decode", exc, "invalid push payload")
+                    _log_decode_failure(topic, frames[-1], attempts, exc)
                     continue
                 payload_data = data.get("data") if isinstance(data, dict) else data
                 with self._sub_lock:
@@ -310,10 +426,12 @@ class RedisQuotePushChannel(QuotePushChannel):
                     if isinstance(channel, bytes):
                         channel = channel.decode("utf-8", errors="ignore")
                     topic = str(channel).rsplit(":", 1)[-1]
+                    attempts = []
                     try:
-                        data = decode_push_payload(message.get("data"))
+                        data = _decode_push_payload(message.get("data"), attempts)
                     except Exception as exc:
                         self._set_error("decode", exc, "invalid push payload")
+                        _log_decode_failure(channel, message.get("data"), attempts, exc)
                         continue
                     payload_data = data.get("data") if isinstance(data, dict) else data
                     with self._lock:

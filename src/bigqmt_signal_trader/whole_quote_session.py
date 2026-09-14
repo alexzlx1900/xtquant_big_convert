@@ -11,8 +11,44 @@ subscription does not by itself deliver an initial full snapshot — callers lay
 a ``get_full_tick`` prime on top (done in ``BigQmtXtData.subscribe_whole_quote``).
 """
 
+import datetime
+import json
+import re
 import threading
 import time
+
+from .logging_setup import get_logger
+
+
+log = get_logger("whole_quote_session")
+
+
+def _utc_timestamp():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _safe_error_message(exc, limit=512):
+    text = str(exc)
+    text = re.sub(
+        r'''(?i)(["']?(?:password|shared_secret|token|credential)["']?\s*[:=]\s*)'''
+        r'''("(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*'?|[^\s,;}]+)''',
+        r"\1***",
+        text,
+    )
+    text = text.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    return text[:limit]
+
+
+def _request_id_from_error(message):
+    match = re.search(r"(?i)request_id\s*[:=]\s*([A-Za-z0-9._:-]+)", message)
+    return match.group(1)[:128] if match else "UNKNOWN"
+
+
+def _bounded_scalar(value, limit, default="UNKNOWN"):
+    if value is None:
+        return default
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    return text[:limit] or default
 
 
 def _norm_topic(code_list):
@@ -104,10 +140,11 @@ class WholeQuoteClientSession(object):
             try:
                 self._rpc("subscribe_whole_quote",
                           {"client_id": self.client_id, "sub_id": sub_id, "codes": codes})
-            except Exception:
+            except Exception as exc:
                 with self._lock:
                     if not self._generation_current_locked(stop_event, generation):
                         return False
+                self._log_replay_error(sub_id, entry.get("topic"), exc)
                 raise
             with self._lock:
                 still_active = (self._subscriptions.get(sub_id) is entry and
@@ -285,6 +322,33 @@ class WholeQuoteClientSession(object):
                 "stage": str(stage), "type": type(exc).__name__,
                 "message": str(message)[:200], "monotonic": time.monotonic(),
             }
+
+    def _log_replay_error(self, sub_id, topic, exc):
+        try:
+            raw_error_message = str(exc)
+            error_message = _safe_error_message(raw_error_message, limit=384)
+            event = {
+                "event": "qmt.subscription_rpc_trace",
+                "timestamp": _utc_timestamp(),
+                "method": "subscribe_whole_quote",
+                "request_id": _request_id_from_error(raw_error_message),
+                "subscription_id": _bounded_scalar(sub_id, 64),
+                "topic": _bounded_scalar(topic, 128),
+                "timeout_seconds": None,
+                "stage": "client_timeout" if isinstance(exc, TimeoutError) else "replay_error",
+                "duration_ms": None,
+                "outcome": "TIMEOUT" if isinstance(exc, TimeoutError) else "ERROR",
+                "error_type": type(exc).__name__[:128],
+                "error_message": error_message,
+            }
+            line = json.dumps(event, ensure_ascii=True, separators=(",", ":"))
+            if len(line.encode("utf-8")) > 2048:
+                event["topic"] = _bounded_scalar(topic, 32)
+                event["error_message"] = error_message[:128]
+                line = json.dumps(event, ensure_ascii=True, separators=(",", ":"))
+            log.warning("%s", line)
+        except Exception:
+            pass
 
     def subscription_health(self):
         with self._lock:

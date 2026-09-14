@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -16,6 +17,7 @@ from bigqmt_signal_trader.redis_rpc import (
     RPC_REVISION,
     BigQmtRpcHandlers,
     RedisPubSubRpcService,
+    call_redis_rpc,
     decode_rpc_request_payload,
     encode_rpc_request_payload,
 )
@@ -39,6 +41,146 @@ class FakeRedis:
     def publish(self, channel, value):
         self.published.append((channel, value))
         return 1
+
+
+class FakeRpcPubSub:
+    def __init__(self, owner):
+        self.owner = owner
+        self.messages = []
+        self.closed = False
+        self.close_calls = 0
+
+    def subscribe(self, channel):
+        self.owner.calls.append(("subscribe", channel))
+        if self.owner.subscribe_error is not None:
+            raise self.owner.subscribe_error
+
+    def get_message(self, timeout=None):
+        self.owner.calls.append(("get_message", timeout))
+        return self.messages.pop(0) if self.messages else None
+
+    def close(self):
+        self.closed = True
+        self.close_calls += 1
+
+
+class FakeRpcClient:
+    def __init__(
+        self,
+        respond=True,
+        send_error=None,
+        subscribe_error=None,
+        response_ok=True,
+        response_error="",
+        raw_response=None,
+    ):
+        self.respond = respond
+        self.send_error = send_error
+        self.subscribe_error = subscribe_error
+        self.response_ok = response_ok
+        self.response_error = response_error
+        self.raw_response = raw_response
+        self.calls = []
+        self.kv = {}
+        self.request = None
+        self._pubsub = FakeRpcPubSub(self)
+
+    def _accept(self, payload, pubsub=False):
+        if self.send_error is not None:
+            raise self.send_error
+        self.request = json.loads(decode_rpc_request_payload(payload))
+        if not self.respond:
+            return
+        response = self.raw_response
+        if response is None:
+            response = json.dumps({
+                "request_id": self.request["request_id"],
+                "ok": self.response_ok,
+                "error": self.response_error,
+                "data": {"subscription_id": self.request["params"].get("sub_id")},
+            })
+        if pubsub:
+            self._pubsub.messages.append({"type": "message", "data": response})
+        else:
+            self.kv[self.request["reply_key"]] = response
+
+    def rpush(self, key, payload):
+        self.calls.append(("rpush", key))
+        self._accept(payload)
+        return 1
+
+    def expire(self, key, seconds):
+        self.calls.append(("expire", key, seconds))
+        return True
+
+    def get(self, key):
+        self.calls.append(("get", key))
+        return self.kv.get(key)
+
+    def blpop(self, key, timeout=None):
+        self.calls.append(("blpop", key, timeout))
+        return None
+
+    def delete(self, key):
+        self.calls.append(("delete", key))
+        return 1
+
+    def pubsub(self, ignore_subscribe_messages=True):
+        self.calls.append(("pubsub", ignore_subscribe_messages))
+        return self._pubsub
+
+    def publish(self, channel, payload):
+        self.calls.append(("publish", channel))
+        self._accept(payload, pubsub=True)
+        return 1
+
+
+class FakeFailingRpcClient(FakeRpcClient):
+    def __init__(self, operation, error):
+        super().__init__(respond=False)
+        self.operation = operation
+        self.error = error
+
+    def expire(self, key, seconds):
+        if self.operation == "expire":
+            self.calls.append(("expire", key, seconds))
+            raise self.error
+        return super().expire(key, seconds)
+
+    def get(self, key):
+        if self.operation == "get":
+            self.calls.append(("get", key))
+            raise self.error
+        return super().get(key)
+
+    def blpop(self, key, timeout=None):
+        if self.operation == "blpop":
+            self.calls.append(("blpop", key, timeout))
+            raise self.error
+        return super().blpop(key, timeout=timeout)
+
+
+class FakeFallbackQueueRedis(FakeRedis):
+    def __init__(self, payload):
+        super().__init__()
+        self.payload = payload
+        self.lpop_calls = 0
+
+    def lpop(self, key):
+        self.lpop_calls += 1
+        if self.payload is None:
+            return None
+        payload, self.payload = self.payload, None
+        return payload
+
+
+class FakeDirectTransport:
+    def __init__(self):
+        self.responses = []
+        self.on_raw_payload = None
+
+    def send_response(self, request, response):
+        self.responses.append((request, response))
 
 
 class FakeMarketData:
@@ -175,6 +317,316 @@ def _service_with_listener_methods(allow_order_methods=False, process_in_listene
         process_in_listener=process_in_listener,
         listener_methods=listener_methods,
     )
+
+
+def _trace_events(info_mock):
+    events = []
+    for call in info_mock.call_args_list:
+        if call.args and call.args[0] == "qmt.subscription_rpc_trace %s":
+            events.append(json.loads(call.args[1]))
+    return events
+
+
+class SubscriptionRpcTraceTest(unittest.TestCase):
+    def _params(self):
+        return {"client_id": "gateway", "sub_id": "sub-1", "codes": ["600000.SH"]}
+
+    def test_queue_client_success_uses_one_request_id_without_extra_redis_calls(self):
+        redis_client = FakeRpcClient()
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            response = call_redis_rpc(
+                redis_client, "acct", "subscribe_whole_quote", self._params(),
+                timeout_seconds=3.0, transport="queue",
+            )
+
+        events = _trace_events(info)
+        self.assertEqual([event["stage"] for event in events], ["client_send_success", "client_response"])
+        self.assertEqual({event["request_id"] for event in events}, {redis_client.request["request_id"]})
+        self.assertEqual({event["subscription_id"] for event in events}, {"sub-1"})
+        self.assertEqual([call[0] for call in redis_client.calls], ["rpush", "expire", "get"])
+        self.assertTrue(response["ok"])
+
+    def test_pubsub_client_success_is_traced_after_publish(self):
+        redis_client = FakeRpcClient()
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            response = call_redis_rpc(
+                redis_client, "acct", "subscribe_whole_quote", self._params(),
+                timeout_seconds=3.0, transport="pubsub",
+            )
+
+        events = _trace_events(info)
+        self.assertEqual([event["stage"] for event in events], ["client_send_success", "client_response"])
+        self.assertEqual({event["request_id"] for event in events}, {redis_client.request["request_id"]})
+        self.assertEqual(
+            [call[0] for call in redis_client.calls],
+            ["pubsub", "subscribe", "publish", "get_message"],
+        )
+        self.assertTrue(response["ok"])
+        self.assertTrue(redis_client._pubsub.closed)
+
+    def test_timeout_keeps_original_prefix_and_adds_trace_request_id(self):
+        redis_client = FakeRpcClient(respond=False)
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            with self.assertRaisesRegex(
+                TimeoutError,
+                r"^redis rpc timeout: subscribe_whole_quote account_id=acct .* request_id=[0-9a-f]{32}$",
+            ):
+                call_redis_rpc(
+                    redis_client, "acct", "subscribe_whole_quote", self._params(),
+                    timeout_seconds=0.0, transport="queue",
+                )
+
+        events = _trace_events(info)
+        self.assertEqual([event["stage"] for event in events], ["client_send_success", "client_timeout"])
+        self.assertEqual(events[1]["outcome"], "TIMEOUT")
+        self.assertEqual(events[1]["timeout_seconds"], 0.0)
+        self.assertEqual(events[0]["request_id"], events[1]["request_id"])
+        self.assertEqual([call[0] for call in redis_client.calls], ["rpush", "expire", "get", "get"])
+
+    def test_send_failure_is_bounded_and_redacted_without_retry(self):
+        error = RuntimeError("password=secret redis://user:pass@host\n" + ("错" * 700))
+        redis_client = FakeRpcClient(send_error=error)
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            with self.assertRaises(RuntimeError) as caught:
+                call_redis_rpc(
+                    redis_client, "acct", "subscribe_whole_quote", self._params(),
+                    timeout_seconds=3.0, transport="queue",
+                )
+
+        self.assertIs(caught.exception, error)
+        events = _trace_events(info)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["stage"], "client_send_failure")
+        self.assertNotIn("secret", events[0]["error_message"])
+        self.assertNotIn("user:pass", events[0]["error_message"])
+        self.assertNotIn("\n", events[0]["error_message"])
+        self.assertLessEqual(len(events[0]["error_message"]), 512)
+        self.assertEqual([call[0] for call in redis_client.calls], ["rpush"])
+        rendered = (info.call_args.args[0] % info.call_args.args[1:]).encode("utf-8")
+        self.assertLessEqual(len(rendered), 2048)
+
+    def test_sensitive_error_value_styles_are_fully_redacted(self):
+        for message, secret in (
+            ("{'password': 'a b'}", "a b"),
+            ('token="c d"', "c d"),
+            ("shared_secret=plain-value", "plain-value"),
+            ("credential: opaque", "opaque"),
+        ):
+            with self.subTest(message=message):
+                redis_client = FakeRpcClient(send_error=RuntimeError(message))
+                with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+                    with self.assertRaises(RuntimeError):
+                        call_redis_rpc(
+                            redis_client, "acct", "subscribe_whole_quote", self._params(),
+                            timeout_seconds=3.0, transport="queue",
+                        )
+                event = _trace_events(info)[0]
+                self.assertNotIn(secret, event["error_message"])
+                self.assertIn("<redacted>", event["error_message"])
+
+    def test_error_response_is_returned_unchanged_and_traced_as_error(self):
+        redis_client = FakeRpcClient(response_ok=False, response_error="upstream unavailable")
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            response = call_redis_rpc(
+                redis_client, "acct", "quote_keepalive", self._params(),
+                timeout_seconds=3.0, transport="queue",
+            )
+
+        self.assertFalse(response["ok"])
+        events = _trace_events(info)
+        self.assertEqual([event["stage"] for event in events], ["client_response"])
+        self.assertEqual(events[0]["outcome"], "ERROR")
+        self.assertEqual(events[0]["error_type"], "RpcResponseError")
+
+    def test_pubsub_decode_failure_keeps_original_exception_and_request_id_trace(self):
+        redis_client = FakeRpcClient(raw_response="not-json")
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            with self.assertRaises(json.JSONDecodeError) as caught:
+                call_redis_rpc(
+                    redis_client, "acct", "subscribe_whole_quote", self._params(),
+                    timeout_seconds=3.0, transport="pubsub",
+                )
+
+        events = _trace_events(info)
+        self.assertEqual([event["stage"] for event in events], ["client_send_success", "client_response"])
+        self.assertEqual(events[1]["outcome"], "ERROR")
+        self.assertEqual(events[1]["error_type"], caught.exception.__class__.__name__)
+        self.assertEqual(events[0]["request_id"], events[1]["request_id"])
+
+    def test_pubsub_subscribe_failure_keeps_exception_and_closes_pubsub(self):
+        error = RuntimeError("subscribe unavailable")
+        redis_client = FakeRpcClient(subscribe_error=error)
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            with self.assertRaises(RuntimeError) as caught:
+                call_redis_rpc(
+                    redis_client, "acct", "subscribe_whole_quote", self._params(),
+                    timeout_seconds=3.0, transport="pubsub",
+                )
+
+        self.assertIs(caught.exception, error)
+        self.assertEqual(redis_client._pubsub.close_calls, 1)
+        self.assertEqual([event["stage"] for event in _trace_events(info)], ["client_send_failure"])
+
+    def test_queue_non_dict_response_preserves_original_value(self):
+        redis_client = FakeRpcClient(raw_response='["legacy", 1]')
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            response = call_redis_rpc(
+                redis_client, "acct", "subscribe_whole_quote", self._params(),
+                timeout_seconds=3.0, transport="queue",
+            )
+
+        self.assertEqual(response, ["legacy", 1])
+        self.assertEqual([event["outcome"] for event in _trace_events(info)], ["SUCCESS", "SUCCESS"])
+
+    def test_non_subscription_timeout_message_and_logging_are_unchanged(self):
+        redis_client = FakeRpcClient(respond=False)
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            with self.assertRaisesRegex(
+                TimeoutError,
+                r"^redis rpc timeout: get_asset account_id=acct request_queue=bigqmt:rpc:queue:acct$",
+            ):
+                call_redis_rpc(
+                    redis_client, "acct", "get_asset", {},
+                    timeout_seconds=0.0, transport="queue",
+                )
+
+        self.assertEqual(_trace_events(info), [])
+
+    def test_queue_transport_errors_keep_original_exception_without_retry(self):
+        expected_calls = {
+            "expire": ["rpush", "expire"],
+            "get": ["rpush", "expire", "get"],
+            "blpop": ["rpush", "expire", "get", "blpop"],
+        }
+        for operation in ("expire", "get", "blpop"):
+            with self.subTest(operation=operation):
+                error = RuntimeError("%s unavailable" % operation)
+                redis_client = FakeFailingRpcClient(operation, error)
+                with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+                    with self.assertRaises(RuntimeError) as caught:
+                        call_redis_rpc(
+                            redis_client, "acct", "subscribe_whole_quote", self._params(),
+                            timeout_seconds=3.0, transport="queue",
+                        )
+                self.assertIs(caught.exception, error)
+                self.assertEqual([call[0] for call in redis_client.calls], expected_calls[operation])
+                events = _trace_events(info)
+                self.assertEqual([event["stage"] for event in events], ["client_send_success", "client_response"])
+                self.assertEqual(events[1]["outcome"], "ERROR")
+                self.assertEqual(events[0]["request_id"], events[1]["request_id"])
+
+    def test_server_success_has_four_correlated_stages(self):
+        redis_client, service = _service()
+        service.handlers.quote_subscription_manager = SimpleNamespace(
+            subscribe=lambda client_id, sub_id, codes: {"subscription_id": sub_id}
+        )
+        request = {
+            "request_id": "trace-server-1",
+            "account_id": "acct",
+            "method": "subscribe_whole_quote",
+            "params": self._params(),
+        }
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            service.enqueue_payload(request)
+            self.assertEqual(service.drain_pending(), 1)
+
+        events = _trace_events(info)
+        self.assertEqual(
+            [event["stage"] for event in events],
+            ["server_receive", "server_handle_start", "server_handle_finish", "server_response_publish"],
+        )
+        self.assertEqual({event["request_id"] for event in events}, {"trace-server-1"})
+        self.assertTrue(all(event["timeout_seconds"] is None for event in events))
+        self.assertEqual({event["subscription_id"] for event in events}, {"sub-1"})
+
+    def test_server_handler_and_publish_failures_are_traced_without_raising(self):
+        redis_client, service = _service()
+        request = {
+            "request_id": "trace-server-error",
+            "account_id": "acct",
+            "method": "subscribe_whole_quote",
+            "params": self._params(),
+        }
+        with mock.patch.object(service._transport, "send_response", side_effect=RuntimeError("token=hidden")):
+            with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+                service.enqueue_payload(request)
+                self.assertEqual(service.drain_pending(), 1)
+
+        events = _trace_events(info)
+        finish = next(event for event in events if event["stage"] == "server_handle_finish")
+        publish = next(event for event in events if event["stage"] == "server_response_publish")
+        self.assertEqual(finish["outcome"], "ERROR")
+        self.assertEqual(finish["error_type"], "RuntimeError")
+        self.assertEqual(publish["outcome"], "ERROR")
+        self.assertNotIn("hidden", publish["error_message"])
+
+    def test_fallback_queue_drain_records_receive_before_handler(self):
+        request = {
+            "request_id": "fallback-receive",
+            "account_id": "acct",
+            "method": "subscribe_whole_quote",
+            "params": self._params(),
+        }
+        redis_client = FakeFallbackQueueRedis(encode_rpc_request_payload(request))
+        _unused, template_service = _service()
+        template_service.handlers.quote_subscription_manager = SimpleNamespace(
+            subscribe=lambda client_id, sub_id, codes: {"subscription_id": sub_id}
+        )
+        transport = FakeDirectTransport()
+        service = RedisPubSubRpcService(
+            redis_client, template_service.handlers, account_id="acct", transport=transport,
+        )
+
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            self.assertEqual(service.drain_request_queue(), 1)
+
+        events = _trace_events(info)
+        self.assertEqual(events[0]["stage"], "server_receive")
+        self.assertEqual(events[1]["stage"], "server_handle_start")
+        self.assertEqual(redis_client.lpop_calls, 2)
+
+    def test_orders_and_successful_keepalive_do_not_emit_trace_noise(self):
+        redis_client, service = _service(allow_order_methods=True)
+        service.handlers.quote_subscription_manager = SimpleNamespace(
+            keepalive=lambda client_id, sub_id: None
+        )
+        with mock.patch("bigqmt_signal_trader.redis_rpc._rpc_logger.info") as info:
+            service.enqueue_payload({
+                "request_id": "quiet-keepalive", "account_id": "acct",
+                "method": "quote_keepalive", "params": self._params(),
+            })
+            service.enqueue_payload({
+                "request_id": "quiet-order", "account_id": "acct",
+                "method": "submit_order", "params": {"token": "must-not-log"},
+            })
+            self.assertEqual(service.drain_pending(), 2)
+
+        self.assertEqual(_trace_events(info), [])
+
+    def test_logging_failure_does_not_change_successful_rpc_result(self):
+        redis_client = FakeRpcClient()
+
+        with mock.patch(
+            "bigqmt_signal_trader.redis_rpc._rpc_logger.info",
+            side_effect=RuntimeError("logger unavailable"),
+        ):
+            response = call_redis_rpc(
+                redis_client, "acct", "subscribe_whole_quote", self._params(),
+                timeout_seconds=3.0, transport="queue",
+            )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual([call[0] for call in redis_client.calls], ["rpush", "expire", "get"])
 
 
 class FakeOrderGateway(DryRunOrderGateway):

@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -16,6 +17,15 @@ from bigqmt_signal_trader.quote_push_channel import (
     decode_push_payload,
     encode_push_payload,
 )
+from bigqmt_signal_trader import quote_push_channel as quote_push_channel_module
+
+
+class CapturingLogger:
+    def __init__(self):
+        self.lines = []
+
+    def warning(self, template, value):
+        self.lines.append(template % value)
 
 
 def _msgpack_packb(payload):
@@ -229,17 +239,109 @@ class RedisPushChannelTest(unittest.TestCase):
         received = []
         done = threading.Event()
         client = RedisQuotePushChannel(redis_client, account_id="acct")
-        client.start_subscriber(["SH"], lambda topic, data: (received.append(data), done.set()))
-        try:
-            redis_client.publish("bigqmt:quote_push:acct:SH", b"not-json-or-msgpack")
-            redis_client.publish("bigqmt:quote_push:acct:SH",
-                                 encode_push_payload({"combo_key": "SH", "data": {"ok": 1}}))
-            self.assertTrue(done.wait(2.0))
-            self.assertEqual(received, [{"ok": 1}])
-            self.assertEqual(client.last_error["stage"], "decode")
-            self.assertEqual(client.last_error["message"], "invalid push payload")
-        finally:
-            client.stop()
+        captured = CapturingLogger()
+        bad_wire = b'{"password":"supersecret",\n' + (b"x" * 160)
+        with mock.patch.object(quote_push_channel_module, "log", captured):
+            client.start_subscriber(["SH"], lambda topic, data: (received.append(data), done.set()))
+            try:
+                redis_client.publish("bigqmt:quote_push:acct:SH", bad_wire)
+                redis_client.publish("bigqmt:quote_push:acct:SH",
+                                     encode_push_payload({"combo_key": "SH", "data": {"ok": 1}}))
+                self.assertTrue(done.wait(2.0))
+                self.assertEqual(received, [{"ok": 1}])
+                self.assertEqual(client.last_error["stage"], "decode")
+                self.assertEqual(client.last_error["message"], "invalid push payload")
+            finally:
+                client.stop()
+
+        self.assertEqual(len(captured.lines), 1)
+        self.assertLessEqual(len(captured.lines[0].encode("utf-8")), 2048)
+        event = json.loads(captured.lines[0])
+        self.assertEqual(event["event"], "qmt.quote_push_decode_failed")
+        self.assertEqual(event["channel"], "bigqmt:quote_push:acct:SH")
+        self.assertEqual(event["wire_bytes"], len(bad_wire))
+        self.assertEqual(event["wire_prefix_bytes"], 64)
+        self.assertLessEqual(len(event["wire_prefix_escaped"]), 256)
+        self.assertLessEqual(event["snippet_source_bytes"], 256)
+        self.assertTrue(event["snippet_truncated"])
+        self.assertTrue(event["timestamp"].endswith("Z"))
+        self.assertEqual(event["codec_attempts"][-1]["codec"], "json")
+        self.assertEqual(event["codec_attempts"][-1]["outcome"], "ERROR")
+        self.assertIn("char=", event["error_location"])
+        self.assertNotIn("\n", event["wire_prefix_escaped"])
+        self.assertNotIn("supersecret", captured.lines[0])
+
+    def test_decode_diagnostics_failure_cannot_break_message_recovery(self):
+        redis_client = FakeRedis()
+        received = []
+        done = threading.Event()
+        client = RedisQuotePushChannel(redis_client, account_id="acct")
+        with mock.patch.object(quote_push_channel_module, "_wire_bytes",
+                               side_effect=RuntimeError("diagnostics failed")):
+            client.start_subscriber(["SH"], lambda topic, data: (received.append(data), done.set()))
+            try:
+                redis_client.publish("bigqmt:quote_push:acct:SH", b"bad-json")
+                redis_client.publish("bigqmt:quote_push:acct:SH",
+                                     encode_push_payload({"combo_key": "SH", "data": {"ok": 2}}))
+                self.assertTrue(done.wait(2.0))
+                self.assertEqual(received, [{"ok": 2}])
+            finally:
+                client.stop()
+
+    def test_unicode_diagnostic_fields_remain_valid_bounded_json(self):
+        captured = CapturingLogger()
+        doc = '{"value":"' + ("测" * 200) + '" broken}'
+        exc = json.JSONDecodeError("bad\nmessage", doc, 120)
+        with mock.patch.object(quote_push_channel_module, "log", captured):
+            quote_push_channel_module._log_decode_failure(
+                "频道" * 300, doc.encode("utf-8"),
+                [{"codec": "json", "outcome": "ERROR", "error_type": "JSONDecodeError"}],
+                exc,
+            )
+        self.assertEqual(len(captured.lines), 1)
+        self.assertLessEqual(len(captured.lines[0].encode("utf-8")), 2048)
+        event = json.loads(captured.lines[0])
+        self.assertEqual(event["event"], "qmt.quote_push_decode_failed")
+        self.assertLessEqual(event["snippet_source_bytes"], 256)
+        self.assertNotIn("\n", event["error_message"])
+
+    def test_head_tail_and_error_context_cannot_reveal_partial_secrets(self):
+        captured = CapturingLogger()
+        doc = ('{"password":"alpha beta value",' + ("x" * 70) +
+               '"token":"middle secret value",' + ("y" * 70) +
+               '"credential":"tail secret value"}')
+        error_pos = doc.index("middle secret") + 7
+        exc = json.JSONDecodeError("bad", doc, error_pos)
+        with mock.patch.object(quote_push_channel_module, "log", captured):
+            quote_push_channel_module._log_decode_failure(
+                "channel", doc.encode("utf-8"),
+                [{"codec": "json", "outcome": "ERROR", "error_type": "JSONDecodeError"}],
+                exc,
+            )
+        event = json.loads(captured.lines[0])
+        snippets = b"".join(
+            bytes.fromhex(event[name].replace("\\x", ""))
+            for name in ("wire_prefix_escaped", "wire_tail_escaped", "error_context_escaped")
+        )
+        for secret_part in (b"alpha", b"beta", b"middle", b"secret", b"tail", b"value"):
+            self.assertNotIn(secret_part, snippets)
+        self.assertLessEqual(event["snippet_source_bytes"], 256)
+
+    def test_double_codec_long_fields_remain_complete_bounded_json(self):
+        captured = CapturingLogger()
+        long_error = type("DiagnosticError" + ("X" * 220), (Exception,), {})
+        exc = long_error("故障" * 600)
+        attempts = [
+            {"codec": "msgpack", "outcome": "ERROR", "error_type": "M" * 128},
+            {"codec": "json", "outcome": "ERROR", "error_type": "J" * 128},
+        ]
+        with mock.patch.object(quote_push_channel_module, "log", captured):
+            quote_push_channel_module._log_decode_failure(
+                "频道" * 400, b"{" + (b"z" * 500), attempts, exc)
+        self.assertEqual(len(captured.lines), 1)
+        self.assertLessEqual(len(captured.lines[0].encode("utf-8")), 2048)
+        event = json.loads(captured.lines[0])
+        self.assertEqual([item["codec"] for item in event["codec_attempts"]], ["msgpack", "json"])
 
     def test_disconnect_recreates_pubsub_and_restores_topics(self):
         redis_client = DisconnectOnceRedis()
