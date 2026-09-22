@@ -420,6 +420,11 @@ class BigQmtMarketDataProvider:
             if method_name in ("get_market_data_ex", "get_market_data_ex_ori")
             else {}
         )
+        if "subscribe" in params and method_name in ("get_market_data_ex", "get_market_data_ex_ori"):
+            if not isinstance(params["subscribe"], bool):
+                raise ValueError("subscribe must be a boolean")
+            extended_kwargs["subscribe"] = params["subscribe"]
+            mini_kwargs["subscribe"] = params["subscribe"]
         big_kwargs.update(extended_kwargs)
         if method_name == "get_local_data" and data_dir is not None:
             mini_kwargs["data_dir"] = data_dir
@@ -440,7 +445,8 @@ class BigQmtMarketDataProvider:
             (method_name, (), mini_kwargs),
             (
                 method_name,
-                (field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data),
+                (field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data)
+                + ((params["subscribe"],) if "subscribe" in extended_kwargs else ()),
                 {},
             ),
             (method_name, (field_list, stock_list), positional_tail_kwargs),
@@ -468,6 +474,7 @@ class BigQmtMarketDataProvider:
                     "count": count,
                     "dividend_type": dividend_type,
                     "fill_data": fill_data,
+                    **extended_kwargs,
                 },
             ),
         ]
@@ -662,7 +669,8 @@ class BigQmtMarketDataProvider:
                 kwargs.get("stock_list") or kwargs.get("stock_code"),
             )
         shapes = self._market_data_shapes("get_market_data_ex", **kwargs)
-        if hasattr(self.context_info, "get_market_data") and kwargs.get("fill_data") is not False:
+        if (hasattr(self.context_info, "get_market_data")
+                and kwargs.get("fill_data") is not False and "subscribe" not in kwargs):
             shapes.extend(self._market_data_shapes("get_market_data", **kwargs))
         return self._call_first_supported(shapes)
 

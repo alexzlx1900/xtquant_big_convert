@@ -262,6 +262,72 @@ class BigQmtAdaptersTest(unittest.TestCase):
                 period="1m", fill_data=False,
             )
 
+    def test_explicit_no_subscribe_reaches_extended_and_raw_methods(self):
+        class Context:
+            def __init__(self):
+                self.calls = []
+
+            def get_market_data_ex(self, fields, stock_code, **kwargs):
+                self.calls.append(kwargs)
+                return {"002278.SZ": []}
+
+        for period, fields in (("1m", ["close"]), ("tick", [])):
+            for raw in (False, True):
+                with self.subTest(period=period, raw=raw):
+                    context = Context()
+                    if raw:
+                        context.get_market_data_ex_ori = context.get_market_data_ex
+                    provider = BigQmtMarketDataProvider(context)
+                    provider.get_market_data_ex(field_list=fields, stock_list=["002278.SZ"],
+                                                period=period, fill_data=False, subscribe=False)
+                    self.assertIs(context.calls[0]["subscribe"], False)
+                    self.assertIs(context.calls[0]["fill_data"], False)
+                    self.assertEqual(context.calls[0]["period"], period)
+
+    def test_no_subscribe_never_falls_back_to_an_implicit_subscription(self):
+        context = FakeMarketDataContext()  # 此旧签名不接受 subscribe。
+        provider = BigQmtMarketDataProvider(context)
+        with self.assertRaises(TypeError):
+            provider.get_market_data_ex(field_list=["close"], stock_list=["002278.SZ"], subscribe=False)
+        self.assertEqual(context.market_calls, [])
+        legacy = BigQmtMarketDataProvider(FakeMarketDataFallbackContext())
+        with self.assertRaises(NotImplementedError):
+            legacy.get_market_data_ex(field_list=["close"], stock_list=["002278.SZ"], subscribe=False)
+
+    def test_positional_only_shape_preserves_no_subscribe(self):
+        class Context:
+            args = None
+
+            def get_market_data_ex(self, *args, **kwargs):
+                if kwargs or len(args) != 9:
+                    raise TypeError("positional signature required")
+                self.args = args
+                return {"002278.SZ": []}
+        context = Context()
+        BigQmtMarketDataProvider(context).get_market_data_ex(
+            field_list=["close"], stock_list=["002278.SZ"], subscribe=False)
+        self.assertIs(context.args[8], False)
+
+    def test_invalid_subscribe_is_rejected_before_context_call(self):
+        context = FakeMarketDataContext()
+        with self.assertRaises(ValueError):
+            BigQmtMarketDataProvider(context).get_market_data_ex(subscribe="false")
+        self.assertEqual(context.market_calls, [])
+
+    def test_last_compatibility_shape_does_not_drop_subscribe(self):
+        class Context:
+            subscribe = None
+
+            def get_market_data_ex(self, *args, **kwargs):
+                if len(args) != 1 or "stock_list" not in kwargs:
+                    raise TypeError("fields positional, stock_list keyword")
+                self.subscribe = kwargs.get("subscribe", True)
+                return {"002278.SZ": []}
+        context = Context()
+        BigQmtMarketDataProvider(context).get_market_data_ex(
+            field_list=["close"], stock_list=["002278.SZ"], subscribe=False)
+        self.assertIs(context.subscribe, False)
+
     def test_position_provider_maps_qmt_position_objects(self):
         calls = []
 

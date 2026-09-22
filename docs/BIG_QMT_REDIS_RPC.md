@@ -26,6 +26,26 @@
 
 ## MiniQMT 兼容方法名
 
+### 2026-09-22：显式订阅参数（本地修复，未部署）
+
+实盘虚拟机 `002278.SZ` 一分钟订阅被行情服务器以 `210000 / 订阅超过上限`
+拒绝。实装 `_PyContextInfo.py:142,179` 的两个扩展读取接口默认 `subscribe=True`；
+原桥接没有传入这个参数，因此普通读取也可能隐式新增订阅。
+
+适配器现在保留调用方显式传入的布尔 `subscribe`，所有关键字和位置参数兼容形态
+都保留此约束。无法表达该参数时直接失败，不能回退到旧 `get_market_data`。
+未传 `subscribe` 的其他调用维持现有默认行为。AQP Gateway 的分钟查询和历史 Tick
+读回显式传 `subscribe=False`；Tick 的 `none/serial/batch` 模式均遵循此约束。
+下载流程本身保持既有有限日期窗口，下载失败时不读回，空读回仍报告失败。
+Gateway 的上述 RPC 使用 `use_formula=False`，不经可能忽略订阅参数的快速路径。
+
+此变更不会释放已存在的订阅，也不会补齐缺失分钟。上线须先更新并验收桥接，
+再更新 Gateway；不能在旧桥接会忽略参数时宣称防止新增订阅已生效。
+本地针对性适配器测试 38 项通过，扩展接口和原始接口均验证分钟及空字段列表 Tick
+的 `subscribe=False`。本次按用户授权交付本地提交；未推送、未部署。
+本次服务端运行文件只涉及 `bigqmt_signal_trader/adapters/market_bigqmt.py`，没有修改
+客户端协议或依赖，不需要以这次修复为由重装 Gateway wheel 或覆盖券商原生 `xtquant`。
+
 ### 2026-09-07：分钟历史查询填充参数修复
 
 实机 `C:\国金证券QMT交易端\python\_PyContextInfo.py` 中，`get_market_data_ex` 与
