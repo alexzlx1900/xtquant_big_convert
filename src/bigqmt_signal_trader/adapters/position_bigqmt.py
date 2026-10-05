@@ -1,5 +1,8 @@
 """Big QMT position and asset adapters."""
 
+import datetime as _dt
+import math
+
 from ..code_utils import normalize_stock_code
 from ..models import AssetSnapshot, PositionSnapshot, PositionStatisticsSnapshot
 
@@ -20,6 +23,58 @@ def _float_or_none(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _evidence_number(value, integer=False):
+    """严格证据路径拒绝缺失、非有限数值和被 int 截断的数量。"""
+    if value is None or isinstance(value, bool):
+        raise ValueError("missing or invalid number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("non-finite number")
+    if integer:
+        if number < 0 or not number.is_integer():
+            raise ValueError("quantity must be a nonnegative integer")
+        return int(number)
+    return number
+
+
+def _evidence_position(row):
+    code = _full_code(
+        _attr(row, ("m_strInstrumentID", "instrument_id", "stock_code")),
+        _attr(row, ("m_strExchangeID", "exchange_id", "market")),
+    )
+    if not code:
+        raise ValueError("missing security code")
+    instrument, separator, market = code.rpartition(".")
+    if separator and market in ("SH", "SZ", "BJ", "HK", "HGT", "SGT"):
+        # SH/SZ 的八位期权代码属于有效原始持仓；事件品种支持由下游判断。
+        allowed_lengths = (6, 8) if market in ("SH", "SZ") else ((6,) if market == "BJ" else (5,))
+        if not instrument.isdigit() or len(instrument) not in allowed_lengths:
+            raise ValueError("invalid security code")
+    values = {
+        "stock_code": code,
+        "stock_name": str(_attr(row, ("m_strInstrumentName", "stock_name"), "") or ""),
+        "volume": _evidence_number(_attr(row, ("m_nVolume", "volume")), integer=True),
+        "available": _evidence_number(
+            _attr(row, ("m_nCanUseVolume", "available", "can_use_volume")), integer=True),
+        "cost": _evidence_number(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "cost"))),
+    }
+    for field, names in (
+        ("market_value", ("m_dMarketValue", "m_dInstrumentValue", "market_value")),
+        ("price", ("m_dLastPrice", "m_dSettlementPrice", "price", "last_price")),
+        ("open_price", ("m_dOpenPrice", "m_dCostPrice", "open_price", "cost")),
+    ):
+        value = _attr(row, names)
+        values[field] = None if value is None else _evidence_number(value)
+    for field, names in (
+        ("frozen_volume", ("m_nFrozenVolume", "frozen_volume")),
+        ("on_road_volume", ("m_nOnRoadVolume", "on_road_volume")),
+        ("yesterday_volume", ("m_nYesterdayVolume", "yesterday_volume")),
+    ):
+        values[field] = _evidence_number(_attr(row, names, 0), integer=True)
+    values["direction"] = int(_attr(row, ("m_nDirection", "direction"), 48) or 48)
+    return PositionSnapshot(**values)
 
 
 # Candidate ThinkTrader field names on the ACCOUNT row of get_trade_detail_data.
@@ -182,6 +237,51 @@ class BigQmtPositionProvider:
                 direction=int(_attr(row, ("m_nDirection", "direction"), 48) or 48),
             )
         return positions
+
+    def get_positions_with_evidence(self, account_id):
+        """一次原生 POSITION 查询及其转换完整性；不改变旧持仓调用。"""
+        evidence = {
+            "contract_version": 1,
+            "account_id": str(account_id),
+            "account_type": self.account_type,
+            "queried_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "source": "native_get_trade_detail_data",
+            "raw_row_count": None,
+            "converted_row_count": None,
+            "returned_row_count": None,
+            "skipped_row_count": None,
+            "duplicate_row_count": None,
+            "complete": False,
+            "status": "FAILED",
+            "error_code": None,
+        }
+        result = {"positions": {}, "source_evidence": evidence}
+        try:
+            rows = self._require_query_func()(account_id, self.account_type, "POSITION")
+        except Exception:
+            evidence["error_code"] = "POSITION_QUERY_FAILED"
+            return result
+        if not isinstance(rows, (list, tuple)):
+            evidence["error_code"] = "POSITION_ROWS_UNAVAILABLE" if rows is None else "POSITION_ROWS_INVALID"
+            return result
+        evidence.update(raw_row_count=len(rows), converted_row_count=0,
+                        returned_row_count=0, skipped_row_count=0, duplicate_row_count=0)
+        positions = result["positions"]
+        for row in rows:
+            try:
+                position = _evidence_position(row)
+            except Exception:
+                evidence["skipped_row_count"] += 1
+                continue
+            evidence["converted_row_count"] += 1
+            if position.stock_code in positions:
+                evidence["duplicate_row_count"] += 1
+            positions[position.stock_code] = position
+        evidence["returned_row_count"] = len(positions)
+        complete = evidence["skipped_row_count"] == 0 and evidence["duplicate_row_count"] == 0
+        evidence.update(complete=complete, status="OK" if complete else "PARTIAL",
+                        error_code=None if complete else "POSITION_CONVERSION_INCOMPLETE")
+        return result
 
     def get_position_statistics(self, account_id):
         query = self._require_query_func()

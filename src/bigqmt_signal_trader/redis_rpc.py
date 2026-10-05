@@ -876,7 +876,24 @@ class BigQmtRpcHandlers:
         return handler(**dict(params or {}))
 
     def _handle_get_positions(self, params):
-        return self.position_provider.get_positions(self._request_account_id(params))
+        account_id = self._request_account_id(params)
+        if params.get("include_source_evidence") is True:
+            handler = getattr(self.position_provider, "get_positions_with_evidence", None)
+            if callable(handler):
+                return handler(account_id)
+            return {
+                "positions": {},
+                "source_evidence": {
+                    "contract_version": 1, "account_id": account_id,
+                    "account_type": getattr(self.position_provider, "account_type", None),
+                    "queried_at": None, "source": None,
+                    "raw_row_count": None, "converted_row_count": None,
+                    "returned_row_count": None, "skipped_row_count": None,
+                    "duplicate_row_count": None, "complete": False,
+                    "status": "UNSUPPORTED", "error_code": "POSITION_EVIDENCE_UNSUPPORTED",
+                },
+            }
+        return self.position_provider.get_positions(account_id)
 
     def _handle_get_position_statistics(self, params):
         return self.position_provider.get_position_statistics(self._request_account_id(params))
