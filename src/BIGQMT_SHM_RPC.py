@@ -1,0 +1,441 @@
+# coding: utf-8
+"""独立SHM RPC原生入口；默认只查询，不绑定原生下单/撤单函数。"""
+
+import base64
+import builtins
+import datetime as _dt
+import json
+import math
+import re
+import threading
+import time
+import types
+
+
+BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
+SHM_RPC_NAME = "Local\\AQP_SHM_TRADE_SIM"
+SHM_RPC_ALLOW_ORDER_METHODS = False
+SHM_RPC_BIND_ACCOUNT_CALLBACKS = False  # 显式只读回报候选可绑定账户；不授予订单权限。
+SHM_RPC_MAX_SECONDS = 60
+SHM_RPC_MAX_REQUESTS = 180
+SHM_RPC_ORDER_GATEWAY = None  # 禁写默认不绑定；另行授权后才可显式注入既有gateway。
+SHM_RPC_ORDER_GATEWAY_FACTORY = None  # 显式候选可注入factory；禁写时不会构造。
+_EMBEDDED_SOURCES = {}  # BUILD_SHM_RPC_EMBEDDED
+_MODULE_CACHE = {}
+_ORIGINAL_IMPORT = builtins.__import__
+_PACKAGES = ("bigqmt_signal_trader", "bigqmt_signal_trader.adapters", "bigqmt_signal_trader.transports")
+_STANDARD_IMPORTS = frozenset(("_strptime", "base64", "builtins", "collections", "ctypes", "datetime", "enum", "json", "math", "os", "re", "struct", "threading", "time", "types", "typing", "uuid"))
+_SERVER = None
+
+
+def _bundle_import(name, module_globals=None, module_locals=None, fromlist=(), level=0):
+    if level:
+        parts = (module_globals or {}).get("__package__", "").split(".")
+        name = ".".join(parts[:len(parts) - level + 1] + ([name] if name else []))
+    if name in _EMBEDDED_SOURCES or name in _PACKAGES:
+        module = _load_embedded(name)
+        return module if fromlist else _load_embedded(name.split(".")[0])
+    if name.split(".")[0] not in _STANDARD_IMPORTS:
+        raise ImportError("module is outside SHM RPC embedded allowlist: %s" % name)
+    return _ORIGINAL_IMPORT(name, module_globals, module_locals, fromlist, 0)
+
+
+def _load_embedded(name):
+    if name in _MODULE_CACHE:
+        return _MODULE_CACHE[name]
+    if name not in _PACKAGES and name not in _EMBEDDED_SOURCES:
+        raise ImportError("embedded SHM RPC module missing: %s" % name)
+    module = types.ModuleType(name)
+    package = name in _PACKAGES
+    module.__package__ = name if package else name.rpartition(".")[0]
+    module.__file__ = "<embedded:%s>" % name
+    if package:
+        module.__path__ = []
+    module_builtins = dict(vars(builtins))
+    module_builtins["__import__"] = _bundle_import
+    module.__dict__["__builtins__"] = module_builtins
+    _MODULE_CACHE[name] = module
+    try:
+        if not package:
+            source = base64.b64decode(_EMBEDDED_SOURCES[name]).decode("utf-8")
+            exec(compile(source, module.__file__, "exec"), module.__dict__)
+        if "." in name:
+            parent, _, child = name.rpartition(".")
+            setattr(_load_embedded(parent), child, module)
+    except Exception:
+        _MODULE_CACHE.pop(name, None)
+        raise
+    return module
+
+
+class NativeReadOnlyProvider:
+    """把已有严格只读转换交给既有handlers；不创建另一个交易gateway。"""
+    def __init__(self, query, account_id):
+        self.account_id = account_id
+        self.positions = _load_embedded("bigqmt_signal_trader.adapters.position_bigqmt").BigQmtPositionProvider(query, account_type="STOCK")
+        self.accounts = _load_embedded("bigqmt_signal_trader.adapters.account_readonly").ReadOnlyAccountProvider(query)
+
+    def _target(self, account_id):
+        if account_id != self.account_id:
+            raise ValueError("native provider account mismatch")
+
+    def get_asset(self, account_id):
+        self._target(account_id)
+        return self.accounts.get_asset(account_id)
+
+    def get_positions(self, account_id):
+        self._target(account_id)
+        evidence = self.positions.get_positions_with_evidence(account_id)
+        if not evidence["source_evidence"]["complete"]:
+            raise RuntimeError("native position evidence incomplete: %s" % evidence["source_evidence"]["error_code"])
+        return evidence["positions"]
+
+    def get_positions_with_evidence(self, account_id):
+        self._target(account_id)
+        return self.positions.get_positions_with_evidence(account_id)
+
+    def _records(self, account_id, detail_type, strategy_name):
+        self._target(account_id)
+        evidence = self.accounts.query_records(account_id, detail_type, strategy_name)
+        if not evidence["source_evidence"]["complete"]:
+            raise RuntimeError("native %s evidence incomplete: %s" % (detail_type, evidence["source_evidence"]["error_code"]))
+        return evidence["orders" if detail_type == "ORDER" else "trades"]
+
+    def query_orders(self, account_id, strategy_name=""):
+        return self._records(account_id, "ORDER", strategy_name)
+
+    def query_trades(self, account_id, strategy_name=""):
+        return self._records(account_id, "DEAL", strategy_name)
+
+
+class NativeStockOrderGateway(NativeReadOnlyProvider):
+    """普通股票限价原生接口；复用既有订单模型和严格查询，不推断合同号。"""
+    def __init__(self, context, account_id, query, passorder_func, cancel_func):
+        if not callable(passorder_func) or not callable(cancel_func):
+            raise RuntimeError("explicit native passorder/cancel functions required")
+        super().__init__(query, account_id)
+        self.context, self.passorder, self.cancel_func = context, passorder_func, cancel_func
+        self.models = _load_embedded("bigqmt_signal_trader.models")
+        self._submitted, self._cancel_attempted = {}, set()
+
+    def validate_submit_params(self, params):
+        # handler信用类型转换依赖xtquant；受限普通股票入口不可丢弃显式类型。
+        if params.get("order_type") not in (None, ""):
+            raise ValueError("native stock gateway requires BUY/SELL action without order_type")
+
+    def submit(self, request):
+        self._target(request.account_id)
+        code = _load_embedded("bigqmt_signal_trader.code_utils").normalize_stock_code(request.stock_code)
+        if (not re.fullmatch(r"[0-9]{6}\.(?:SH|SZ|BJ)", code)
+                or request.action not in ("BUY", "SELL") or request.order_type is not None
+                or request.price_type not in ("LIMIT", "FIX_PRICE", 11)
+                or type(request.volume) is not int or request.volume <= 0
+                or type(request.price) not in (int, float) or not math.isfinite(request.price) or request.price <= 0
+                or not isinstance(request.remark, str) or not request.remark.strip()):
+            raise ValueError("native gateway requires explicit ordinary-stock limit order")
+        tag = request.remark.strip()
+        if tag in self._submitted:
+            raise RuntimeError("native submission attempt already consumed for this remark")
+        orders, trades = self.query_submission_identities_strict(self.account_id, "")
+        if any(row.user_order_id == tag for row in orders + trades):
+            raise RuntimeError("remark already exists in native orders/trades")
+        self._submitted[tag] = request
+        self.passorder(23 if request.action == "BUY" else 24, 1101, self.account_id, code, 11,
+                       float(request.price), request.volume, request.strategy_name, 2, tag, self.context)
+        return self.models.OrderSubmitResult(status="SUBMITTED", user_order_id=tag, order_sys_id=None,
+                                            message="native call returned; contract requires strict query/callback")
+
+    def query_orders(self, account_id, strategy_name=""):
+        rows = super().query_orders(account_id, strategy_name)
+        for tag, request in self._submitted.items():
+            matched = [row for row in rows if row.user_order_id == tag]
+            if len(matched) > 1:
+                raise RuntimeError("native remark maps to multiple orders")
+            if matched:
+                row = matched[0]
+                code = _load_embedded("bigqmt_signal_trader.code_utils").normalize_stock_code(request.stock_code)
+                if (row.stock_code != code or row.action != request.action or row.volume != request.volume
+                        or row.price != request.price or row.order_sys_id.upper() in ("0", "-1", "NONE", "NULL", "UNKNOWN")):
+                    raise RuntimeError("native submitted-order identity mismatch")
+        return rows
+
+    def query_orders_strict(self, account_id, strategy_name=""):
+        return self.query_orders(account_id, strategy_name)
+
+    def query_trades_strict(self, account_id, strategy_name=""):
+        return self.query_trades(account_id, strategy_name)
+
+    def query_submission_identities_strict(self, account_id, strategy_name=""):
+        return self.query_orders(account_id, strategy_name), self.query_trades(account_id, strategy_name)
+
+    def cancel(self, order_ref):
+        contract = str(order_ref.order_sys_id or "").strip()
+        if not contract or contract.upper() in ("0", "-1", "NONE", "NULL", "UNKNOWN"):
+            raise ValueError("real native contract required for cancellation")
+        if contract in self._cancel_attempted:
+            raise RuntimeError("native cancel attempt already consumed for this contract")
+        rows = [row for row in self.query_orders(self.account_id) if row.order_sys_id == contract]
+        if (len(rows) != 1 or not order_ref.user_order_id or rows[0].user_order_id != order_ref.user_order_id
+                or rows[0].status not in ("50", "55") or rows[0].traded_volume >= rows[0].volume):
+            raise RuntimeError("no unique matching cancelable native order with remaining volume")
+        self._cancel_attempted.add(contract)
+        raw = self.cancel_func(contract, self.account_id, "STOCK", self.context)
+        return self.models.CancelResult(success=bool(raw), message="native cancel return; callback/query required")
+
+
+def create_native_stock_order_gateway(context, account_id, query, passorder_func, cancel_func):
+    return NativeStockOrderGateway(context, account_id, query, passorder_func, cancel_func)
+
+
+class NativeTradeLoginState:
+    """独立账户回调证据；只接受2026-10-15实机确认的精确登录成功文本。"""
+    def __init__(self, account_id, query):
+        self.account_id, self.query = account_id, query
+        self.identity, self.event = None, None
+
+    def bind_identity(self, session_id, native_pid):
+        self.identity, self.event = (session_id, native_pid), None
+
+    def record_account_callback(self, account_info):
+        field = lambda name: account_info.get(name) if isinstance(account_info, dict) else getattr(account_info, name, None)
+        self.event = dict(raw_account_id=field("m_strAccountID"), raw_status=field("m_strStatus"),
+                          raw_numeric_status=field("m_nStatus"), identity=self.identity,
+                          observed_monotonic=time.monotonic(), observed_at_utc=_dt.datetime.utcnow().isoformat() + "Z")
+
+    def readback(self):
+        session_id, pid = self.identity or (None, None)
+        value = dict(status="UNKNOWN", account_id=self.account_id, session_id=session_id, native_pid=pid,
+                     source="native_account_callback", raw_status=None, raw_numeric_status=None,
+                     event_observed_at_utc=None, age_seconds=None, fresh=False,
+                     positive_contract_verified=False, reason="TRADE_LOGIN_CALLBACK_NOT_OBSERVED",
+                     contract_source="https://dict.thinktrader.net/innerApi/data_structure.html")
+        if self.event is not None:
+            event = self.event
+            age = time.monotonic() - event["observed_monotonic"]
+            value.update(raw_status=event["raw_status"], raw_numeric_status=event["raw_numeric_status"],
+                         raw_account_id=event["raw_account_id"], event_observed_at_utc=event["observed_at_utc"],
+                         age_seconds=age, fresh=0 <= age <= 15)
+            if event["identity"] != self.identity:
+                value["reason"] = "TRADE_LOGIN_SESSION_CHANGED"
+            elif event["raw_account_id"] != self.account_id:
+                value["reason"] = "TRADE_LOGIN_CALLBACK_ACCOUNT_MISSING_OR_MISMATCH"
+            elif not value["fresh"]:
+                value["reason"] = "TRADE_LOGIN_CALLBACK_STALE"
+            elif event["raw_status"] == "\u51c6\u5907\u767b\u5f55":
+                value.update(status="NOT_LOGGED_IN", reason="TRADE_LOGIN_PREPARING_LOGIN")
+            elif event["raw_status"] == "\u767b\u5f55\u6210\u529f":
+                # 官方m_strStatus字段 + 当日55013746独立原生回调实样；不映射其它文本/数字。
+                value.update(status="LOGGED_IN", positive_contract_verified=True, reason="")
+            else:
+                value["reason"] = "TRADE_LOGIN_POSITIVE_STATUS_CONTRACT_UNVERIFIED"
+        return value
+
+    def diagnostic_readback(self):
+        value = self.readback()
+        # ACCOUNT缓存只作原字段诊断；绝不刷新callback事件时间或推导登录成功。
+        diagnostic = dict(source="native_query_ACCOUNT_cache", query_observed_at_utc=_dt.datetime.utcnow().isoformat() + "Z",
+                          proves_login=False, raw_status=None, raw_numeric_status=None)
+        try:
+            rows = self.query(self.account_id, "STOCK", "ACCOUNT")
+            if not isinstance(rows, (list, tuple)) or len(rows) != 1:
+                raise ValueError("single account row required")
+            row = rows[0]
+            field = lambda name: row.get(name) if isinstance(row, dict) else getattr(row, name, None)
+            diagnostic.update(raw_account_id=field("m_strAccountID"), raw_status=field("m_strStatus"),
+                              raw_numeric_status=field("m_nStatus"))
+            if diagnostic["raw_account_id"] != self.account_id:
+                raise ValueError("raw account identity mismatch")
+        except Exception as exc:
+            diagnostic["error"] = str(exc)
+        value["query_diagnostic"] = diagnostic
+        return value
+
+
+class NativeShmRpcRuntime:
+    def __init__(self, context, query):
+        if not isinstance(BIGQMT_ACCOUNT_ID, str) or not BIGQMT_ACCOUNT_ID or BIGQMT_ACCOUNT_ID == "YOUR_ACCOUNT_ID" or len(BIGQMT_ACCOUNT_ID) > 64:
+            raise ValueError("confirmed fixed account required")
+        if type(SHM_RPC_ALLOW_ORDER_METHODS) is not bool:
+            raise ValueError("explicit boolean order permission required")
+        if type(SHM_RPC_BIND_ACCOUNT_CALLBACKS) is not bool:
+            raise ValueError("explicit boolean callback binding required")
+        if type(SHM_RPC_MAX_SECONDS) is not int or not 1 <= SHM_RPC_MAX_SECONDS <= 1800 or type(SHM_RPC_MAX_REQUESTS) is not int or not 1 <= SHM_RPC_MAX_REQUESTS <= 1000:
+            raise ValueError("bounded runtime budgets required")
+        if not callable(query) or not callable(getattr(context, "run_time", None)):
+            raise RuntimeError("native query/timer API unavailable")
+        if SHM_RPC_ALLOW_ORDER_METHODS and SHM_RPC_ORDER_GATEWAY is None and not callable(SHM_RPC_ORDER_GATEWAY_FACTORY):
+            raise RuntimeError("write enabled without explicit authorized order_gateway")
+        if SHM_RPC_ALLOW_ORDER_METHODS and SHM_RPC_ORDER_GATEWAY is not None and SHM_RPC_ORDER_GATEWAY_FACTORY is not None:
+            raise RuntimeError("choose one explicit order_gateway or factory")
+        if not SHM_RPC_ALLOW_ORDER_METHODS and SHM_RPC_ORDER_GATEWAY is not None:
+            raise RuntimeError("default readonly bootstrap must not bind order_gateway")
+        if SHM_RPC_ALLOW_ORDER_METHODS or SHM_RPC_BIND_ACCOUNT_CALLBACKS:
+            set_account = getattr(context, "set_account", None)
+            if not callable(set_account):
+                raise RuntimeError("native set_account API required for order callbacks")
+            set_account(BIGQMT_ACCOUNT_ID)
+        self.context, self.thread_id = context, threading.get_ident()
+        self.created_at, self.requests, self.closed = time.monotonic(), 0, False
+        self.created_at_unix = time.time()
+        self.trade_login = NativeTradeLoginState(BIGQMT_ACCOUNT_ID, query)
+        provider = NativeReadOnlyProvider(query, BIGQMT_ACCOUNT_ID)
+        rpc = _load_embedded("bigqmt_signal_trader.redis_rpc")
+        transport = _load_embedded("bigqmt_signal_trader.transports.shm_rpc")
+        allowed = set(transport.READ_METHODS) - {"poll_execution_events"}
+        if SHM_RPC_ALLOW_ORDER_METHODS:
+            allowed.update(transport.WRITE_METHODS)
+        gateway = provider
+        if SHM_RPC_ALLOW_ORDER_METHODS:
+            gateway = SHM_RPC_ORDER_GATEWAY
+            if gateway is None:
+                gateway = SHM_RPC_ORDER_GATEWAY_FACTORY(context, BIGQMT_ACCOUNT_ID, query,
+                                                       globals().get("passorder"), globals().get("cancel"))
+            if gateway is None:
+                raise RuntimeError("authorized order_gateway factory returned no gateway")
+        handlers = rpc.BigQmtRpcHandlers(BIGQMT_ACCOUNT_ID, None, provider, gateway,
+                                        allow_order_methods=SHM_RPC_ALLOW_ORDER_METHODS,
+                                        allowed_methods=allowed, settle_orders_inline=False)
+        self.bridge = _load_embedded("bigqmt_signal_trader.shm_rpc_bridge").ShmRpcBridge(
+            name=SHM_RPC_NAME, account_id=BIGQMT_ACCOUNT_ID, handlers=handlers,
+            allow_order_methods=SHM_RPC_ALLOW_ORDER_METHODS, trade_login_reader=self.trade_login.readback)
+        self.trade_login.bind_identity(self.bridge.mailbox.session_id, self.bridge.mailbox.server_pid)
+        self.bridge.trade_login_diagnostic_reader = self.trade_login.diagnostic_readback
+        if SHM_RPC_ALLOW_ORDER_METHODS:
+            for field in ("passorder", "cancel_func"):
+                native_function = getattr(gateway, field, None)
+                if callable(native_function):
+                    setattr(gateway, field, self._guard_native_write(native_function))
+
+    def _guard_native_write(self, function):
+        def guarded(*args, **kwargs):
+            self._thread()
+            login = self.bridge._trade_login()
+            if login.get("status") != "LOGGED_IN":
+                raise PermissionError(login.get("reason") or "TRADE_LOGIN_NOT_CONFIRMED")
+            return function(*args, **kwargs)
+        return guarded
+
+    def _thread(self):
+        if threading.get_ident() != self.thread_id:
+            raise RuntimeError("native original callback thread required")
+
+    def poll(self):
+        self._thread()
+        if self.closed:
+            return
+        if time.monotonic() - self.created_at >= SHM_RPC_MAX_SECONDS or self.requests >= SHM_RPC_MAX_REQUESTS:
+            self.close("budget")
+            return
+        try:
+            if self.bridge.poll_once():
+                self.requests += 1
+        except Exception:
+            self.close("callback_error")
+            raise
+
+    def event(self, event_type, native_object):
+        self._thread()
+        if self.closed:
+            return
+        self.bridge.record_execution_event(event_type, native_object)
+
+    def close(self, reason="stop"):
+        self._thread()
+        if self.closed:
+            return
+        self.closed = True
+        self.bridge.close()
+        print("AQP_SHM_RPC_CLOSED " + json.dumps(dict(reason=reason, requests=self.requests,
+                                                      native_handles_closed=True), sort_keys=True))
+
+
+def init(ContextInfo):
+    global _SERVER
+    if _SERVER is not None:
+        _SERVER.close("reload")
+        _SERVER = None
+    if not _EMBEDDED_SOURCES:
+        raise RuntimeError("build tools/build_shm_rpc_single_file.py before native use")
+    try:
+        _SERVER = NativeShmRpcRuntime(ContextInfo, globals().get("get_trade_detail_data"))
+        start_at = (_dt.datetime.now() + _dt.timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+        ContextInfo.run_time("aqp_shm_rpc_adjust", "100nMilliSecond", start_at)
+    except Exception:
+        if _SERVER is not None:
+            _SERVER.close("init_failed")
+        raise
+    print("AQP_SHM_RPC_READY " + json.dumps(dict(account_id=BIGQMT_ACCOUNT_ID, name=SHM_RPC_NAME,
+          session_id=_SERVER.bridge.mailbox.session_id, native_pid=_SERVER.bridge.mailbox.server_pid,
+          allow_order_methods=SHM_RPC_ALLOW_ORDER_METHODS, bind_account_callbacks=SHM_RPC_BIND_ACCOUNT_CALLBACKS,
+          max_seconds=SHM_RPC_MAX_SECONDS, max_requests=SHM_RPC_MAX_REQUESTS,
+          source_deadline_unix=_SERVER.created_at_unix + SHM_RPC_MAX_SECONDS,
+          background_threads=False), sort_keys=True))
+
+
+def aqp_shm_rpc_adjust(ContextInfo):
+    if _SERVER is not None:
+        _SERVER.poll()
+
+
+def handlebar(ContextInfo):
+    return None
+
+
+def account_callback(ContextInfo, accountInfo):
+    if _SERVER is not None and not _SERVER.closed:
+        _SERVER._thread()
+        _SERVER.trade_login.record_account_callback(accountInfo)
+
+
+def order_callback(ContextInfo, orderInfo):
+    if _SERVER is not None:
+        _SERVER.event("order", orderInfo)
+        status = orderInfo.get("m_nOrderStatus", orderInfo.get("status")) if isinstance(orderInfo, dict) else getattr(orderInfo, "m_nOrderStatus", getattr(orderInfo, "status", None))
+        try:
+            rejected = int(status) == 57
+        except (TypeError, ValueError):
+            rejected = False
+        if rejected:
+            _SERVER.event("order_error", orderInfo)
+
+
+def deal_callback(ContextInfo, dealInfo):
+    if _SERVER is not None:
+        _SERVER.event("trade", dealInfo)
+
+
+def aqp_shm_rpc_order_error(ContextInfo, orderErrorInfo):
+    if _SERVER is not None:
+        _SERVER.event("order_error", orderErrorInfo)
+
+
+def orderError_callback(ContextInfo, orderArgs, errMsg):
+    if _SERVER is None or _SERVER.closed:
+        return
+    events = _load_embedded("bigqmt_signal_trader.exec_events")
+    remark = events._attr(orderArgs, ["m_strRemark", "order_remark", "remark", "user_order_id"], "")
+    if not remark:
+        strategy_name = str(events._attr(orderArgs, ["strategyName"], "") or "")
+        _, separator, native_remark = strategy_name.partition("_&&&_")
+        remark = native_remark if separator else ""
+    stock_code = events._attr(orderArgs, ["orderCode", "stock_code", "m_strInstrumentID"], "")
+    try:
+        stock_code = _load_embedded("bigqmt_signal_trader.code_utils").normalize_stock_code(stock_code)
+    except ValueError:
+        stock_code = str(stock_code or "")
+    payload = {field: events._attr(orderArgs, [field]) for field in
+               ("m_strOrderSysID", "order_sys_id", "order_sysid", "order_id", "seq", "request_id",
+                "m_nErrorID", "error_id", "m_nOrderStatus", "status")}
+    payload.update(account_id=events._attr(orderArgs, ["m_strAccountID", "accountID", "account_id"], BIGQMT_ACCOUNT_ID),
+                   stock_code=stock_code, remark=remark, error_msg=str(errMsg or ""))
+    _SERVER.event("order_error", payload)
+
+
+def aqp_shm_rpc_cancel_error(ContextInfo, cancelErrorInfo):
+    if _SERVER is not None:
+        _SERVER.event("cancel_error", cancelErrorInfo)
+
+
+def stop(ContextInfo):
+    if _SERVER is not None:
+        _SERVER.close()
