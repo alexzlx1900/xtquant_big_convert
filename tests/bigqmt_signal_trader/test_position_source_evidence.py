@@ -101,6 +101,60 @@ class PositionSourceEvidenceTest(unittest.TestCase):
         self.assertTrue(result["source_evidence"]["complete"])
         self.assertEqual(result["positions"]["600000.SH"].cost, -2.5)
 
+    def test_market_value_invalid_primary_uses_finite_native_alias(self):
+        for primary in (float("nan"), float("inf"), float("-inf"), None, "bad", "", True):
+            with self.subTest(primary=repr(primary)):
+                result = self.provider([row(m_dMarketValue=primary, m_dInstrumentValue=1180.5,
+                                            market_value=9999, m_dLastPrice=99)]).get_positions_with_evidence("test-account")
+                self.assertTrue(result["source_evidence"]["complete"])
+                self.assert_counts(result["source_evidence"], 1, 1, 1, 0, 0)
+                self.assertEqual(result["positions"]["600000.SH"].market_value, 1180.5)
+                self.assertEqual(self.calls, [("test-account", "STOCK", "POSITION")])
+
+    def test_market_value_final_native_alias_and_finite_priority(self):
+        cases = [
+            (dict(m_dMarketValue=float("nan"), m_dInstrumentValue=float("inf"), market_value=980), 980),
+            (dict(m_dMarketValue=1111, m_dInstrumentValue=2222, market_value=3333), 1111),
+            (dict(m_dMarketValue=0, m_dInstrumentValue=2222, market_value=3333), 0),
+            (dict(m_dMarketValue=float("nan"), m_dInstrumentValue=0, market_value=3333), 0),
+        ]
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                result = self.provider([row(**fields)]).get_positions_with_evidence("test-account")
+                self.assertTrue(result["source_evidence"]["complete"])
+                self.assertEqual(result["positions"]["600000.SH"].market_value, expected)
+
+    def test_market_value_all_invalid_is_rejected_without_price_quantity_estimate(self):
+        cases = [
+            dict(m_dMarketValue=float("nan"), m_dInstrumentValue=float("inf"), market_value="bad"),
+            dict(m_dMarketValue="bad", m_dInstrumentValue=None, market_value=None),
+            dict(m_dMarketValue=True, m_dInstrumentValue=False, market_value=float("nan")),
+        ]
+        for fields in cases:
+            with self.subTest(fields=fields):
+                result = self.provider([row(m_dLastPrice=12, **fields)]).get_positions_with_evidence("test-account")
+                self.assertFalse(result["source_evidence"]["complete"])
+                self.assert_counts(result["source_evidence"], 1, 0, 0, 1, 0)
+                self.assertEqual(result["positions"], {})
+
+    def test_market_value_all_missing_or_none_keeps_original_null_contract(self):
+        for fields in ({}, dict(m_dMarketValue=None, m_dInstrumentValue=None, market_value=None)):
+            with self.subTest(fields=fields):
+                result = self.provider([row(**fields)]).get_positions_with_evidence("test-account")
+                self.assertTrue(result["source_evidence"]["complete"])
+                self.assert_counts(result["source_evidence"], 1, 1, 1, 0, 0)
+                self.assertIsNone(result["positions"]["600000.SH"].market_value)
+                self.assertIsNone(to_jsonable(result)["positions"]["600000.SH"]["market_value"])
+
+    def test_market_value_compatibility_does_not_relax_cost_or_quantity(self):
+        for fields in (dict(m_dOpenPrice=float("nan")), dict(m_nVolume=1.5),
+                       dict(m_nCanUseVolume=None), dict(m_dLastPrice=float("inf"))):
+            with self.subTest(fields=fields):
+                result = self.provider([row(m_dMarketValue=float("nan"), m_dInstrumentValue=1180.5,
+                                            **fields)]).get_positions_with_evidence("test-account")
+                self.assertFalse(result["source_evidence"]["complete"])
+                self.assert_counts(result["source_evidence"], 1, 0, 0, 1, 0)
+
     def test_native_eight_digit_options_remain_in_source_coverage(self):
         result = self.provider([row(m_strInstrumentID="10000001")]).get_positions_with_evidence("test-account")
         self.assertTrue(result["source_evidence"]["complete"])

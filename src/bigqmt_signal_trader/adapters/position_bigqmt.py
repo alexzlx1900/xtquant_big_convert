@@ -39,6 +39,22 @@ def _evidence_number(value, integer=False):
     return number
 
 
+def _evidence_market_value(row):
+    """同义市值字段优先取有限数值；所有候选无效时仍拒绝该行。"""
+    last_error = None
+    for name in ("m_dMarketValue", "m_dInstrumentValue", "market_value"):
+        value = _attr(row, (name,))
+        if value is None:
+            continue
+        try:
+            return _evidence_number(value)
+        except (ValueError, TypeError, OverflowError) as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return None
+
+
 def _evidence_position(row):
     code = _full_code(
         _attr(row, ("m_strInstrumentID", "instrument_id", "stock_code")),
@@ -65,8 +81,11 @@ def _evidence_position(row):
         ("price", ("m_dLastPrice", "m_dSettlementPrice", "price", "last_price")),
         ("open_price", ("m_dOpenPrice", "m_dCostPrice", "open_price", "cost")),
     ):
-        value = _attr(row, names)
-        values[field] = None if value is None else _evidence_number(value)
+        if field == "market_value":
+            values[field] = _evidence_market_value(row)
+        else:
+            value = _attr(row, names)
+            values[field] = None if value is None else _evidence_number(value)
     for field, names in (
         ("frozen_volume", ("m_nFrozenVolume", "frozen_volume")),
         ("on_road_volume", ("m_nOnRoadVolume", "on_road_volume")),
