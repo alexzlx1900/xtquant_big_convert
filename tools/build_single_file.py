@@ -7,6 +7,8 @@ bigqmt_signal_trader_redis_rpc_runtime) and embeds their sources
 base64-encoded into a single self-contained strategy file that
 never imports other custom modules from disk.
 """
+import argparse
+import ast
 import base64
 import os
 
@@ -75,7 +77,34 @@ def embed_block(sources, extra):
     return "\n".join(lines)
 
 
-def main():
+def load_config_snapshot(path):
+    """仅解析离线配置中的完整字面赋值；不执行原配置代码。"""
+    with open(path, "rb") as stream:
+        source = stream.read().decode("utf-8-sig")
+    values = {}
+    allowed = {"BIGQMT_ACCOUNT_ID", "BIGQMT_ACCOUNT_TYPE", "BIGQMT_REDIS_CONFIG"}
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            continue
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            raise ValueError("configuration snapshot must contain literal assignments only")
+        target = node.targets[0]
+        value = ast.literal_eval(node.value)
+        if isinstance(target, ast.Name) and target.id in allowed:
+            values[target.id] = value
+        elif (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+              and target.value.id == "BIGQMT_REDIS_CONFIG"):
+            key = ast.literal_eval(target.slice)
+            if not isinstance(key, str) or not isinstance(values.get("BIGQMT_REDIS_CONFIG"), dict):
+                raise ValueError("configuration dictionary must be declared before an override")
+            values["BIGQMT_REDIS_CONFIG"][key] = value
+        else:
+            raise ValueError("unsupported configuration assignment")
+    return values
+
+
+def build_source(config_values=None):
+    """生成原接口内嵌源码；显式配置候选始终禁写，不读取磁盘回退。"""
     sources = collect_package(PACKAGE_DIR, os.path.join(SRC_DIR, "src"))
     extra = {}
     for name in ("bigqmt_signal_trader_strategy.py",
@@ -87,13 +116,44 @@ def main():
     embedded = embed_block(sources, extra)
 
     template = TEMPLATE.replace("__EMBEDDED_SOURCES_BLOCK__", embedded)
+    if config_values is not None:
+        account = config_values.get("BIGQMT_ACCOUNT_ID")
+        account_type = config_values.get("BIGQMT_ACCOUNT_TYPE", "STOCK")
+        config = config_values.get("BIGQMT_REDIS_CONFIG")
+        if not isinstance(account, str) or not account.strip() or len(account) > 64:
+            raise ValueError("explicit account required for a configured candidate")
+        if account_type not in {"STOCK", "CREDIT", "FUTURE", "OPTION"} or not isinstance(config, dict):
+            raise ValueError("explicit valid account type and configuration dictionary required")
+        config = dict(config)
+        config["rpc_allow_order_methods"] = False
+        replacements = {"BIGQMT_ACCOUNT_ID": account, "BIGQMT_ACCOUNT_TYPE": account_type,
+                        "BIGQMT_REDIS_CONFIG": config}
+        lines = template.splitlines(keepends=True)
+        for node in reversed(ast.parse(template).body):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                key = node.targets[0].id
+                if key in replacements:
+                    lines[node.lineno - 1:node.end_lineno] = ["%s = %r\n" % (key, replacements[key])]
+        template = "".join(lines)
+    ast.parse(template, feature_version=(3, 6))
+    return template
 
-    total = sum(len(v) for v in sources.values()) + sum(len(v) for v in extra.values())
-    with open(OUT_PATH, "w", encoding="utf-8", newline="\n") as f:
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config-snapshot", help="离线字面配置快照；显式候选强制禁写")
+    parser.add_argument("--output", default=OUT_PATH)
+    args = parser.parse_args()
+    config = load_config_snapshot(args.config_snapshot) if args.config_snapshot else None
+    template = build_source(config)
+    if args.config_snapshot:
+        fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+    else:
+        stream = open(args.output, "w", encoding="utf-8", newline="\n")
+    with stream as f:
         f.write(template)
-    print("WROTE %s" % OUT_PATH)
-    print("embedded files: %d package + %d top-level" % (len(sources), len(extra)))
-    print("embedded raw bytes: %d" % total)
+    print("WROTE %s (%d bytes)" % (args.output, len(template.encode("utf-8"))))
 
 
 TEMPLATE = '''#coding:gbk
@@ -187,6 +247,7 @@ _LOCAL_ROOTS = (
 _ORIGINAL_IMPORT = _builtins.__import__
 _ORIGINAL_IMPORT_MODULE = _importlib.import_module
 _ORIGINAL_RELOAD = _importlib.reload
+_EMBEDDED_OWNER = object()
 
 # QMT runs the strategy via exec, where __file__ may be absent; fall back safely.
 _STRATEGY_FILE_DIR = os.path.dirname(os.path.abspath(globals().get("__file__", os.getcwd())))
@@ -231,11 +292,14 @@ def _set_parent_attribute(name, module):
 def _load_local_module(name):
     existing = sys.modules.get(name)
     if existing is not None:
+        if getattr(existing, "__bigqmt_embedded_owner__", None) is not _EMBEDDED_OWNER:
+            raise ImportError("foreign local module conflicts with embedded candidate: %s" % name)
         return existing
     source_path, is_package = _find_local_source(name)
     if "." in name:
         _load_local_module(name.rsplit(".", 1)[0])
     module = types.ModuleType(name)
+    module.__bigqmt_embedded_owner__ = _EMBEDDED_OWNER
     # Point __file__ under the strategy file dir so adapters that walk up the
     # tree (e.g. market_bigqmt locating the native xtdata SDK) still work when
     # this file lives inside a QMT python directory.
@@ -364,6 +428,7 @@ try:
         "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
         "get_debt_contract", "get_option_subject_position", "get_comb_option",
         "get_hkt_exchange_rate",
+        "download_history_data", "download_history_data2", "down_history_data",
     ):
         if function_name in globals():
             qmt_extra[function_name] = globals()[function_name]

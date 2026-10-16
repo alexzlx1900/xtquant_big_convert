@@ -14,19 +14,20 @@ import sys
 # holds bigqmt_signal_trader_strategy.py on sys.path[0]. This keeps the package
 # and bigqmt_signal_trader_local_config importable regardless of how QMT
 # invokes the script.
-_CANDIDATE_DIRS = []
-try:
-    _CANDIDATE_DIRS.append(os.path.dirname(os.path.abspath(__file__)))
-except Exception:
-    pass
-_CANDIDATE_DIRS.append(os.getcwd())
-for _up in (".", ".."):
-    _CANDIDATE_DIRS.append(os.path.abspath(os.path.join(os.getcwd(), _up)))
-for _dir in _CANDIDATE_DIRS:
-    if os.path.exists(os.path.join(_dir, "bigqmt_signal_trader_strategy.py")):
-        if _dir not in sys.path:
-            sys.path.insert(0, _dir)
-        break
+if not callable(globals().get("__bigqmt_load_local_module")):
+    _CANDIDATE_DIRS = []
+    try:
+        _CANDIDATE_DIRS.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    _CANDIDATE_DIRS.append(os.getcwd())
+    for _up in (".", ".."):
+        _CANDIDATE_DIRS.append(os.path.abspath(os.path.join(os.getcwd(), _up)))
+    for _dir in _CANDIDATE_DIRS:
+        if os.path.exists(os.path.join(_dir, "bigqmt_signal_trader_strategy.py")):
+            if _dir not in sys.path:
+                sys.path.insert(0, _dir)
+            break
 
 
 try:
