@@ -387,6 +387,7 @@ class ShmReadOnlyBridge:
                             "account_id": self.account_id, "session_id": self.mailbox.session_id,
                             "code": params["code"], "active": True, "native_handle": None}
             with self.event_lock:
+                subscription["initial_sequence"] = self.event_sequence
                 self.subscription = subscription
                 self.dropped_count += len(self.events)
                 self.events = []

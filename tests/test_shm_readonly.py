@@ -1062,6 +1062,68 @@ class MarketRpcTest(BridgeFixture):
         self.assertEqual(self.bridge.event_sequence, 34)
         self.context.unsubscribe_quote.assert_called_once_with(27)
 
+    def test_first_subscription_reports_zero_sequence_before_native_registration(self):
+        def subscribe(code, **kwargs):
+            self.assertTrue(self.bridge.event_lock.acquire(False))
+            self.bridge.event_lock.release()
+            self.assertEqual(self.bridge.subscription["initial_sequence"], 0)
+            return self.subscribe(code, **kwargs)
+
+        self.context.subscribe_quote.side_effect = subscribe
+        result = self.process("subscribe_quote", params={"code": "000001.SZ"})["data"]
+        self.assertIs(type(result["initial_sequence"]), int)
+        self.assertEqual(result["initial_sequence"], 0)
+
+    def test_same_session_resubscription_keeps_real_start_after_old_queue_overflow(self):
+        old_id = self.begin()
+        old_callback = self.callback
+        for _ in range(101):
+            self.callback(self.tick())
+        self.assertTrue(self.process("unsubscribe_quote", params={"subscription_id": old_id})["data"]["cancelled"])
+        subscription = self.process("subscribe_quote", params={"code": "000001.SZ"})["data"]
+        self.assertEqual(subscription["initial_sequence"], 101)
+        self.assertIs(type(subscription["initial_sequence"]), int)
+        self.assertNotEqual(subscription["subscription_id"], old_id)
+        self.assertEqual(subscription["session_id"], self.mailbox.session_id)
+        old_callback(self.tick())
+        self.assertEqual(self.bridge.event_sequence, 101)
+        self.callback(self.tick())
+        result = self.process("poll_quote_events", params={"after_sequence": subscription["initial_sequence"]})["data"]
+        self.assertFalse(result["gap"])
+        self.assertEqual([event["sequence"] for event in result["events"]], [102])
+        self.assertEqual(result["events"][0]["subscription_id"], subscription["subscription_id"])
+        self.assertTrue(self.process("unsubscribe_quote", params={"subscription_id": subscription["subscription_id"]})["data"]["cancelled"])
+        self.callback(self.tick())
+        self.assertEqual(self.bridge.event_sequence, 102)
+        self.assertEqual(self.context.unsubscribe_quote.call_count, 2)
+
+    def test_synchronous_native_callback_first_event_is_not_skipped(self):
+        self.bridge.event_sequence = 101
+        def subscribe(code, **kwargs):
+            self.assertEqual(self.bridge.subscription["initial_sequence"], 101)
+            self.subscribe(code, **kwargs)
+            kwargs["callback"](self.tick())
+            return 27
+
+        self.context.subscribe_quote.side_effect = subscribe
+        subscription = self.process("subscribe_quote", params={"code": "000001.SZ"})["data"]
+        self.assertEqual(subscription["initial_sequence"], 101)
+        self.assertEqual(self.bridge.event_sequence, 102)
+        result = self.process("poll_quote_events", params={"after_sequence": subscription["initial_sequence"]})["data"]
+        self.assertEqual([event["sequence"] for event in result["events"]], [102])
+        self.assertFalse(result["gap"])
+
+    def test_real_new_subscription_overflow_still_reports_gap(self):
+        self.bridge.event_sequence = 101
+        subscription = self.process("subscribe_quote", params={"code": "000001.SZ"})["data"]
+        for _ in range(33):
+            self.callback(self.tick())
+        result = self.process("poll_quote_events", params={"after_sequence": subscription["initial_sequence"]})["data"]
+        self.assertTrue(result["gap"])
+        self.assertEqual(result["oldest_sequence"], 103)
+        self.assertEqual(result["dropped_count"], 1)
+        self.assertEqual(len(result["events"]), 32)
+
     def test_callback_copy_and_invalid_payload(self):
         self.begin()
         raw = self.tick()

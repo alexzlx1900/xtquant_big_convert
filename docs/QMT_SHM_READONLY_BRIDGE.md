@@ -152,6 +152,8 @@ N05 证据目录：`/Users/zhanglongxiang/.codex/tmp/aqp-qmt-n05-20261014-1150/`
 
 订阅仅允许白名单一只股票、`tick/dict/none`，最多一个活动订阅。原生回调只校验并复制入锁保护的 32 批内存队列，不触碰邮箱或调用查询，不创建线程。事件保留账户、桥 session、subscription、单调序号、原生时间及接收时间；显式 `poll_quote_events(after_sequence)` 报告丢弃批数和覆盖 gap。这是轮询消费，不宣称异步直推。
 
+订阅响应新增 `initial_sequence`：在事件锁内、切换本次 subscription 与清理旧队列的同一临界区，从桥的真实累计 `event_sequence` 取快照，并且先于原生 callback 注册。它是非负整数，首次通常为 0；同一 session 取消后再次订阅时可以大于 32，例如 101。消费者以该值作为首轮 `after_sequence`，不得固定归零；缺失、布尔值或非法起点应拒绝并清理已经确认的订阅。原生注册函数可能同步回调，因此不得用函数返回时的最新序号作为起点，否则会跳过第一条事件。之后实际超过 32 批的未消费事件仍报告 `gap` 并阻断，不掩盖真实丢包。
+
 取消成功关闭回调门，晚到回调忽略；取消异常保留 `CLEANUP_FAILED`。stop/deadline 只取消本桥订阅，finally 仍释放共享内存。恢复必须新建客户端，再显式 ping 核对账户、session 和 native PID；旧 poisoned 客户端不恢复，不重发未知请求。
 
 容量边界：每个回调事件不超过 2048 个 ASCII JSON 字节，最多 32 批；历史最多 10 行、64 字段、32768 字节。超界回调保留 `callback_error`，不生成序号、不添加队列。`count` 为原生以 end_time 向前取条数，起点语义保留原生行为，不伪称返回必在起止交集。`verify_identity(expected_session_id, expected_native_pid)` 为新增 RPC 的显式前置；旧七方法仍可直接调用。
