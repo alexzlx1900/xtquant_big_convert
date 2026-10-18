@@ -3,6 +3,7 @@
 
 import base64
 import builtins
+import ctypes
 import datetime as _dt
 import json
 import math
@@ -18,6 +19,9 @@ SHM_RPC_ALLOW_ORDER_METHODS = False
 SHM_RPC_BIND_ACCOUNT_CALLBACKS = False  # 显式只读回报候选可绑定账户；不授予订单权限。
 SHM_RPC_MAX_SECONDS = 60
 SHM_RPC_MAX_REQUESTS = 180
+SHM_RPC_PERSISTENT_READONLY = False  # 显式55013746驻留禁写；默认仍有界。
+SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE = False  # 显式模拟读写驻留；不启用策略tick。
+SHM_RPC_ACCOUNT_ALREADY_BOUND = False  # 仅双源外壳已绑定55013746时使用。
 SHM_RPC_ORDER_GATEWAY = None  # 禁写默认不绑定；另行授权后才可显式注入既有gateway。
 SHM_RPC_ORDER_GATEWAY_FACTORY = None  # 显式候选可注入factory；禁写时不会构造。
 _EMBEDDED_SOURCES = {}  # BUILD_SHM_RPC_EMBEDDED
@@ -26,6 +30,16 @@ _ORIGINAL_IMPORT = builtins.__import__
 _PACKAGES = ("bigqmt_signal_trader", "bigqmt_signal_trader.adapters", "bigqmt_signal_trader.transports")
 _STANDARD_IMPORTS = frozenset(("_strptime", "base64", "builtins", "collections", "ctypes", "datetime", "enum", "json", "math", "os", "re", "struct", "threading", "time", "types", "typing", "uuid"))
 _SERVER = None
+
+
+def _native_windows_session(native_pid):
+    kernel = getattr(getattr(ctypes, "windll", None), "kernel32", None)
+    if kernel is None:
+        return None  # 非Windowsfixture保留缺失，不把配置值当原生证据。
+    session = ctypes.c_uint()
+    if not kernel.ProcessIdToSessionId(native_pid, ctypes.byref(session)):
+        raise RuntimeError("native Windows session lookup failed")
+    return session.value
 
 
 def _bundle_import(name, module_globals=None, module_locals=None, fromlist=(), level=0):
@@ -106,6 +120,32 @@ class NativeReadOnlyProvider:
 
     def query_trades(self, account_id, strategy_name=""):
         return self._records(account_id, "DEAL", strategy_name)
+
+    def get_orders_with_evidence(self, account_id, strategy_name=""):
+        self._target(account_id)
+        return self.accounts.query_records(account_id, "ORDER", strategy_name)
+
+    def get_trades_with_evidence(self, account_id, strategy_name=""):
+        self._target(account_id)
+        return self.accounts.query_records(account_id, "DEAL", strategy_name)
+
+    def get_execution_snapshot_with_evidence(self, account_id, order_strategy_name, trade_strategy_name):
+        orders = self.get_orders_with_evidence(account_id, order_strategy_name)
+        trades = self.get_trades_with_evidence(account_id, trade_strategy_name)
+        order_evidence, trade_evidence = orders["source_evidence"], trades["source_evidence"]
+        complete = order_evidence["complete"] and trade_evidence["complete"]
+        raw_counts = (order_evidence["raw_row_count"], trade_evidence["raw_row_count"])
+        returned_counts = (order_evidence["returned_row_count"], trade_evidence["returned_row_count"])
+        return dict(account_id=account_id, server_time=_dt.datetime.now(),
+                    rpc_revision=_load_embedded("bigqmt_signal_trader.redis_rpc").RPC_REVISION,
+                    orders=orders["orders"], trades=trades["trades"],
+                    orders_source_evidence=order_evidence, trades_source_evidence=trade_evidence,
+                    source_evidence=dict(contract_version=1, account_id=account_id, complete=complete,
+                        status="OK" if complete else "PARTIAL", source="native_ORDER_DEAL_queries",
+                        queried_at=trade_evidence["queried_at"],
+                        raw_row_count=sum(raw_counts) if all(type(value) is int for value in raw_counts) else None,
+                        returned_row_count=sum(returned_counts) if all(type(value) is int for value in returned_counts) else None,
+                        error_code="" if complete else "EXECUTION_SNAPSHOT_INCOMPLETE"))
 
 
 class NativeStockOrderGateway(NativeReadOnlyProvider):
@@ -259,7 +299,25 @@ class NativeShmRpcRuntime:
             raise ValueError("explicit boolean order permission required")
         if type(SHM_RPC_BIND_ACCOUNT_CALLBACKS) is not bool:
             raise ValueError("explicit boolean callback binding required")
-        if type(SHM_RPC_MAX_SECONDS) is not int or not 1 <= SHM_RPC_MAX_SECONDS <= 1800 or type(SHM_RPC_MAX_REQUESTS) is not int or not 1 <= SHM_RPC_MAX_REQUESTS <= 1000:
+        if (type(SHM_RPC_PERSISTENT_READONLY) is not bool or type(SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE) is not bool
+                or type(SHM_RPC_ACCOUNT_ALREADY_BOUND) is not bool):
+            raise ValueError("explicit boolean persistent readonly selection required")
+        if SHM_RPC_PERSISTENT_READONLY and SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE:
+            raise ValueError("choose one persistent runtime policy")
+        if SHM_RPC_ACCOUNT_ALREADY_BOUND and (not SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE or BIGQMT_ACCOUNT_ID != "55013746"):
+            raise ValueError("prebound account only belongs to explicit persistent simulation read-write source")
+        if SHM_RPC_PERSISTENT_READONLY:
+            if (BIGQMT_ACCOUNT_ID != "55013746" or SHM_RPC_ALLOW_ORDER_METHODS is not False
+                    or SHM_RPC_BIND_ACCOUNT_CALLBACKS is not False or SHM_RPC_ORDER_GATEWAY is not None
+                    or SHM_RPC_ORDER_GATEWAY_FACTORY is not None or type(SHM_RPC_MAX_SECONDS) is not int
+                    or SHM_RPC_MAX_SECONDS != 0 or type(SHM_RPC_MAX_REQUESTS) is not int or SHM_RPC_MAX_REQUESTS != 0):
+                raise ValueError("persistent mode requires fixed simulation, no write gateway/binding and zero budgets")
+        elif SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE:
+            if (BIGQMT_ACCOUNT_ID != "55013746" or SHM_RPC_ALLOW_ORDER_METHODS is not True
+                    or SHM_RPC_BIND_ACCOUNT_CALLBACKS is not False or type(SHM_RPC_MAX_SECONDS) is not int
+                    or SHM_RPC_MAX_SECONDS != 0 or type(SHM_RPC_MAX_REQUESTS) is not int or SHM_RPC_MAX_REQUESTS != 0):
+                raise ValueError("persistent read-write requires explicit fixed simulation writes and zero budgets")
+        elif type(SHM_RPC_MAX_SECONDS) is not int or not 1 <= SHM_RPC_MAX_SECONDS <= 1800 or type(SHM_RPC_MAX_REQUESTS) is not int or not 1 <= SHM_RPC_MAX_REQUESTS <= 1000:
             raise ValueError("bounded runtime budgets required")
         if not callable(query) or not callable(getattr(context, "run_time", None)):
             raise RuntimeError("native query/timer API unavailable")
@@ -269,7 +327,7 @@ class NativeShmRpcRuntime:
             raise RuntimeError("choose one explicit order_gateway or factory")
         if not SHM_RPC_ALLOW_ORDER_METHODS and SHM_RPC_ORDER_GATEWAY is not None:
             raise RuntimeError("default readonly bootstrap must not bind order_gateway")
-        if SHM_RPC_ALLOW_ORDER_METHODS or SHM_RPC_BIND_ACCOUNT_CALLBACKS:
+        if (SHM_RPC_ALLOW_ORDER_METHODS or SHM_RPC_BIND_ACCOUNT_CALLBACKS) and not SHM_RPC_ACCOUNT_ALREADY_BOUND:
             set_account = getattr(context, "set_account", None)
             if not callable(set_account):
                 raise RuntimeError("native set_account API required for order callbacks")
@@ -277,6 +335,11 @@ class NativeShmRpcRuntime:
         self.context, self.thread_id = context, threading.get_ident()
         self.created_at, self.requests, self.closed = time.monotonic(), 0, False
         self.created_at_unix = time.time()
+        self.persistent_readonly = SHM_RPC_PERSISTENT_READONLY
+        self.persistent_simulation_read_write = SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE
+        self.persistent = self.persistent_readonly or self.persistent_simulation_read_write
+        self.runtime_policy = ("PERSISTENT_SIMULATION_READ_WRITE" if self.persistent_simulation_read_write
+                               else "PERSISTENT_READONLY" if self.persistent_readonly else "BOUNDED")
         self.trade_login = NativeTradeLoginState(BIGQMT_ACCOUNT_ID, query)
         provider = NativeReadOnlyProvider(query, BIGQMT_ACCOUNT_ID)
         rpc = _load_embedded("bigqmt_signal_trader.redis_rpc")
@@ -297,7 +360,13 @@ class NativeShmRpcRuntime:
                                         allowed_methods=allowed, settle_orders_inline=False)
         self.bridge = _load_embedded("bigqmt_signal_trader.shm_rpc_bridge").ShmRpcBridge(
             name=SHM_RPC_NAME, account_id=BIGQMT_ACCOUNT_ID, handlers=handlers,
-            allow_order_methods=SHM_RPC_ALLOW_ORDER_METHODS, trade_login_reader=self.trade_login.readback)
+            allow_order_methods=SHM_RPC_ALLOW_ORDER_METHODS, trade_login_reader=self.trade_login.readback,
+            persistent_readonly=self.persistent_readonly,
+            persistent_simulation_read_write=self.persistent_simulation_read_write)
+        self.bridge.runtime_metadata = dict(runtime_policy=self.runtime_policy,
+            started_at_unix=self.created_at_unix, source_deadline_unix=None if self.persistent else self.created_at_unix + SHM_RPC_MAX_SECONDS,
+            max_seconds=SHM_RPC_MAX_SECONDS, max_requests=SHM_RPC_MAX_REQUESTS,
+            rpc_revision="shm-rpc-single-file-v1")
         self.trade_login.bind_identity(self.bridge.mailbox.session_id, self.bridge.mailbox.server_pid)
         self.bridge.trade_login_diagnostic_reader = self.trade_login.diagnostic_readback
         if SHM_RPC_ALLOW_ORDER_METHODS:
@@ -323,7 +392,7 @@ class NativeShmRpcRuntime:
         self._thread()
         if self.closed:
             return
-        if time.monotonic() - self.created_at >= SHM_RPC_MAX_SECONDS or self.requests >= SHM_RPC_MAX_REQUESTS:
+        if not self.persistent and (time.monotonic() - self.created_at >= SHM_RPC_MAX_SECONDS or self.requests >= SHM_RPC_MAX_REQUESTS):
             self.close("budget")
             return
         try:
@@ -358,6 +427,7 @@ def init(ContextInfo):
         raise RuntimeError("build tools/build_shm_rpc_single_file.py before native use")
     try:
         _SERVER = NativeShmRpcRuntime(ContextInfo, globals().get("get_trade_detail_data"))
+        _SERVER.bridge.runtime_metadata["windows_session_id"] = _native_windows_session(_SERVER.bridge.mailbox.server_pid)
         start_at = (_dt.datetime.now() + _dt.timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
         ContextInfo.run_time("aqp_shm_rpc_adjust", "100nMilliSecond", start_at)
     except Exception:
@@ -366,9 +436,12 @@ def init(ContextInfo):
         raise
     print("AQP_SHM_RPC_READY " + json.dumps(dict(account_id=BIGQMT_ACCOUNT_ID, name=SHM_RPC_NAME,
           session_id=_SERVER.bridge.mailbox.session_id, native_pid=_SERVER.bridge.mailbox.server_pid,
+          windows_session_id=_SERVER.bridge.runtime_metadata["windows_session_id"],
           allow_order_methods=SHM_RPC_ALLOW_ORDER_METHODS, bind_account_callbacks=SHM_RPC_BIND_ACCOUNT_CALLBACKS,
           max_seconds=SHM_RPC_MAX_SECONDS, max_requests=SHM_RPC_MAX_REQUESTS,
-          source_deadline_unix=_SERVER.created_at_unix + SHM_RPC_MAX_SECONDS,
+          runtime_policy=_SERVER.runtime_policy,
+          started_at_unix=_SERVER.created_at_unix,
+          source_deadline_unix=None if _SERVER.persistent else _SERVER.created_at_unix + SHM_RPC_MAX_SECONDS,
           background_threads=False), sort_keys=True))
 
 

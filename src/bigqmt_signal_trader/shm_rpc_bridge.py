@@ -15,11 +15,18 @@ from .transports.shm_rpc import READ_METHODS, WRITE_METHODS
 
 class ShmRpcBridge:
     def __init__(self, *, name, account_id, handlers, allow_order_methods=False,
-                 region=None, event_capacity=64, replay_capacity=1024, trade_login_reader=None):
+                 region=None, event_capacity=64, replay_capacity=1024, trade_login_reader=None,
+                 persistent_readonly=False, persistent_simulation_read_write=False):
         if not isinstance(account_id, str) or not account_id or handlers.account_id != account_id:
             raise ValueError("handler fixed account mismatch")
         if type(allow_order_methods) is not bool or handlers.allow_order_methods is not allow_order_methods:
             raise ValueError("handler write permission mismatch")
+        if type(persistent_readonly) is not bool or (persistent_readonly and (
+                account_id != "55013746" or allow_order_methods is not False)):
+            raise ValueError("persistent read replay requires fixed simulation and writes disabled")
+        if (type(persistent_simulation_read_write) is not bool or persistent_readonly and persistent_simulation_read_write
+                or persistent_simulation_read_write and (account_id != "55013746" or allow_order_methods is not True)):
+            raise ValueError("persistent read-write replay requires explicit fixed simulation writes")
         if type(event_capacity) is not int or not 1 <= event_capacity <= 128 or type(replay_capacity) is not int or not 1 <= replay_capacity <= 10000:
             raise ValueError("bounded capacities required")
         if getattr(handlers, "settle_orders_inline", False):
@@ -31,6 +38,11 @@ class ShmRpcBridge:
         self._events, self._event_sequence = deque(maxlen=event_capacity), 0
         self._lost_sequence = 0
         self._replays, self._replay_capacity = {}, replay_capacity
+        self.persistent_readonly = persistent_readonly
+        self.persistent_simulation_read_write = persistent_simulation_read_write
+        self.persistent = persistent_readonly or persistent_simulation_read_write
+        self.runtime_metadata = {}
+        self._read_replay_expiries = {}
         self._pending = None
         self.mailbox = ReadOnlyMailbox(name, create=True, region=region)
         try:
@@ -139,11 +151,63 @@ class ShmRpcBridge:
 
     def _finish(self, sequence, request, response, fingerprint):
         self._replays[request["request_id"]] = (fingerprint, dict(response))
+        if self.persistent and request["method"] in READ_METHODS:
+            self._read_replay_expiries[request["request_id"]] = (request["read_expires_at_unix"], sequence)
         # 即使发布互斥暂忙也缓存响应，下一 callback 仅重发响应不执行业务。
         self._pending = (sequence, request, response, fingerprint, None)
 
+    def _attach_source_identity(self, value):
+        if not isinstance(value, dict):
+            return value
+        for key in ("source_evidence", "orders_source_evidence", "trades_source_evidence"):
+            evidence = value.get(key)
+            if isinstance(evidence, dict):
+                value[key] = dict(evidence, session_id=self.mailbox.session_id,
+                    native_pid=self.mailbox.server_pid, windows_session_id=self.runtime_metadata.get("windows_session_id"))
+        return value
+
+    def _read_with_evidence(self, method, params):
+        provider = self.handlers.position_provider
+        if method in ("query_orders", "query_trades") and params.get("include_source_evidence") is True:
+            function = getattr(provider, "get_orders_with_evidence" if method == "query_orders" else "get_trades_with_evidence", None)
+            if callable(function):
+                if set(params) - {"account_id", "strategy_name", "include_source_evidence"}:
+                    raise ShmProtocolError("unsupported evidence record parameter")
+                strategy = params.get("strategy_name", "")
+                if not isinstance(strategy, str) or len(strategy) > 128 or any(ord(char) < 32 for char in strategy):
+                    raise ShmProtocolError("bounded strategy string required")
+                return function(self.account_id, strategy)
+            raise ShmProtocolError("native record evidence unavailable")
+        if method == "query_execution_snapshot":
+            function = getattr(provider, "get_execution_snapshot_with_evidence", None)
+            if callable(function):
+                order_strategy = params.get("order_strategy_name", params.get("strategy_name", "bigqmt_signal_trader"))
+                trade_strategy = params.get("trade_strategy_name", "")
+                if any(not isinstance(value, str) or len(value) > 128 or any(ord(char) < 32 for char in value)
+                       for value in (order_strategy, trade_strategy)):
+                    raise ShmProtocolError("bounded snapshot strategy strings required")
+                return function(self.account_id, order_strategy, trade_strategy)
+        return self.handlers.handle(method, params)
+
+    def _expire_confirmed_read_replays(self):
+        if not self.persistent or self._pending is not None:
+            return
+        region = self.mailbox.region
+        if not region.acquire(0):
+            return
+        try:
+            confirmed = self.mailbox._header()[6]
+        finally:
+            region.release()
+        now = time.time()
+        for rid, (expires, sequence) in list(self._read_replay_expiries.items()):
+            if expires <= now and sequence <= confirmed:
+                self._read_replay_expiries.pop(rid)
+                self._replays.pop(rid, None)
+
     def poll_once(self):
         self._callback_thread()
+        self._expire_confirmed_read_replays()
         if self._pending is not None:
             sequence, request, response, fingerprint, settlement = self._pending
             if settlement is not None:
@@ -187,18 +251,26 @@ class ShmRpcBridge:
                 raise ShmProtocolError("handler identity/permission changed")
             if method in WRITE_METHODS and not self.allow_order_methods:
                 raise PermissionError("orders disabled")
+            expires = request.get("read_expires_at_unix")
+            if self.persistent and (type(expires) not in (int, float) or expires != expires
+                                            or expires <= time.time() or expires > time.time() + 60):
+                raise ShmProtocolError("request deadline expired/invalid; not executed")
             fingerprint = json.dumps([method, params, self.account_id], sort_keys=True, allow_nan=False)
             if rid in self._replays:
                 prior_fp, prior = self._replays[rid]
                 if prior_fp != fingerprint:
                     raise ShmProtocolError("request_id conflict")
+                if self.persistent and method in READ_METHODS:
+                    original_expires = self._read_replay_expiries[rid][0]
+                    if original_expires <= time.time():
+                        raise ShmProtocolError("original read request expired; cached identity cannot be renewed")
+                    self._read_replay_expiries[rid] = (original_expires, sequence)
                 response.update(prior)
                 response["sequence"] = sequence
                 self._pending = (sequence, request, response, fingerprint, None)
                 return self.poll_once()
             if len(self._replays) >= self._replay_capacity:
                 raise ShmProtocolError("session replay capacity exhausted; do not resend unknown writes")
-            expires = request.get("read_expires_at_unix")
             if type(expires) not in (int, float) or expires != expires or expires <= time.time() or expires > time.time() + 60:
                 raise ShmProtocolError("request deadline expired/invalid; not executed")
             validated = True
@@ -206,6 +278,7 @@ class ShmRpcBridge:
                 result = dict(pong=True, transport="shm_rpc", account_id=self.account_id,
                               allow_order_methods=self.allow_order_methods, session_id=self.mailbox.session_id,
                               native_pid=self.mailbox.server_pid, capabilities=sorted(READ_METHODS | (WRITE_METHODS if self.allow_order_methods else frozenset())))
+                result.update(self.runtime_metadata)
             elif method == "poll_execution_events":
                 result = self._poll_events(params)
             elif method == "get_trade_login_state":
@@ -228,7 +301,7 @@ class ShmRpcBridge:
                     validate = getattr(self.handlers.order_gateway, "validate_submit_params", None)
                     if callable(validate):
                         validate(business_params)
-                result = self.handlers.handle(method, business_params)
+                result = self._read_with_evidence(method, business_params) if method in READ_METHODS else self.handlers.handle(method, business_params)
                 if method in WRITE_METHODS:
                     settlement = self.handlers.take_pending_settlement()
                     response.update(ok=True, data=self._write_result(method, result))
@@ -236,7 +309,7 @@ class ShmRpcBridge:
                         self._pending = (sequence, request, response, fingerprint, settlement)
                         return self.poll_once()
                     result = response["data"]
-            response.update(ok=True, data=to_jsonable(result))
+            response.update(ok=True, data=self._attach_source_identity(to_jsonable(result)))
         except Exception as exc:
             if validated and method in WRITE_METHODS:
                 response.update(ok=True, data=dict(status="UNKNOWN", automatic_retry=False, error=str(exc), result=None, order_sys_id=""))

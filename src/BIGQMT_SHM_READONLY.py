@@ -3,6 +3,7 @@
 
 import base64
 import builtins
+import ctypes
 import datetime as _dt
 import json
 import math
@@ -18,6 +19,8 @@ READONLY_SYMBOLS = None  # None 保留旧单股票配置；显式列表最多 64
 READONLY_ENABLE_MARKET_RPC = False
 READONLY_MAX_REQUESTS = 180
 READONLY_MAX_SECONDS = 60
+READONLY_PERSISTENT_READONLY = False  # 仅显式55013746禁写驻留候选；默认仍有界。
+READONLY_PERSISTENT_MARKET_RPC = False  # 双源读写候选显式开放已有市场只读方法。
 RPC_REVISION = "shm-readonly-single-file-v2"
 _EMBEDDED_SOURCES = {}  # BUILD_READONLY_EMBEDDED
 _MODULE_CACHE = {}
@@ -25,6 +28,16 @@ _ORIGINAL_IMPORT = builtins.__import__
 _PACKAGES = ("bigqmt_signal_trader", "bigqmt_signal_trader.adapters")
 _STANDARD_IMPORTS = frozenset(("base64", "builtins", "ctypes", "datetime", "enum", "json", "math", "os", "re", "struct", "threading", "time", "types", "typing"))
 _SERVER = None
+
+
+def _native_windows_session(native_pid):
+    kernel = getattr(getattr(ctypes, "windll", None), "kernel32", None)
+    if kernel is None:
+        return None  # 非Windows本地测试不伪造原生会话；正式代理会拒绝缺失证据。
+    session = ctypes.c_uint()
+    if not kernel.ProcessIdToSessionId(native_pid, ctypes.byref(session)):
+        raise RuntimeError("native Windows session lookup failed")
+    return session.value
 
 
 def _bundle_import(name, module_globals=None, module_locals=None, fromlist=(), level=0):
@@ -85,7 +98,17 @@ class ShmReadOnlyBridge:
                        or symbol[6:] not in (".SH", ".SZ", ".BJ") for symbol in symbols)
                 or len(set(symbols)) != len(symbols)):
             raise ValueError("configure 1-64 unique SH/SZ/BJ quote symbols")
-        if type(READONLY_MAX_REQUESTS) is not int or not 1 <= READONLY_MAX_REQUESTS <= 1000 or type(READONLY_MAX_SECONDS) is not int or not 1 <= READONLY_MAX_SECONDS <= 1800:
+        if (type(READONLY_PERSISTENT_READONLY) is not bool or type(READONLY_PERSISTENT_MARKET_RPC) is not bool
+                or type(READONLY_ENABLE_MARKET_RPC) is not bool):
+            raise ValueError("explicit boolean persistent readonly selection required")
+        if READONLY_PERSISTENT_MARKET_RPC and (not READONLY_PERSISTENT_READONLY or not READONLY_ENABLE_MARKET_RPC):
+            raise ValueError("persistent market opt-in requires explicit persistent readonly market source")
+        if READONLY_PERSISTENT_READONLY:
+            if (BIGQMT_ACCOUNT_ID != "55013746" or (READONLY_ENABLE_MARKET_RPC and not READONLY_PERSISTENT_MARKET_RPC)
+                    or type(READONLY_MAX_REQUESTS) is not int or READONLY_MAX_REQUESTS != 0
+                    or type(READONLY_MAX_SECONDS) is not int or READONLY_MAX_SECONDS != 0):
+                raise ValueError("persistent readonly requires simulation55013746, explicit market opt-in and zero budgets")
+        elif type(READONLY_MAX_REQUESTS) is not int or not 1 <= READONLY_MAX_REQUESTS <= 1000 or type(READONLY_MAX_SECONDS) is not int or not 1 <= READONLY_MAX_SECONDS <= 1800:
             raise ValueError("readonly request and session budgets must be bounded integers")
         if not callable(query) or not callable(getattr(context, "get_full_tick", None)):
             raise RuntimeError("QMT native readonly query functions are unavailable")
@@ -93,9 +116,12 @@ class ShmReadOnlyBridge:
         self.account_id = BIGQMT_ACCOUNT_ID
         self.quote_symbols = tuple(symbols)
         self.callback_thread_id = threading.get_ident()
+        self.windows_session_id = None
         self.created_at = time.monotonic()
+        self.created_at_unix = time.time()
+        self.persistent_readonly = READONLY_PERSISTENT_READONLY
         self.request_count = 0
-        self.seen_request_ids = set()
+        self.seen_request_ids = {} if self.persistent_readonly else set()
         self.pending = None
         self.closed = False
         self.market_enabled = READONLY_ENABLE_MARKET_RPC is True
@@ -132,7 +158,8 @@ class ShmReadOnlyBridge:
             "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         try:
-            if self.closed or self.request_count >= READONLY_MAX_REQUESTS or time.monotonic() - self.created_at >= READONLY_MAX_SECONDS:
+            if self.closed or (not self.persistent_readonly and (
+                    self.request_count >= READONLY_MAX_REQUESTS or time.monotonic() - self.created_at >= READONLY_MAX_SECONDS)):
                 raise ReadOnlyRequestError("SESSION_CLOSED", "readonly session is closed or exhausted")
             if threading.get_ident() != self.callback_thread_id:
                 raise ReadOnlyRequestError("WRONG_CALLBACK_THREAD", "QMT calls require the original callback thread")
@@ -165,14 +192,27 @@ class ShmReadOnlyBridge:
                 raise ReadOnlyRequestError("READ_EXPIRED", "read RPC expired before execution")
             if request_id in self.seen_request_ids:
                 raise ReadOnlyRequestError("DUPLICATE_REQUEST", "request_id was already processed in this session")
-            self.seen_request_ids.add(request_id)
+            if self.persistent_readonly:
+                if len(self.seen_request_ids) >= 1024:
+                    raise ReadOnlyRequestError("REPLAY_CAPACITY_EXHAUSTED", "unexpired or unconfirmed read records are not evicted")
+                self.seen_request_ids[request_id] = (expires_at, response["sequence"])
+            else:
+                self.seen_request_ids.add(request_id)
             if method == "ping":
                 data = {"pong": True, "account_id": self.account_id, "allow_order_methods": False,
                         "rpc_revision": RPC_REVISION, "server_time": _dt.datetime.now(),
+                        "transport": "shm_readonly",
+                        "runtime_policy": "PERSISTENT_READONLY" if self.persistent_readonly else "BOUNDED_READONLY",
+                        "started_at_unix": self.created_at_unix,
+                        "source_deadline_unix": None if self.persistent_readonly else self.created_at_unix + READONLY_MAX_SECONDS,
+                        "max_seconds": READONLY_MAX_SECONDS, "max_requests": READONLY_MAX_REQUESTS,
+                        "windows_session_id": self.windows_session_id,
                         "background_threads": False, "callback_thread_id": self.callback_thread_id,
                         "session_id": self.mailbox.session_id, "native_pid": self.mailbox.server_pid, "capabilities": list(allowed_methods)}
             elif method in ("get_local_data", "get_market_data_ex", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"):
                 data = self.market_request(method, params)
+                data.update(account_id=self.account_id, session_id=self.mailbox.session_id,
+                            native_pid=self.mailbox.server_pid, windows_session_id=self.windows_session_id)
             elif method == "get_positions":
                 evidence = self.positions.get_positions_with_evidence(self.account_id)
                 if not evidence["source_evidence"]["complete"]:
@@ -180,9 +220,11 @@ class ShmReadOnlyBridge:
                     raise ReadOnlyRequestError(evidence["source_evidence"]["error_code"] or "POSITION_INCOMPLETE", "native position evidence is incomplete")
                 data = evidence if params.get("include_source_evidence") is True else evidence["positions"]
             elif method in ("get_asset", "query_orders", "query_trades"):
-                allowed_params = {"account_id"} if method == "get_asset" else {"account_id", "strategy_name"}
+                allowed_params = {"account_id", "include_source_evidence"} if method == "get_asset" else {"account_id", "strategy_name", "include_source_evidence"}
                 if set(params) - allowed_params:
                     raise ReadOnlyRequestError("INVALID_PARAMS", "unsupported readonly account query parameter")
+                if "include_source_evidence" in params and type(params["include_source_evidence"]) is not bool:
+                    raise ReadOnlyRequestError("INVALID_PARAMS", "evidence selection must be boolean")
                 strategy_name = params.get("strategy_name", "")
                 if not isinstance(strategy_name, str) or len(strategy_name) > 128 or any(ord(char) < 32 for char in strategy_name):
                     raise ReadOnlyRequestError("INVALID_PARAMS", "strategy_name must be a bounded string")
@@ -262,6 +304,9 @@ class ShmReadOnlyBridge:
         except Exception as exc:
             response["error"] = "%s: %s" % (type(exc).__name__, exc)
             response["server_error"] = exc.code if isinstance(exc, ReadOnlyRequestError) else "QMT_QUERY_FAILED"
+        if isinstance(response["data"], dict) and isinstance(response["data"].get("source_evidence"), dict):
+            response["data"]["source_evidence"].update(session_id=self.mailbox.session_id,
+                native_pid=self.mailbox.server_pid, windows_session_id=self.windows_session_id)
         self.request_count += 1
         print("AQP_SHM_READONLY_RPC " + json.dumps({
             "request_id": response["request_id"], "method": response["method"], "sequence": response["sequence"],
@@ -474,11 +519,20 @@ class ShmReadOnlyBridge:
         if threading.get_ident() != self.callback_thread_id:
             raise ReadOnlyRequestError("WRONG_CALLBACK_THREAD", "mailbox polling requires the original QMT callback thread")
         try:
-            if time.monotonic() - self.created_at >= READONLY_MAX_SECONDS:
+            if self.persistent_readonly and self.pending is None and self.mailbox.region.acquire(0):
+                try:
+                    confirmed = self.mailbox._header()[6]
+                finally:
+                    self.mailbox.region.release()
+                now = time.time()
+                for rid, (expires, sequence) in list(self.seen_request_ids.items()):
+                    if expires <= now and sequence <= confirmed:
+                        self.seen_request_ids.pop(rid)
+            if not self.persistent_readonly and time.monotonic() - self.created_at >= READONLY_MAX_SECONDS:
                 self.close("deadline")
                 return
             if self.pending is None:
-                if self.request_count >= READONLY_MAX_REQUESTS:
+                if not self.persistent_readonly and self.request_count >= READONLY_MAX_REQUESTS:
                     self.close("request_limit")
                     return
                 incoming = self.mailbox.read_request()
@@ -489,7 +543,7 @@ class ShmReadOnlyBridge:
             sequence, response = self.pending
             if self.mailbox.publish_response(sequence, response):
                 self.pending = None
-                if self.request_count >= READONLY_MAX_REQUESTS:
+                if not self.persistent_readonly and self.request_count >= READONLY_MAX_REQUESTS:
                     self.close("request_limit")
         except Exception as exc:
             print("AQP_SHM_READONLY_ERROR %s: %s" % (type(exc).__name__, exc))
@@ -532,6 +586,7 @@ def init(ContextInfo):
         raise RuntimeError("build with tools/build_shm_readonly_single_file.py before running")
     try:
         _SERVER = ShmReadOnlyBridge(ContextInfo, globals().get("get_trade_detail_data"))
+        _SERVER.windows_session_id = _native_windows_session(_SERVER.mailbox.server_pid)
         _SERVER.start()
         start_at = (_dt.datetime.now() + _dt.timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
         ContextInfo.run_time("aqp_shm_readonly_adjust", "100nMilliSecond", start_at)
@@ -547,7 +602,12 @@ def init(ContextInfo):
         "account_id": _SERVER.account_id, "name": READONLY_SHM_NAME, "symbol": READONLY_SYMBOL,
         "symbols": list(_SERVER.quote_symbols),
         "session_id": _SERVER.mailbox.session_id, "native_pid": _SERVER.mailbox.server_pid,
+        "windows_session_id": _SERVER.windows_session_id,
+        "allow_order_methods": False,
         "max_requests": READONLY_MAX_REQUESTS, "max_seconds": READONLY_MAX_SECONDS,
+        "runtime_policy": "PERSISTENT_READONLY" if _SERVER.persistent_readonly else "BOUNDED_READONLY",
+        "started_at_unix": _SERVER.created_at_unix,
+        "source_deadline_unix": None if _SERVER.persistent_readonly else _SERVER.created_at_unix + READONLY_MAX_SECONDS,
         "background_threads": False, "rpc_revision": RPC_REVISION,
     }, sort_keys=True))
 
