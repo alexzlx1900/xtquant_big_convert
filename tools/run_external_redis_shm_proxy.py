@@ -60,6 +60,9 @@ def validate_config(value, now_unix=None):
         raise ValueError("allow_order_methods must explicitly match simulation runtime policy")
     result = dict(value)
     result["runtime_policy"] = policy
+    result["start_write_blocked"] = value.get("start_write_blocked", policy == "PERSISTENT_SIMULATION_READ_WRITE")
+    if type(result["start_write_blocked"]) is not bool:
+        raise ValueError("start_write_blocked must be an explicit boolean")
     result["native_pid"] = _integer(value.get("native_pid"), "native_pid", 1, 0xFFFFFFFF)
     result["windows_session"] = _integer(value.get("windows_session"), "windows_session", 0, 0xFFFFFFFF)
     for field, prefix in (("read_name", "Local\\AQP_SHM_READONLY_"), ("execution_name", "Local\\AQP_SHM_TRADE_")):
@@ -141,6 +144,9 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
     errors = []
     result = dict(status="FAILED", account_id=ACCOUNT, automatic_retry=False,
                   allow_order_methods=config["allow_order_methods"], runtime_policy=config["runtime_policy"],
+                  start_write_blocked=config["start_write_blocked"],
+                  writes_blocked=config["start_write_blocked"], write_ready=False,
+                  write_block_reason="OPERATOR_WRITE_DISABLED" if config["start_write_blocked"] else "",
                   processed_requests=0, received_requests=0, full_duration_acceptance_proved=False)
     began = time.monotonic()
     try:
@@ -159,6 +165,8 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
             read_cache_capacity=config["read_cache_capacity"], write_ledger_capacity=config["write_ledger_capacity"],
             expected_windows_session_id=config["windows_session"],
         )
+        if config["start_write_blocked"]:
+            proxy._block_writes("OPERATOR_WRITE_DISABLED")
         proxy.verify_identity()
         evidence = dict(proxy.identity_snapshot(), status="READY", automatic_retry=False)
         (ready_observer or _emit_ready)(evidence)
@@ -192,6 +200,10 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
             result["processed_requests"] = proxy.processed_count
     finally:
         if proxy is not None:
+            if proxy.verified:
+                snapshot = proxy.identity_snapshot()
+                result.update({field: snapshot[field]
+                               for field in ("writes_blocked", "write_ready", "write_block_reason")})
             try:
                 proxy.close()
             except Exception as exc:
@@ -225,6 +237,7 @@ def main(argv=None):
         else:
             result = dict(status="DRY_RUN", account_id=ACCOUNT, allow_order_methods=config["allow_order_methods"],
                           runtime_policy=config["runtime_policy"],
+                          start_write_blocked=config["start_write_blocked"],
                           native_pid=config["native_pid"], windows_session=config["windows_session"],
                           max_seconds=config["max_seconds"], max_requests=config["max_requests"],
                           connections_created=0, full_duration_acceptance_proved=False)

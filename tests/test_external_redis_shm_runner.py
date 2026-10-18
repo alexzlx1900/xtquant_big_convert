@@ -200,7 +200,8 @@ def test_persistent_runner_emits_actual_ready_before_consumption_and_stop_event_
         assert not any(operation[0] == "lpop" for operation in provider.operations)
         assert proof["read_source"]["session_id"] == value["read_session_id"]
         assert proof["execution_source"]["session_id"] == value["execution_session_id"]
-        assert proof["write_ready"] is value["allow_order_methods"]
+        assert proof["writes_blocked"] is value["allow_order_methods"]
+        assert proof["write_ready"] is False
         stop.set()
 
     result = RUNNER.run_candidate(value, lambda target: provider, factory, stop_event=stop, ready_observer=ready)
@@ -259,4 +260,86 @@ def test_persistent_cli_default_remains_inert_even_with_explicit_write_capabilit
     proof = json.loads(capsys.readouterr().out)
     assert proof["connections_created"] == 0 and proof["allow_order_methods"] is True
     assert proof["runtime_policy"] == "PERSISTENT_SIMULATION_READ_WRITE"
+    assert proof["start_write_blocked"] is True
     run.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "false", "true", [], {}])
+def test_start_write_blocked_requires_strict_bool_before_any_connection(monkeypatch, invalid):
+    value, _, _, _ = persistent_resources("PERSISTENT_SIMULATION_READ_WRITE")
+    value["start_write_blocked"] = invalid
+    factory = mock.Mock(side_effect=AssertionError("invalid configuration cannot connect"))
+    with pytest.raises(ValueError, match="start_write_blocked"):
+        RUNNER.run_candidate(value, factory, factory)
+    factory.assert_not_called()
+
+
+def test_start_write_blocked_defaults_follow_policy_without_changing_capability_contract():
+    assert RUNNER.validate_config(config())["start_write_blocked"] is False
+    for policy in ("PERSISTENT_READONLY", "PERSISTENT_SIMULATION_READ_WRITE"):
+        value, _, _, _ = persistent_resources(policy)
+        parsed = RUNNER.validate_config(value)
+        assert parsed["start_write_blocked"] is (policy == "PERSISTENT_SIMULATION_READ_WRITE")
+        assert parsed["allow_order_methods"] is value["allow_order_methods"]
+
+
+def test_default_readwrite_gate_blocks_submit_cancel_before_ledger_and_native_but_reads_continue(monkeypatch):
+    value, provider, clients, factory = persistent_resources("PERSISTENT_SIMULATION_READ_WRITE")
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    stop = threading.Event()
+    binding = dict(read_session_id=value["read_session_id"], execution_session_id=value["execution_session_id"],
+                   native_pid=value["native_pid"], windows_session_id=value["windows_session"])
+    requests = []
+    for index, method in enumerate(("get_asset", "get_positions", "submit_order", "cancel_order", "query_orders", "get_positions")):
+        message = PROXY_FIXTURES.request(method, rid="operator-gate-%d" % index)
+        message["expected_source_binding"] = binding
+        requests.append(json.dumps(message))
+    provider.queues["bigqmt:rpc:queue:55013746"] = requests
+    original_pop = provider.lpop
+
+    def pop_and_stop_after_last(queue):
+        result = original_pop(queue)
+        if not provider.queues[queue]:
+            stop.set()
+        return result
+
+    provider.lpop = pop_and_stop_after_last
+
+    def ready(proof):
+        assert proof["writes_blocked"] is True and proof["write_ready"] is False
+        assert proof["write_block_reason"] == "OPERATOR_WRITE_DISABLED"
+        assert proof["allow_order_methods"] is True
+        assert proof["execution_source"]["allow_order_methods"] is True
+        assert {"submit_order", "cancel_order"} <= set(proof["capabilities"])
+        assert [len(client.calls) for client in clients] == [1, 1]
+
+    result = RUNNER.run_candidate(value, lambda target: provider, factory, stop_event=stop, ready_observer=ready)
+    assert result["status"] == "STOP_REQUESTED" and result["resources_closed"]
+    assert result["received_requests"] == 6
+    assert result["writes_blocked"] is True and result["write_ready"] is False
+    assert result["write_block_reason"] == "OPERATOR_WRITE_DISABLED"
+    assert [call[0]["method"] for call in clients[1].calls] == [
+        "ping", "get_asset", "get_positions", "query_orders", "get_positions"]
+    assert not any(operation[0] == "eval" for operation in provider.operations)
+    assert provider.hashes == {}
+    published = [json.loads(operation[3]) for operation in provider.operations if operation[0] == "setex"]
+    rejected = [response for response in published if response["method"] in ("submit_order", "cancel_order")]
+    assert len(rejected) == 2 and all(response["status"] == "REJECTED" for response in rejected)
+    assert all(response["ok"] for response in published if response["method"] not in ("submit_order", "cancel_order"))
+
+
+def test_explicit_false_preserves_authorized_local_readwrite_ready_capability(monkeypatch):
+    value, provider, clients, factory = persistent_resources("PERSISTENT_SIMULATION_READ_WRITE")
+    value["start_write_blocked"] = False
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    stop = threading.Event()
+
+    def ready(proof):
+        assert proof["write_ready"] is True and proof["writes_blocked"] is False
+        assert proof["allow_order_methods"] is True
+        assert {"submit_order", "cancel_order"} <= set(proof["capabilities"])
+        stop.set()
+
+    result = RUNNER.run_candidate(value, lambda target: provider, factory, stop_event=stop, ready_observer=ready)
+    assert result["status"] == "STOP_REQUESTED" and result["resources_closed"]
+    assert result["write_ready"] is True and result["writes_blocked"] is False
