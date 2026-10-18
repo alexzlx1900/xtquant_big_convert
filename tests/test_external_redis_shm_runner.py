@@ -103,6 +103,7 @@ def test_explicit_redis_constructor_ignores_url_env_and_disables_library_retry(m
     try:
         values = client.connection_pool.connection_kwargs
         assert (values["host"], values["port"], values["db"]) == ("127.0.0.1", 16379, 6)
+        assert values["health_check_interval"] == 15
         operation = mock.Mock(side_effect=RUNNER.redis.exceptions.ConnectionError("unconfirmed"))
         with pytest.raises(RUNNER.redis.exceptions.ConnectionError):
             values["retry"].call_with_retry(operation, lambda error: None)
@@ -219,8 +220,49 @@ def test_ready_observer_failure_prevents_consumption_and_releases_owned_connecti
     ready = mock.Mock(side_effect=RuntimeError("observer unavailable"))
     result = RUNNER.run_candidate(value, lambda target: provider, factory, ready_observer=ready)
     assert result["status"] == "FAILED" and result["resources_closed"]
+    assert result["error_phase"] == "READY_OBSERVER"
+    assert result["error_message"] == "observer unavailable"
     assert not any(operation[0] == "lpop" for operation in provider.operations)
     assert all(client.closed for client in clients)
+
+
+def test_runner_records_exact_idle_timeout_phase_message_and_limit_without_consumption(monkeypatch):
+    value, provider, clients, factory = persistent_resources("PERSISTENT_READONLY")
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    provider.llen = mock.Mock(side_effect=RUNNER.redis.exceptions.TimeoutError("idle private-secret connection read"))
+    result = RUNNER.run_candidate(value, lambda target: provider, factory, ready_observer=lambda proof: None)
+    assert result["status"] == "FAILED" and result["resources_closed"]
+    assert result["error_phase"] == "REDIS_QUEUE_INSPECT" and result["error_type"] == "TimeoutError"
+    assert result["stop_reason"] == "REDIS_IDLE_INSPECTION_TIMEOUT_LIMIT"
+    assert result["error_message"] == "idle <redacted> connection read"
+    assert result["diagnostics"]["last_error"]["error_message"] == result["error_message"]
+    assert result["diagnostics"]["idle_receive_timeouts"] == 3
+    assert result["received_requests"] == result["processed_requests"] == 0
+    assert result["runtime_running"] is False and result["identity_verified"]
+    assert not any(operation[0] == "lpop" for operation in provider.operations)
+    assert [len(client.calls) for client in clients] == [1, 1]
+
+
+def test_redis_factory_failure_has_phase_and_redacted_message(monkeypatch):
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    provider = mock.Mock(side_effect=RUNNER.redis.exceptions.TimeoutError("private-secret connect timed out"))
+    result = RUNNER.run_candidate(config(), redis_factory=provider)
+    assert result["error_phase"] == "REDIS_CLIENT_CREATE"
+    assert result["error_message"] == "<redacted> connect timed out"
+    assert result["status"] == "FAILED" and result["resources_closed"]
+
+
+def test_confirmed_runner_seal_also_preserves_native_timeout_phase(monkeypatch):
+    value, provider, clients, factory = persistent_resources("PERSISTENT_READONLY")
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    provider.queues["bigqmt:rpc:queue:55013746"] = [json.dumps(PROXY_FIXTURES.request())]
+    def ready(proof):
+        clients[1].failure = PROXY_FIXTURES.ShmTimeoutError("native result private-secret unknown")
+    result = RUNNER.run_candidate(value, lambda target: provider, factory, ready_observer=ready)
+    assert result["status"] == "PROXY_STOPPED" and result["resources_closed"]
+    assert result["stop_reason"] == "SHM_RESULT_UNCONFIRMED"
+    assert result["diagnostics"]["last_error"]["error_phase"] == "SHM_FORWARD"
+    assert result["diagnostics"]["last_error"]["error_message"] == "native result <redacted> unknown"
 
 
 def test_persistent_keyboard_interrupt_releases_resources_and_does_not_clear_redis_objects(monkeypatch):

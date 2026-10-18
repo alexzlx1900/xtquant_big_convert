@@ -11,6 +11,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
@@ -103,6 +105,10 @@ class FakeRedis:
         self._record("lpop", queue)
         values = self.queues.get(queue, [])
         return values.pop(0) if values else None
+
+    def llen(self, queue):
+        self._record("llen", queue)
+        return len(self.queues.get(queue, []))
 
     def pubsub(self, **kwargs):
         self._record("pubsub", kwargs)
@@ -658,6 +664,106 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         self.assertEqual(redis.operations, before)
         self.assertEqual(redis.queues[proxy.transport.request_queue], ["untouched"])
         self.assertEqual(len(execution.calls), 3)
+
+    def test_idle_queue_checks_do_not_issue_consuming_lpop(self):
+        proxy, redis, readonly, execution = self.make_proxy(policy="PERSISTENT_READONLY")
+        for _ in range(5):
+            self.assertIsNone(proxy.poll_once())
+        self.assertEqual([op[0] for op in redis.operations].count("llen"), 5)
+        self.assertFalse(any(op[0] == "lpop" for op in redis.operations))
+        self.assertEqual([len(readonly.calls), len(execution.calls)], [1, 1])
+        self.assertFalse(proxy.stopped)
+
+    def test_only_unconsumed_llen_timeouts_are_rechecked_before_one_write(self):
+        proxy, redis, _, execution = self.make_proxy(policy="PERSISTENT_SIMULATION_READ_WRITE")
+        redis.queues[proxy.transport.request_queue] = [json.dumps(request("submit_order"))]
+        original = redis.llen
+        redis.llen = mock.Mock(side_effect=[RedisTimeoutError("Timeout reading from socket"),
+            RedisTimeoutError("Timeout reading from socket"), 1])
+        for _ in range(2):
+            self.assertIsNone(proxy.poll_once())
+            self.assertEqual(len(redis.queues[proxy.transport.request_queue]), 1)
+            self.assertEqual(len(execution.calls), 1)
+            self.assertFalse(any(op[0] in ("lpop", "eval") for op in redis.operations))
+        self.assertTrue(proxy.poll_once()["ok"])
+        self.assertEqual([call[0]["method"] for call in execution.calls], ["ping", "submit_order"])
+        self.assertEqual(redis.llen.call_count, 3)
+        self.assertEqual(proxy.diagnostic_snapshot()["idle_receive_timeouts"], 2)
+        self.assertEqual(proxy.diagnostic_snapshot()["consecutive_idle_timeouts"], 0)
+        redis.llen = original
+
+    def test_third_consecutive_idle_inspection_timeout_stops_without_consuming(self):
+        proxy, redis, _, execution = self.make_proxy(policy="PERSISTENT_READONLY")
+        redis.llen = mock.Mock(side_effect=RedisTimeoutError("idle read timed out"))
+        self.assertIsNone(proxy.poll_once())
+        self.assertIsNone(proxy.poll_once())
+        with self.assertRaises(RedisTimeoutError):
+            proxy.poll_once()
+        self.assertEqual(proxy.stop_reason, "REDIS_IDLE_INSPECTION_TIMEOUT_LIMIT")
+        self.assertEqual(proxy.diagnostic_snapshot()["last_error"]["error_phase"], "REDIS_QUEUE_INSPECT")
+        self.assertEqual(len(execution.calls), 1)
+        self.assertFalse(any(op[0] == "lpop" for op in redis.operations))
+
+    def test_pubsub_timeout_may_have_consumed_message_and_never_recovers(self):
+        proxy, redis, _, execution = self.make_proxy(policy="PERSISTENT_READONLY")
+        redis.subscription.messages = [{"type": "message", "data": json.dumps(request())}]
+        def consume_then_fail(timeout):
+            redis.subscription.messages.pop(0)
+            raise RedisTimeoutError("partial PubSub read")
+        redis.subscription.get_message = consume_then_fail
+        with self.assertRaises(RedisTimeoutError):
+            proxy.poll_once()
+        self.assertTrue(proxy.stopped)
+        self.assertEqual(proxy.diagnostic_snapshot()["idle_receive_timeouts"], 0)
+        self.assertEqual(proxy.diagnostic_snapshot()["last_error"]["error_phase"], "REDIS_PUBSUB_RECEIVE")
+        self.assertFalse(any(op[0] in ("llen", "lpop") for op in redis.operations))
+        self.assertEqual(len(execution.calls), 1)
+
+    def test_consumed_pubsub_request_does_not_enter_idle_recovery_path(self):
+        proxy, redis, _, execution = self.make_proxy(policy="PERSISTENT_READONLY")
+        redis.subscription.messages = [{"type": "message", "data": json.dumps(request())}]
+        redis.llen = mock.Mock(side_effect=RedisTimeoutError("must not be called"))
+        self.assertTrue(proxy.poll_once()["ok"])
+        redis.llen.assert_not_called()
+        self.assertEqual(len(execution.calls), 2)
+
+    def test_lpop_timeout_after_consumption_stops_and_never_reissues_pop(self):
+        proxy, redis, _, execution = self.make_proxy(policy="PERSISTENT_READONLY")
+        redis.queues[proxy.transport.request_queue] = [json.dumps(request())]
+        original = redis.lpop
+        def consume_then_fail(queue):
+            original(queue)
+            raise RedisTimeoutError("LPOP response lost")
+        redis.lpop = mock.Mock(side_effect=consume_then_fail)
+        with self.assertRaises(RedisTimeoutError):
+            proxy.poll_once()
+        self.assertTrue(proxy.stopped)
+        with self.assertRaises(ShmProtocolError):
+            proxy.poll_once()
+        redis.lpop.assert_called_once()
+        self.assertEqual(len(execution.calls), 1)
+        self.assertEqual(proxy.diagnostic_snapshot()["last_error"]["error_phase"], "REDIS_QUEUE_LPOP")
+        self.assertEqual(proxy.diagnostic_snapshot()["idle_receive_timeouts"], 0)
+
+    def test_native_write_and_publish_timeouts_keep_unknown_or_publication_gate(self):
+        for phase in ("SHM_FORWARD", "REDIS_RESPONSE_PUBLISH"):
+            with self.subTest(phase=phase):
+                proxy, redis, _, execution = self.make_proxy(policy="PERSISTENT_SIMULATION_READ_WRITE")
+                redis.queues[proxy.transport.request_queue] = [json.dumps(request("submit_order"))]
+                if phase == "SHM_FORWARD":
+                    execution.failure = RedisTimeoutError("native call uncertain")
+                    self.assertEqual(proxy.poll_once()["status"], "UNKNOWN")
+                else:
+                    redis.setex = mock.Mock(side_effect=RedisTimeoutError("publish uncertain"))
+                    with self.assertRaises(RedisTimeoutError):
+                        proxy.poll_once()
+                self.assertTrue(proxy.stopped)
+                self.assertEqual(len(execution.calls), 2)
+                self.assertEqual(proxy.diagnostic_snapshot()["last_error"]["error_phase"], phase)
+                self.assertEqual(proxy.diagnostic_snapshot()["idle_receive_timeouts"], 0)
+                with self.assertRaises(ShmProtocolError):
+                    proxy.poll_once()
+                self.assertEqual(len(execution.calls), 2)
 
     def test_concurrent_poll_is_rejected_before_consuming_queue(self):
         proxy, redis, _, execution = self.make_proxy()

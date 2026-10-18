@@ -110,6 +110,10 @@ class MemoryRedis:
             values = self.lists.get(key, [])
             return values.pop(0) if values else None
 
+    def llen(self, key):
+        with self.lock:
+            return len(self.lists.get(key, []))
+
     def blpop(self, key, timeout):
         until = time.monotonic() + timeout
         while time.monotonic() < until:

@@ -17,6 +17,7 @@ from .adapters.redis_common import decode_text
 from .redis_rpc import decode_rpc_request_payload
 from .transports.readonly_shm import ShmProtocolError
 from .transports.readonly_shm_client import MARKET_RPC_METHODS, ShmReadOnlyRpcClient
+from .transports.redis_transport import _is_redis_timeout
 from .transports.shm_rpc import WRITE_METHODS
 
 
@@ -122,6 +123,22 @@ class RedisShmReadOnlyProxy:
         self._writes_blocked = False
         self._write_block_reason = ""
         self._write_record_count = 0
+        self._operation_phase = "INITIALIZED"
+        self._request_context = {}
+        self._last_error = {}
+        self._idle_receive_timeouts = 0
+        self._consecutive_idle_timeouts = 0
+
+    def _record_error(self, exc):
+        self._last_error = dict(error_phase=self._operation_phase,
+            error_type=type(exc).__name__, error_message=str(exc)[:2048],
+            error_at_unix=time.time(), **self._request_context)
+
+    def diagnostic_snapshot(self):
+        """有界运行证据，不包含请求参数、Redis凭据或任何重发入口。"""
+        return dict(operation_phase=self._operation_phase, last_error=copy.deepcopy(self._last_error),
+                    idle_receive_timeouts=self._idle_receive_timeouts,
+                    consecutive_idle_timeouts=self._consecutive_idle_timeouts)
 
     @property
     def closed(self):
@@ -291,6 +308,7 @@ class RedisShmReadOnlyProxy:
             result = {}
             try:
                 for route in ("readonly", "execution"):
+                    self._operation_phase = "SHM_HANDSHAKE_" + route.upper()
                     self._ensure_open()
                     client = self._check_client(route)
                     now = time.time()
@@ -318,10 +336,13 @@ class RedisShmReadOnlyProxy:
                 self._capabilities = frozenset(EXECUTION_METHODS | QUOTE_METHODS
                     | (MARKET_RPC_METHODS & set(result["readonly"]["capabilities"]))
                     | (WRITE_METHODS if self.allow_order_methods else frozenset()))
+                self._operation_phase = "WRITE_LEDGER_INSPECT"
                 self._inspect_write_ledger()
                 self._verified = True
+                self._operation_phase = "IDENTITY_VERIFIED"
                 return result
-            except Exception:
+            except Exception as exc:
+                self._record_error(exc)
                 self._seal("IDENTITY_VERIFICATION_FAILED")
                 raise
         finally:
@@ -445,6 +466,7 @@ class RedisShmReadOnlyProxy:
 
     def process_raw(self, raw_payload, source="queue"):
         """沿用原 JSON/b64s 编码；无法取得合法身份时不写 Redis。"""
+        self._operation_phase = "REQUEST_DECODE"
         request = raw_payload if isinstance(raw_payload, dict) else json.loads(
             decode_rpc_request_payload(decode_text(raw_payload)))
         return self.process_request(request)
@@ -460,6 +482,9 @@ class RedisShmReadOnlyProxy:
             if not isinstance(request, dict):
                 raise ShmProtocolError("request must be object")
             request = copy.deepcopy(request)
+            self._request_context = {key: request[key][:128] for key in ("request_id", "method")
+                                     if isinstance(request.get(key), str)}
+            self._operation_phase = "REQUEST_VALIDATE"
             # 先拒绝无法安全寻址的请求；不写任意 custom 回复键。
             reply = self._reply_request(request)
             rid = request["request_id"]
@@ -475,6 +500,7 @@ class RedisShmReadOnlyProxy:
                     if prior_fp != fingerprint:
                         raise ShmProtocolError("request_id semantic conflict")
                     try:
+                        self._operation_phase = "SHM_IDENTITY_CHECK"
                         for checked_route in self._clients:
                             self._check_client(checked_route)
                         response = copy.deepcopy(prior)
@@ -485,6 +511,7 @@ class RedisShmReadOnlyProxy:
                         self._seal("SHM_IDENTITY_CHANGED")
                 else:
                     is_write = request["method"] in WRITE_METHODS
+                    self._operation_phase = "WRITE_GATE_CHECK" if is_write else "REQUEST_VALIDATE"
                     if (is_write and self._writes_blocked
                             and self.transport.redis.hget(_WRITE_LEDGER_KEY, rid) is None):
                         raise ShmProtocolError("new writes are blocked: %s; inspect existing results" % self._write_block_reason)
@@ -513,9 +540,11 @@ class RedisShmReadOnlyProxy:
                     try:
                         # 两路是一次固定身份合同；任何一路换 SID 都不能让旧
                         # 代理继续沿另一通道运行。
+                        self._operation_phase = "SHM_IDENTITY_CHECK"
                         for checked_route in self._clients:
                             self._check_client(checked_route)
                         if is_write:
+                            self._operation_phase = "WRITE_LEDGER_CLAIM"
                             reservation, prior_write = self._claim_write(request, fingerprint)
                         else:
                             prior_write = None
@@ -524,8 +553,10 @@ class RedisShmReadOnlyProxy:
                         remaining = deadline - time.time()
                         if remaining <= 0:
                             raise ShmProtocolError("read deadline expired before forwarding")
+                        self._operation_phase = "SHM_FORWARD"
                         response = (prior_write if prior_write is not None else
                                     client.send_request(forwarded, timeout_seconds=remaining))
+                        self._operation_phase = "SHM_RESPONSE_VALIDATE"
                         if prior_write is None:
                             self._check_response(forwarded, response, self._sessions[route])
                         response = copy.deepcopy(response)
@@ -570,13 +601,16 @@ class RedisShmReadOnlyProxy:
                                 response["data"] = wrapped["asset"]
                                 response["source_evidence"] = wrapped["source_evidence"]
                     except Exception as exc:
+                        self._record_error(exc)
                         response = self._response(request, exc, "SHM_RESULT_UNCONFIRMED", unknown=True)
                         self._seal("SHM_RESULT_UNCONFIRMED")
                     if reservation is not None:
                         try:
+                            self._operation_phase = "WRITE_LEDGER_SETTLE"
                             write_settlement = self._settle_write(request, reservation, response,
                                 "UNKNOWN" if response.get("status") == "UNKNOWN" else "PUBLISH_PENDING")
                         except Exception as exc:
+                            self._record_error(exc)
                             response = self._response(request, exc, "WRITE_LEDGER_SETTLEMENT_UNCONFIRMED", unknown=True)
                             self._seal("WRITE_LEDGER_SETTLEMENT_UNCONFIRMED")
                     self._replays[rid] = (fingerprint, copy.deepcopy(response))
@@ -589,12 +623,15 @@ class RedisShmReadOnlyProxy:
             if binding is not None:
                 response["source_binding"] = binding
             try:
+                self._operation_phase = "REDIS_RESPONSE_PUBLISH"
                 self.transport.send_response(reply, response)
                 if write_settlement is not None and response.get("status") != "UNKNOWN":
                     # 先持久留下发布待确认，再 fanout，全部完成才晋级；
                     # 即使最后一次 Redis 写失联，重启也不能解除停写门。
+                    self._operation_phase = "WRITE_LEDGER_CONFIRM"
                     write_settlement = self._settle_write(request, write_settlement, response, "CONFIRMED")
-            except Exception:
+            except Exception as exc:
+                self._record_error(exc)
                 # 一次 fanout 的部分写入也可能已对外可见，只封闭并留本地缓存。
                 self._seal("REDIS_RESPONSE_PUBLISH_FAILED")
                 if write_settlement is not None:
@@ -614,7 +651,7 @@ class RedisShmReadOnlyProxy:
         return None if prior is None else copy.deepcopy(prior[1])
 
     def poll_once(self):
-        """同步非阻塞读取一次，固定账户队列和订阅；任何接收失败停止。"""
+        """空队列只读检查；仅未消费业务的LLEN超时可有限重检，其余失败封闭。"""
         if not self._poll_lock.acquire(False):
             raise ShmProtocolError("proxy already has an in-flight poll")
         try:
@@ -625,15 +662,42 @@ class RedisShmReadOnlyProxy:
                 self._seal("SESSION_CAPACITY_EXHAUSTED")
                 return None
             try:
+                self._request_context = {}
                 if self._pubsub is None:
+                    self._operation_phase = "REDIS_PUBSUB_CREATE"
                     self._pubsub = self.transport.listen_redis.pubsub(ignore_subscribe_messages=True)
+                    self._operation_phase = "REDIS_SUBSCRIBE"
                     self._pubsub.subscribe(self.transport.request_channel)
+                self._operation_phase = "REDIS_PUBSUB_RECEIVE"
                 message = self._pubsub.get_message(timeout=0)
                 if message and message.get("type") == "message":
                     return self.process_raw(message.get("data"), source="pubsub")
+                # 到此尚未取得PubSub业务，也没有发出破坏性LPOP。空闲
+                # TCP检查超时可以丢弃该只读结果，下轮重新检查而不重发业务。
+                self._operation_phase = "REDIS_QUEUE_INSPECT"
+                try:
+                    length = self.transport.listen_redis.llen(self.transport.request_queue)
+                except Exception as exc:
+                    if not _is_redis_timeout(exc):
+                        raise
+                    self._record_error(exc)
+                    self._idle_receive_timeouts += 1
+                    self._consecutive_idle_timeouts += 1
+                    if self._consecutive_idle_timeouts >= 3:
+                        self._seal("REDIS_IDLE_INSPECTION_TIMEOUT_LIMIT")
+                        raise
+                    return None
+                if type(length) is not int or length < 0:
+                    raise ShmProtocolError("queue length must be a nonnegative integer")
+                self._consecutive_idle_timeouts = 0
+                if length == 0:
+                    self._operation_phase = "IDLE"
+                    return None
+                self._operation_phase = "REDIS_QUEUE_LPOP"
                 raw = self.transport.listen_redis.lpop(self.transport.request_queue)
                 return None if raw is None else self.process_raw(raw, source="queue")
-            except Exception:
+            except Exception as exc:
+                self._record_error(exc)
                 self._seal("REDIS_RECEIVE_OR_PROCESS_FAILED")
                 raise
         finally:

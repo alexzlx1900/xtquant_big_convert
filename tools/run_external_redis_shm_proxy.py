@@ -117,7 +117,7 @@ def create_redis_client(target):
     if redis is None or Retry is None or NoBackoff is None:
         raise RuntimeError("the existing environment needs the project Redis optional dependency")
     # Direct constructor keeps this exact local target independent of URL/env fallbacks.
-    kwargs = dict(target, socket_connect_timeout=1.0, socket_timeout=1.0,
+    kwargs = dict(target, socket_connect_timeout=1.0, socket_timeout=1.0, health_check_interval=15,
                   retry=Retry(NoBackoff(), 0), retry_on_timeout=False)
     if "protocol" in inspect.signature(redis.Redis.__init__).parameters:
         kwargs["protocol"] = 2
@@ -128,8 +128,16 @@ def _emit_ready(evidence):
     print(json.dumps(evidence, ensure_ascii=False, sort_keys=True), flush=True)
 
 
+def _safe_message(message, target):
+    value = str(message)
+    for key in ("password", "username"):
+        if target.get(key):
+            value = value.replace(target[key], "<redacted>")
+    return value[:2048]
+
+
 def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=None, ready_observer=None):
-    """显式运行政策；停止事件或中断释放自有连接，不重连、不重发、不删键。"""
+    """显式运行政策；仅空闲只读队列检查允许有限恢复，不重发业务、不删键。"""
     config = validate_config(value)
     if windows_session_id(os.getpid()) != config["windows_session"] or windows_session_id(config["native_pid"]) != config["windows_session"]:
         raise RuntimeError("consumer and native source must share the explicit Windows session")
@@ -149,12 +157,16 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                   write_block_reason="OPERATOR_WRITE_DISABLED" if config["start_write_blocked"] else "",
                   processed_requests=0, received_requests=0, full_duration_acceptance_proved=False)
     began = time.monotonic()
+    phase = "REDIS_CLIENT_CREATE"
     try:
         redis_client = (redis_factory or create_redis_client)(config["redis"])
         transport = RedisTransport(redis_client, account_id=ACCOUNT)
         factory = shm_factory or ShmReadOnlyClient
+        phase = "SHM_READ_CLIENT_CREATE"
         clients.append(factory(config["read_name"], ACCOUNT))
+        phase = "SHM_EXECUTION_CLIENT_CREATE"
         clients.append(factory(config["execution_name"], ACCOUNT))
+        phase = "PROXY_CREATE"
         proxy = RedisShmReadOnlyProxy(
             redis_transport=transport, readonly_client=clients[0], execution_client=clients[1],
             account_id=ACCOUNT, expected_readonly_session_id=config["read_session_id"],
@@ -167,8 +179,10 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         )
         if config["start_write_blocked"]:
             proxy._block_writes("OPERATOR_WRITE_DISABLED")
+        phase = "IDENTITY_VERIFY"
         proxy.verify_identity()
         evidence = dict(proxy.identity_snapshot(), status="READY", automatic_retry=False)
+        phase = "READY_OBSERVER"
         (ready_observer or _emit_ready)(evidence)
         stop_requested = False
         while not proxy.stopped:
@@ -182,6 +196,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                         or proxy.processed_count >= config["max_requests"]
                         or result["received_requests"] >= config["max_requests"]):
                     break
+            phase = "RECEIVE_LOOP"
             response = proxy.poll_once()
             if response is None:
                 time.sleep(min(0.02, remaining) if bounded else 0.02)
@@ -195,11 +210,20 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                       processed_requests=proxy.processed_count if proxy else 0,
                       stop_reason="KEYBOARD_INTERRUPT")
     except Exception as exc:
-        result.update(status="FAILED", error_type=type(exc).__name__)
+        diagnostics = proxy.diagnostic_snapshot() if proxy is not None else {}
+        result.update(status="FAILED", error_type=type(exc).__name__,
+                      error_phase=diagnostics.get("operation_phase", phase) if phase in ("RECEIVE_LOOP", "IDENTITY_VERIFY") else phase,
+                      error_message=_safe_message(exc, config["redis"]),
+                      error_at_unix=time.time(), stop_reason=proxy.stop_reason if proxy else "",
+                      identity_verified=bool(proxy and proxy.verified))
         if proxy is not None:
             result["processed_requests"] = proxy.processed_count
     finally:
         if proxy is not None:
+            diagnostics = proxy.diagnostic_snapshot()
+            if diagnostics["last_error"]:
+                diagnostics["last_error"]["error_message"] = _safe_message(diagnostics["last_error"]["error_message"], config["redis"])
+            result["diagnostics"] = diagnostics
             if proxy.verified:
                 snapshot = proxy.identity_snapshot()
                 result.update({field: snapshot[field]
@@ -218,7 +242,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                 redis_client.connection_pool.disconnect()
             except Exception as exc:
                 errors.append(type(exc).__name__)
-        result.update(cleanup_errors=errors, resources_closed=not errors,
+        result.update(cleanup_errors=errors, resources_closed=not errors, runtime_running=False,
                       elapsed_seconds=round(time.monotonic() - began, 3))
         if errors:
             result["status"] = "UNKNOWN"
