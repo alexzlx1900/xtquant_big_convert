@@ -529,7 +529,20 @@ class RedisShmReadOnlyProxy:
                             response["source_binding"] = binding
                         if time.time() >= deadline:
                             raise ShmProtocolError("SHM response arrived after deadline")
-                        if isinstance(response.get("data"), dict) and response["data"].get("status") == "UNKNOWN":
+                        data = response.get("data")
+                        # 登录回调尚未观测是已确认的业务未知，不能当作 SHM
+                        # 请求结果未知；仅接受当前原生账户/会话的明确回读。
+                        login_state_unknown = (
+                            request["method"] == "get_trade_login_state" and response["ok"]
+                            and isinstance(data, dict) and data.get("status") == "UNKNOWN"
+                            and data.get("source") == "native_account_callback"
+                            and data.get("account_id") == self.account_id
+                            and data.get("session_id") == self._sessions[route]
+                            and type(data.get("native_pid")) is int
+                            and data["native_pid"] == self.expected_native_pid
+                            and data.get("positive_contract_verified") is False
+                        )
+                        if isinstance(data, dict) and data.get("status") == "UNKNOWN" and not login_state_unknown:
                             response.update(status="UNKNOWN", automatic_retry=False)
                             if is_write:
                                 self._block_writes("NATIVE_WRITE_RESULT_UNKNOWN")

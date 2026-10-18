@@ -737,6 +737,47 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         self.assertEqual(source_changed.process_request(rebound)["status"], "UNKNOWN")
         self.assertEqual(len(changed_execution.calls), 1)
 
+    def test_confirmed_unknown_login_state_keeps_read_channel_open_without_proving_login(self):
+        proxy, _, _, execution = self.make_proxy(policy="PERSISTENT_SIMULATION_READ_WRITE")
+        execution.result = dict(status="UNKNOWN", account_id=ACCOUNT,
+                                session_id="execution-sid", native_pid=2852,
+                                source="native_account_callback", fresh=False,
+                                positive_contract_verified=False,
+                                reason="TRADE_LOGIN_CALLBACK_NOT_OBSERVED")
+        response = proxy.process_request(request("get_trade_login_state", rid="login-state"))
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["data"]["status"], "UNKNOWN")
+        self.assertFalse(response["data"]["positive_contract_verified"])
+        self.assertFalse(proxy.stopped)
+        execution.result = [{"symbol": "000001.SZ", "volume": 100}]
+        self.assertTrue(proxy.process_request(request("get_positions", rid="positions-after-login"))["ok"])
+
+    def test_unknown_login_with_untrusted_identity_still_seals_channel(self):
+        for changes in ({"account_id": "other"}, {"session_id": "old-sid"},
+                        {"native_pid": True}, {"source": "other"},
+                        {"positive_contract_verified": True}):
+            with self.subTest(changes=changes):
+                proxy, _, _, execution = self.make_proxy(policy="PERSISTENT_SIMULATION_READ_WRITE")
+                execution.result = dict(status="UNKNOWN", account_id=ACCOUNT,
+                                        session_id="execution-sid", native_pid=2852,
+                                        source="native_account_callback",
+                                        positive_contract_verified=False)
+                execution.result.update(changes)
+                response = proxy.process_request(request("get_trade_login_state"))
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["server_error"], "SHM_RESULT_UNKNOWN")
+                self.assertTrue(proxy.stopped)
+
+    def test_unrelated_unknown_read_still_seals_channel(self):
+        proxy, _, _, execution = self.make_proxy(policy="PERSISTENT_SIMULATION_READ_WRITE")
+        execution.result = dict(status="UNKNOWN", account_id=ACCOUNT,
+                                session_id="execution-sid", native_pid=2852,
+                                source="native_account_callback", positive_contract_verified=False)
+        response = proxy.process_request(request("get_positions"))
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["server_error"], "SHM_RESULT_UNKNOWN")
+        self.assertTrue(proxy.stopped)
+
     def test_native_write_unknown_blocks_new_writes_but_read_queries_and_events_continue(self):
         proxy, redis, _, execution = self.make_proxy(policy="PERSISTENT_SIMULATION_READ_WRITE")
         execution.result = {"status": "UNKNOWN", "automatic_retry": False, "order_sys_id": "native-1"}
