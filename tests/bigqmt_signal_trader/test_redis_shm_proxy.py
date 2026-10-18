@@ -182,7 +182,7 @@ def request(method="get_positions", rid="request-1", params=None):
 
 class RedisShmReadOnlyProxyTest(unittest.TestCase):
     def make_proxy(self, *, verify=True, capacity=1000, deadline=None, redis=None,
-                   policy="BOUNDED", read_capacity=1000, write_capacity=1000, market=False):
+                   policy="BOUNDED", read_capacity=1000, write_capacity=1000, market=False, timeout=5):
         redis = redis or FakeRedis()
         transport = RedisTransport(redis, account_id=ACCOUNT)
         readonly, execution = FakeRawClient("readonly"), FakeRawClient("execution")
@@ -196,7 +196,7 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         proxy = RedisShmReadOnlyProxy(
             transport, readonly, execution, expected_readonly_session_id="readonly-sid",
             expected_execution_session_id="execution-sid", expected_native_pid=2852,
-            timeout_seconds=5, max_requests=capacity, deadline_unix=deadline,
+            timeout_seconds=timeout, max_requests=capacity, deadline_unix=deadline,
             runtime_policy=policy, allow_order_methods=execution.allow_order_methods,
             read_cache_capacity=read_capacity, write_ledger_capacity=write_capacity)
         if verify:
@@ -443,6 +443,101 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         original["read_expires_at_unix"] = time.time() + 3600
         self.assertTrue(proxy.process_request(original)["ok"])
         self.assertLess(execution.calls[-1][0]["read_expires_at_unix"], original["read_expires_at_unix"])
+
+    def test_cached_history_explicit_15_second_deadline_preserves_remaining_caller_budget(self):
+        params = dict(code="000001.SZ", period="1m", start_time="20261016090000",
+                      end_time="20261016150000", count=2, fill_data=False, subscribe=False)
+        clock = [1000.0]
+        with mock.patch("bigqmt_signal_trader.redis_shm_proxy.time.time", side_effect=lambda: clock[0]):
+            proxy, _, readonly, execution = self.make_proxy(market=True, timeout=2)
+            value = request("get_market_data_ex", params=params)
+            value["read_expires_at_unix"] = 1015.0
+            self.assertTrue(proxy.process_request(value)["ok"])
+            self.assertEqual(readonly.calls[-1][0]["read_expires_at_unix"], 1015.0)
+            self.assertEqual(readonly.calls[-1][1], 15.0)
+            clock[0] = 1005.0
+            value["request_id"] = "remaining-history"
+            for key in ("reply_key", "reply_list", "reply_channel"):
+                value.pop(key)
+            self.assertTrue(proxy.process_request(value)["ok"])
+            self.assertEqual(readonly.calls[-1][0]["read_expires_at_unix"], 1015.0)
+            self.assertEqual(readonly.calls[-1][1], 10.0)
+            self.assertEqual(len(execution.calls), 1)
+
+    def test_cached_history_short_caller_or_source_deadline_wins_and_limit_remains_15_seconds(self):
+        params = dict(code="000001.SZ", period="1d", start_time="20261016000000",
+                      end_time="20261016235959", count=1, fill_data=False, subscribe=False)
+        with mock.patch("bigqmt_signal_trader.redis_shm_proxy.time.time", return_value=1000.0):
+            for caller_deadline, source_deadline, expected in ((1001.0, None, 1001.0),
+                                                              (1060.0, None, 1015.0),
+                                                              (1015.0, 1008.0, 1008.0)):
+                with self.subTest(caller_deadline=caller_deadline, source_deadline=source_deadline):
+                    proxy, _, readonly, _ = self.make_proxy(market=True, timeout=2, deadline=source_deadline)
+                    value = request("get_market_data_ex", params=params)
+                    value["read_expires_at_unix"] = caller_deadline
+                    self.assertTrue(proxy.process_request(value)["ok"])
+                    self.assertEqual(readonly.calls[-1][0]["read_expires_at_unix"], expected)
+                    self.assertEqual(readonly.calls[-1][1], expected - 1000.0)
+
+    def test_cached_history_without_explicit_deadline_and_other_methods_keep_default_budget(self):
+        history = dict(code="000001.SZ", period="1d", start_time="20261016000000",
+                       end_time="20261016235959", count=1, fill_data=False, subscribe=False)
+        with mock.patch("bigqmt_signal_trader.redis_shm_proxy.time.time", return_value=1000.0):
+            for method, params, explicit in (("get_market_data_ex", history, False),
+                                            ("get_local_data", dict(history, fill_data=False), True),
+                                            ("get_positions", {}, True), ("submit_order", {}, True)):
+                with self.subTest(method=method):
+                    proxy, _, readonly, execution = self.make_proxy(
+                        market=True, timeout=2, policy="PERSISTENT_SIMULATION_READ_WRITE")
+                    if method == "get_local_data":
+                        params = {key: value for key, value in params.items() if key not in ("fill_data", "subscribe")}
+                    value = request(method, params=params)
+                    if explicit:
+                        value["read_expires_at_unix"] = 1015.0
+                    self.assertTrue(proxy.process_request(value)["ok"])
+                    client = readonly if method in MARKET_RPC_METHODS else execution
+                    self.assertEqual(client.calls[-1][0]["read_expires_at_unix"], 1002.0)
+                    self.assertEqual(client.calls[-1][1], 2.0)
+
+    def test_cached_history_expired_or_invalid_caller_deadline_never_forwards(self):
+        params = dict(code="000001.SZ", period="1m", start_time="20261016090000",
+                      end_time="20261016150000", count=2, fill_data=False, subscribe=False)
+        with mock.patch("bigqmt_signal_trader.redis_shm_proxy.time.time", return_value=1000.0):
+            for expires in (999.0, 1000.0, True, None, float("inf"), float("nan")):
+                with self.subTest(expires=expires):
+                    proxy, redis, readonly, execution = self.make_proxy(market=True, timeout=2)
+                    value = request("get_market_data_ex", params=params)
+                    value["read_expires_at_unix"] = expires
+                    self.assertFalse(proxy.process_request(value)["ok"])
+                    self.assertEqual(len(readonly.calls), 1)
+                    self.assertEqual(len(execution.calls), 1)
+                    self.assertFalse(any(operation[0] == "eval" for operation in redis.operations))
+
+    def test_cached_history_late_response_remains_unknown_and_seals_without_resend(self):
+        params = dict(code="000001.SZ", period="1m", start_time="20261016090000",
+                      end_time="20261016150000", count=2, fill_data=False, subscribe=False)
+        clock = [1000.0]
+        with mock.patch("bigqmt_signal_trader.redis_shm_proxy.time.time", side_effect=lambda: clock[0]):
+            proxy, _, readonly, _ = self.make_proxy(market=True, timeout=2)
+            original_send = readonly.send_request
+
+            def late_response(value, timeout_seconds):
+                response = original_send(value, timeout_seconds)
+                clock[0] = 1015.0
+                return response
+
+            readonly.send_request = late_response
+            value = request("get_market_data_ex", params=params)
+            value["read_expires_at_unix"] = 1015.0
+            response = proxy.process_request(value)
+            self.assertFalse(response["ok"])
+            self.assertEqual(response["status"], "UNKNOWN")
+            self.assertFalse(response["automatic_retry"])
+            self.assertTrue(proxy.stopped)
+            self.assertEqual(readonly.calls[-1][1], 15.0)
+            with self.assertRaises(ShmProtocolError):
+                proxy.process_request(value)
+            self.assertEqual(len(readonly.calls), 2)
 
     def test_confirmed_duplicate_replies_from_cache_and_conflict_does_not_pollute(self):
         proxy, _, _, execution = self.make_proxy()

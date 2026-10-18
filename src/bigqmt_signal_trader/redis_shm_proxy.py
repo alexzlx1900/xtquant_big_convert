@@ -498,7 +498,12 @@ class RedisShmReadOnlyProxy:
                     expires = request.get("read_expires_at_unix", now + self.timeout_seconds)
                     if type(expires) not in (int, float) or not math.isfinite(expires) or expires <= now:
                         raise ShmProtocolError("read request is expired or has an invalid deadline")
-                    deadline = min(expires, now + self.timeout_seconds)
+                    # 正式缓存历史入口可显式申请最多 15 秒；消费前已耗时
+                    # 仍由调用方原始绝对截止扣除，其他方法保留原预算。
+                    request_budget = (15.0 if request["method"] == "get_market_data_ex"
+                                      and "read_expires_at_unix" in request
+                                      else self.timeout_seconds)
+                    deadline = min(expires, now + request_budget)
                     if self.deadline_unix is not None:
                         deadline = min(deadline, self.deadline_unix)
                     route = "readonly" if request["method"] in QUOTE_METHODS | MARKET_RPC_METHODS else "execution"
