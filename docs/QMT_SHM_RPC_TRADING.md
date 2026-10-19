@@ -6,11 +6,17 @@
 
 股票 Account 对象的原生字段为 `m_strAccountID`、`m_strStatus`，依据是[官方数据结构](https://dict.thinktrader.net/innerApi/data_structure.html)和[账户回调](https://dict.thinktrader.net/innerApi/callback_function.html)。不移植 MiniQMT 或信用账户的数值状态，也不把 TASK、资产查询、set_account 或合成 ONLINE 当作登录证明。
 
-本轮真实独立 `account_callback` 取得账户 55013746 的精确文本“登录成功”，由此冻结唯一正向文本映射。仅原生回调、固定账户、同 SID/PID 且单调时钟年龄不超过 15 秒，才为 `LOGGED_IN`；“准备登录”为 `NOT_LOGGED_IN`，其他、缺失、过期或错身份为 `UNKNOWN`。不从账户缓存刷新事件时间。
+真实独立 `account_callback` 已取得账户 55013746 的精确文本“登录成功”，保留唯一正向文本映射。旧版证据合同要求回调年龄不超过15秒；2026-10-19 新版 `login_evidence_version=2` 修正为会话内状态事件与本次账户采样分开计时。官方回调是“资金账号状态变化”，没有15秒心跳承诺，不能仅因状态事件变老而判定登出。新版当前仅为本地实现，应用实机须另以固定候选及真实路径验收。
+
+v2 的 `freshness_basis=native_callback_state_with_current_account_sample`、`source=native_account_callback`。只有当前 SID/PID 下已收到精确账户“登录成功”事件，并且本次原生线程中唯一 `ACCOUNT` 采样的 `m_strAccountID/m_strStatus` 与该事件一致，才为 `LOGGED_IN`。`event_observed_at_utc`、`age_seconds` 保留真实事件时间与年龄，`state_event_age_seconds` 等于该年龄；新增 `sample_observed_at_utc/sample_age_seconds` 表示本次采样起点及单调耗时，`fresh` 只表示该采样有效且年龄0至15秒。采样异常、空/多行、错账户、未知或负状态均否决；负回调优先覆盖旧成功，未知字符串仍 UNKNOWN，新 SID 和停止清空事件。
+
+每次 `readback` 仅查询一次 `ACCOUNT`，`diagnostic_readback` 复用同一结果；`query_diagnostic.proves_login=False`、`used_as_consistency_veto=True`，缓存不能单独建立正状态，不能刷新原事件时间。Bridge 在每次写入及最终原生函数边界重新读取；v2 严格核对版本、来源/身份、事件非负有限年龄、相同事件年龄字段、本次采样0至15秒及诊断一致性，未知版本拒绝。无版本旧合同继续原15秒约束，不自动放宽。该合同证明当前 QMT 客户端报告的状态，不宣称具有普通股票柜台强查询API；本地手册6.8明确 `ACCOUNT` 为客户端缓存。
 
 新增只读 `get_trade_login_state`，返回原始状态、回调观测时间、年龄、来源和拒绝原因。`query_diagnostic` 保存 ACCOUNT 缓存的原始字段，明确 `proves_login=False`。每份新的 submit/cancel 在最终原生调用前重新检查；未确认登录返回 `BLOCKED`、`native_write_executed=False`，阻断结果缓存，登录恢复不能借同一 request_id 重发。
 
-实际首轮回调时间 `2026-10-15T13:44:43.989912Z`，读时约 28.109 秒；恢复回调 `2026-10-15T14:04:44.175167Z`，读时约 95.125 秒，均正确为 `STALE/UNKNOWN`。账户缓存虽显示同名状态，仍不证明当前可下单。回报源 CONNECTED 与门禁分别展示，未知登录不抹掉只读连接。
+v2本地验收：`tests/test_shm_trade_login.py tests/test_shm_rpc_single_file.py tests/test_shm_rpc.py tests/test_dual_shm_single_file.py` 共230项通过；最后补充查询期间会话切换防护后，登录定向55项通过，两组重叠不相加。覆盖实际生成bundle、超过120秒正事件配合当前一致采样、事件时间保真、单次ACCOUNT读取、负事件覆盖、负/缺/多行/错账户/异常样本、样本超龄和冻结旧样本年龄攻击、未知版本、停止/新SID及无登录来源零写。生成外壳继续通过ASCII/GBK/Python3.6检查。此记录仅证明本地工程合同，未加载新实机源、未请求交易、未推送或部署。
+
+历史首轮回调时间 `2026-10-15T13:44:43.989912Z`，读时约28.109秒；恢复回调 `2026-10-15T14:04:44.175167Z`，读时约95.125秒，按当时v1合同均为 `STALE/UNKNOWN`，不能把这一工程判定写成柜台已登出的事实。2026-10-19 12:11三次保存查询中来源及RPC可用、写账本未阻断，仅事件年龄28.906/30.203/31.515秒触发旧门禁，缓存状态仍为“登录成功”，由此定位上述状态事件与心跳混用问题。未知登录仍保留强阻断，不以只读连接代替登录。
 
 首批 Converter 119 项及 Gateway 36 项测试通过；取得真实字段后 63 项受影响/生成包检查通过，集合重叠不求和。真实恢复候选默认禁写，本轮零下单、零撤单、零卖出；未证明新单柜台接受或撤单终态。Converter `alex-quant` 工作区未提交，无关 `position_bigqmt.py` 改动保持。
 

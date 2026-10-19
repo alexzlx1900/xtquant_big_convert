@@ -274,7 +274,7 @@ def create_native_stock_order_gateway(context, account_id, query, passorder_func
 
 
 class NativeTradeLoginState:
-    """独立账户回调证据；只接受2026-10-15实机确认的精确登录成功文本。"""
+    """会话内原生状态事件与本次账户采样分开计时，不把状态变化当心跳。"""
     def __init__(self, account_id, query):
         self.account_id, self.query = account_id, query
         self.identity, self.event = None, None
@@ -290,51 +290,71 @@ class NativeTradeLoginState:
 
     def readback(self):
         session_id, pid = self.identity or (None, None)
+        sample_started = time.monotonic()
+        sample_at = _dt.datetime.utcnow().isoformat() + "Z"
+        diagnostic = dict(source="native_query_ACCOUNT_cache", query_observed_at_utc=sample_at,
+                          proves_login=False, used_as_consistency_veto=True, raw_status=None, raw_numeric_status=None)
+        sample_error = ""
+        try:
+            rows = self.query(self.account_id, "STOCK", "ACCOUNT")
+            if not isinstance(rows, (list, tuple)) or len(rows) != 1:
+                raise ValueError("TRADE_LOGIN_ACCOUNT_SAMPLE_NOT_UNIQUE")
+            row = rows[0]
+            field = lambda name: row.get(name) if isinstance(row, dict) else getattr(row, name, None)
+            diagnostic.update(raw_account_id=field("m_strAccountID"), raw_status=field("m_strStatus"),
+                              raw_numeric_status=field("m_nStatus"))
+            if diagnostic["raw_account_id"] != self.account_id:
+                raise ValueError("TRADE_LOGIN_ACCOUNT_SAMPLE_IDENTITY_MISMATCH")
+            if not isinstance(diagnostic["raw_status"], str) or not diagnostic["raw_status"]:
+                raise ValueError("TRADE_LOGIN_ACCOUNT_SAMPLE_STATUS_UNKNOWN")
+        except Exception as exc:
+            known = ("TRADE_LOGIN_ACCOUNT_SAMPLE_NOT_UNIQUE", "TRADE_LOGIN_ACCOUNT_SAMPLE_IDENTITY_MISMATCH",
+                     "TRADE_LOGIN_ACCOUNT_SAMPLE_STATUS_UNKNOWN")
+            sample_error = str(exc) if isinstance(exc, ValueError) and str(exc) in known else "TRADE_LOGIN_ACCOUNT_SAMPLE_FAILED"
+            diagnostic.update(error=sample_error, exception_type=type(exc).__name__)
+        sample_age = time.monotonic() - sample_started
         value = dict(status="UNKNOWN", account_id=self.account_id, session_id=session_id, native_pid=pid,
                      source="native_account_callback", raw_status=None, raw_numeric_status=None,
-                     event_observed_at_utc=None, age_seconds=None, fresh=False,
+                     login_evidence_version=2,
+                     freshness_basis="native_callback_state_with_current_account_sample",
+                     event_observed_at_utc=None, age_seconds=None, state_event_age_seconds=None,
+                     sample_observed_at_utc=sample_at, sample_age_seconds=sample_age,
+                     fresh=not sample_error and 0 <= sample_age <= 15,
                      positive_contract_verified=False, reason="TRADE_LOGIN_CALLBACK_NOT_OBSERVED",
+                     query_diagnostic=diagnostic,
                      contract_source="https://dict.thinktrader.net/innerApi/data_structure.html")
         if self.event is not None:
             event = self.event
             age = time.monotonic() - event["observed_monotonic"]
             value.update(raw_status=event["raw_status"], raw_numeric_status=event["raw_numeric_status"],
                          raw_account_id=event["raw_account_id"], event_observed_at_utc=event["observed_at_utc"],
-                         age_seconds=age, fresh=0 <= age <= 15)
-            if event["identity"] != self.identity:
+                         age_seconds=age, state_event_age_seconds=age)
+            if self.identity != (session_id, pid) or event["identity"] != (session_id, pid):
                 value["reason"] = "TRADE_LOGIN_SESSION_CHANGED"
             elif event["raw_account_id"] != self.account_id:
                 value["reason"] = "TRADE_LOGIN_CALLBACK_ACCOUNT_MISSING_OR_MISMATCH"
-            elif not value["fresh"]:
-                value["reason"] = "TRADE_LOGIN_CALLBACK_STALE"
+            elif not math.isfinite(age) or age < 0:
+                value["reason"] = "TRADE_LOGIN_EVENT_TIME_INVALID"
             elif event["raw_status"] == "\u51c6\u5907\u767b\u5f55":
                 value.update(status="NOT_LOGGED_IN", reason="TRADE_LOGIN_PREPARING_LOGIN")
             elif event["raw_status"] == "\u767b\u5f55\u6210\u529f":
-                # 官方m_strStatus字段 + 当日55013746独立原生回调实样；不映射其它文本/数字。
-                value.update(status="LOGGED_IN", positive_contract_verified=True, reason="")
+                if sample_error:
+                    value["reason"] = sample_error
+                elif not value["fresh"]:
+                    value["reason"] = "TRADE_LOGIN_ACCOUNT_SAMPLE_STALE"
+                elif diagnostic["raw_status"] == "\u51c6\u5907\u767b\u5f55":
+                    value.update(status="NOT_LOGGED_IN", reason="TRADE_LOGIN_ACCOUNT_SAMPLE_PREPARING_LOGIN")
+                elif diagnostic["raw_status"] != "\u767b\u5f55\u6210\u529f":
+                    value["reason"] = "TRADE_LOGIN_ACCOUNT_SAMPLE_STATUS_UNVERIFIED"
+                else:
+                    value.update(status="LOGGED_IN", positive_contract_verified=True, reason="")
             else:
                 value["reason"] = "TRADE_LOGIN_POSITIVE_STATUS_CONTRACT_UNVERIFIED"
         return value
 
     def diagnostic_readback(self):
-        value = self.readback()
-        # ACCOUNT缓存只作原字段诊断；绝不刷新callback事件时间或推导登录成功。
-        diagnostic = dict(source="native_query_ACCOUNT_cache", query_observed_at_utc=_dt.datetime.utcnow().isoformat() + "Z",
-                          proves_login=False, raw_status=None, raw_numeric_status=None)
-        try:
-            rows = self.query(self.account_id, "STOCK", "ACCOUNT")
-            if not isinstance(rows, (list, tuple)) or len(rows) != 1:
-                raise ValueError("single account row required")
-            row = rows[0]
-            field = lambda name: row.get(name) if isinstance(row, dict) else getattr(row, name, None)
-            diagnostic.update(raw_account_id=field("m_strAccountID"), raw_status=field("m_strStatus"),
-                              raw_numeric_status=field("m_nStatus"))
-            if diagnostic["raw_account_id"] != self.account_id:
-                raise ValueError("raw account identity mismatch")
-        except Exception as exc:
-            diagnostic["error"] = str(exc)
-        value["query_diagnostic"] = diagnostic
-        return value
+        # 复用readback的一次采样；缓存不能建立回调状态，也不改事件时间。
+        return self.readback()
 
 
 class NativeShmRpcRuntime:
@@ -459,6 +479,7 @@ class NativeShmRpcRuntime:
         if self.closed:
             return
         self.closed = True
+        self.trade_login.bind_identity(None, None)
         self.bridge.close()
         print("AQP_SHM_RPC_CLOSED " + json.dumps(dict(reason=reason, requests=self.requests,
                                                       native_handles_closed=True), sort_keys=True))

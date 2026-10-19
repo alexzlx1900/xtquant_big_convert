@@ -152,7 +152,7 @@ def test_real_saved_success_text_replay_maps_only_fresh_matching_native_callback
         h.close()
 
 
-def test_real_saved_success_callback_stays_stale_after_cached_query_and_blocks_writes():
+def test_real_saved_success_callback_age_is_preserved_with_one_current_consistent_sample():
     h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False,
         account=REAL_NATIVE_LOGIN["raw_account_id"])
     try:
@@ -164,27 +164,167 @@ def test_real_saved_success_callback_stays_stale_after_cached_query_and_blocks_w
         h.server.trade_login.query = mock.Mock(return_value=[dict(m_strAccountID=REAL_NATIVE_LOGIN["raw_account_id"],
             m_strStatus=REAL_NATIVE_LOGIN["raw_status"])])
         state = h.call("get_trade_login_state")["data"]
-        assert state["status"] == "UNKNOWN" and state["reason"] == "TRADE_LOGIN_CALLBACK_STALE"
+        assert state["status"] == "LOGGED_IN" and state["login_evidence_version"] == 2
+        assert state["age_seconds"] >= REAL_NATIVE_LOGIN["age_seconds"]
+        assert state["state_event_age_seconds"] == state["age_seconds"]
+        assert state["fresh"] is True and 0 <= state["sample_age_seconds"] <= 15
         assert state["event_observed_at_utc"] == REAL_NATIVE_LOGIN["event_observed_at_utc"]
         assert state["query_diagnostic"]["proves_login"] is False and state["query_diagnostic"]["raw_status"] == "登录成功"
-        for method, params in (("submit_order", PROTOCOL.ORDER), ("cancel_order", {"order_sys_id": "REAL-SYSID"})):
-            assert h.call(method, params)["data"]["status"] == "BLOCKED"
+        h.server.trade_login.query.assert_called_once_with(REAL_NATIVE_LOGIN["raw_account_id"], "STOCK", "ACCOUNT")
         assert h.namespace["passorder"].call_count == 0 and h.namespace["cancel"].call_count == 0
     finally:
         h.close()
 
 
-def test_generated_login_staleness_and_new_session_clear_evidence():
+def test_generated_negative_event_does_not_age_into_success_and_new_session_clears_evidence():
     h = NATIVE.Fixture()
     try:
         h.namespace["account_callback"](h.context, {"m_strAccountID": NATIVE.ACCOUNT, "m_strStatus": "准备登录"})
         h.server.trade_login.event["observed_monotonic"] -= 16
         state = h.server.trade_login.readback()
-        assert state["status"] == "UNKNOWN" and state["reason"] == "TRADE_LOGIN_CALLBACK_STALE" and state["fresh"] is False
+        assert state["status"] == "NOT_LOGGED_IN" and state["reason"] == "TRADE_LOGIN_PREPARING_LOGIN"
         h.server.trade_login.bind_identity("new-session", 888)
         state = h.server.trade_login.readback()
         assert state["status"] == "UNKNOWN" and state["event_observed_at_utc"] is None
         assert state["session_id"] == "new-session" and state["native_pid"] == 888
+    finally:
+        h.close()
+
+
+def test_generated_v2_old_state_event_with_fresh_sample_permits_only_exact_session_order():
+    def submitted(*args):
+        h.orders.append(NATIVE._native_order_row())
+
+    h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False, submit=submitted)
+    try:
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功"))
+        event = h.server.trade_login.event
+        event["observed_monotonic"] -= 120
+        original_at = event["observed_at_utc"]
+        state = h.call("get_trade_login_state")["data"]
+        assert state["status"] == "LOGGED_IN" and state["age_seconds"] >= 120
+        assert state["event_observed_at_utc"] == original_at
+        assert state["freshness_basis"] == "native_callback_state_with_current_account_sample"
+        result = h.call("submit_order", NATIVE._native_limit_params())["data"]
+        assert result["status"] == "CONFIRMED" and result["order_sys_id"] == "7620"
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="准备登录"))
+        blocked = h.call("cancel_order", dict(order_sys_id="7620", user_order_id="native-short"))["data"]
+        assert blocked["status"] == "BLOCKED" and h.namespace["cancel"].call_count == 0
+    finally:
+        h.close()
+
+
+@pytest.mark.parametrize("rows", [[], None, [dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功")] * 2,
+    [dict(m_strAccountID="OTHER", m_strStatus="登录成功")], [dict(m_strAccountID=NATIVE.ACCOUNT)],
+    [dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="准备登录")],
+    [dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="LOGGED_OUT")],
+    [dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="UNKNOWN")]])
+def test_generated_v2_negative_missing_or_conflicting_sample_blocks_both_native_writes(rows):
+    h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False)
+    try:
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功"))
+        h.server.trade_login.query = mock.Mock(return_value=rows)
+        for method, params in (("submit_order", PROTOCOL.ORDER), ("cancel_order", {"order_sys_id": "REAL-SYSID"})):
+            result = h.call(method, params)["data"]
+            assert result["status"] == "BLOCKED" and result["native_write_executed"] is False
+        assert h.namespace["passorder"].call_count == h.namespace["cancel"].call_count == 0
+    finally:
+        h.close()
+
+
+def test_generated_v2_query_error_is_redacted_and_fresh_cache_alone_never_proves_login():
+    h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False)
+    try:
+        state = h.call("get_trade_login_state")["data"]
+        assert state["status"] == "UNKNOWN" and state["query_diagnostic"]["raw_status"] == "登录成功"
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功"))
+        h.server.trade_login.query = mock.Mock(side_effect=RuntimeError("password=private"))
+        state = h.call("get_trade_login_state")["data"]
+        assert state["status"] == "UNKNOWN" and state["reason"] == "TRADE_LOGIN_ACCOUNT_SAMPLE_FAILED"
+        assert state["query_diagnostic"]["exception_type"] == "RuntimeError"
+        assert "private" not in str(state)
+        assert h.call("submit_order", PROTOCOL.ORDER)["data"]["status"] == "BLOCKED"
+        assert h.namespace["passorder"].call_count == 0
+    finally:
+        h.close()
+
+
+@pytest.mark.parametrize("change", [dict(login_evidence_version=3), dict(login_evidence_version=True),
+    dict(freshness_basis="cache_only"), dict(state_event_age_seconds=0), dict(sample_age_seconds=15.001),
+    dict(sample_age_seconds=float("nan")), dict(sample_age_seconds=-1), dict(sample_observed_at_utc=None),
+    dict(sample_observed_at_utc="not-a-date"), dict(event_observed_at_utc="not-a-date"),
+    dict(raw_account_id="OTHER"), dict(raw_status="UNKNOWN"), dict(query_diagnostic={})])
+def test_bridge_rejects_malformed_v2_proof_with_zero_native_writes(change):
+    h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False)
+    try:
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功"))
+        h.server.trade_login.event["observed_monotonic"] -= 120
+        state = h.server.trade_login.readback()
+        h.server.bridge.trade_login_reader = lambda: dict(state, **change)
+        assert h.call("submit_order", PROTOCOL.ORDER)["data"]["status"] == "BLOCKED"
+        assert h.namespace["passorder"].call_count == 0
+    finally:
+        h.close()
+
+
+def test_generated_stop_clears_positive_callback_evidence():
+    h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False)
+    try:
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功"))
+        assert h.server.trade_login.readback()["status"] == "LOGGED_IN"
+        h.namespace["stop"](h.context)
+        assert h.server.trade_login.event is None
+        assert h.server.trade_login.readback()["status"] == "UNKNOWN"
+    finally:
+        h.client.close()
+
+
+def test_generated_v2_slow_account_sample_is_stale_and_cannot_authorize():
+    h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False)
+    try:
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功"))
+        start = h.server.trade_login.event["observed_monotonic"] + 100
+        with mock.patch.object(h.namespace["time"], "monotonic", side_effect=[start, start + 16, start + 16]):
+            state = h.server.trade_login.readback()
+        assert state["fresh"] is False and state["status"] == "UNKNOWN"
+        assert state["reason"] == "TRADE_LOGIN_ACCOUNT_SAMPLE_STALE"
+        h.server.bridge.trade_login_reader = lambda: state
+        assert h.call("submit_order", PROTOCOL.ORDER)["data"]["status"] == "BLOCKED"
+        assert h.namespace["passorder"].call_count == 0
+    finally:
+        h.close()
+
+
+def test_bridge_cannot_reuse_old_sample_by_freezing_its_reported_age_at_zero():
+    h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False)
+    try:
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功"))
+        state = h.server.trade_login.readback()
+        state["sample_observed_at_utc"] = "2001-01-01T00:00:00Z"
+        state["query_diagnostic"]["query_observed_at_utc"] = state["sample_observed_at_utc"]
+        state["sample_age_seconds"] = 0
+        h.server.bridge.trade_login_reader = lambda: state
+        assert h.call("submit_order", PROTOCOL.ORDER)["data"]["status"] == "BLOCKED"
+        assert h.namespace["passorder"].call_count == 0
+    finally:
+        h.close()
+
+
+def test_native_sample_cannot_rebind_new_event_into_previous_session_response():
+    h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False)
+    try:
+        state = h.server.trade_login
+
+        def changed_during_query(*args):
+            state.bind_identity("new-session", 888)
+            state.record_account_callback(dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功"))
+            return [dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功")]
+
+        state.query = changed_during_query
+        result = h.call("submit_order", PROTOCOL.ORDER)["data"]
+        assert result["status"] == "BLOCKED"
+        assert result["error"] == "TRADE_LOGIN_SESSION_CHANGED"
+        assert h.namespace["passorder"].call_count == 0
     finally:
         h.close()
 

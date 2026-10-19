@@ -129,7 +129,7 @@ class Fixture:
             return [types.SimpleNamespace(m_strInstrumentID="000001", m_strExchangeID="SZ", m_nVolume=100,
                 m_nCanUseVolume=100, m_dOpenPrice=10.0, m_dMarketValue=1147.0, m_dLastPrice=11.47)]
         if kind == "ACCOUNT":
-            return [types.SimpleNamespace(m_strAccountID=ACCOUNT, m_dAvailable=1000.0, m_dBalance=2147.0,
+            return [types.SimpleNamespace(m_strAccountID=ACCOUNT, m_strStatus="登录成功", m_dAvailable=1000.0, m_dBalance=2147.0,
                 m_dFrozenCash=0.0, m_dInstrumentValue=1147.0)]
         return []
 

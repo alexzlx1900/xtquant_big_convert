@@ -3,6 +3,7 @@
 
 import datetime
 import json
+import math
 import threading
 import time
 from collections import deque
@@ -161,11 +162,48 @@ class ShmRpcBridge:
                     self.account_id, self.mailbox.session_id, self.mailbox.server_pid):
                 unknown["reason"] = "TRADE_LOGIN_IDENTITY_MISMATCH"
                 return unknown
-            if value.get("status") == "LOGGED_IN" and (value.get("fresh") is not True
-                    or value.get("positive_contract_verified") is not True
-                    or type(value.get("age_seconds")) not in (int, float)
-                    or not 0 <= value["age_seconds"] <= 15 or not value.get("event_observed_at_utc")
-                    or value.get("source") != "native_account_callback"):
+            valid = (value.get("fresh") is True and value.get("positive_contract_verified") is True
+                     and type(value.get("age_seconds")) in (int, float) and math.isfinite(value["age_seconds"])
+                     and value["age_seconds"] >= 0 and value.get("event_observed_at_utc")
+                     and value.get("source") == "native_account_callback")
+            if "login_evidence_version" in value:
+                diagnostic = value.get("query_diagnostic")
+                valid = (valid and type(value["login_evidence_version"]) is int and value["login_evidence_version"] == 2
+                    and value.get("freshness_basis") == "native_callback_state_with_current_account_sample"
+                    and type(value.get("state_event_age_seconds")) in (int, float)
+                    and value["state_event_age_seconds"] == value["age_seconds"]
+                    and type(value.get("sample_age_seconds")) in (int, float)
+                    and math.isfinite(value["sample_age_seconds"]) and 0 <= value["sample_age_seconds"] <= 15
+                    and isinstance(value.get("sample_observed_at_utc"), str) and bool(value["sample_observed_at_utc"])
+                    and value.get("raw_account_id") == self.account_id and value.get("raw_status") == "\u767b\u5f55\u6210\u529f"
+                    and isinstance(diagnostic, dict) and diagnostic.get("proves_login") is False
+                    and diagnostic.get("source") == "native_query_ACCOUNT_cache"
+                    and diagnostic.get("query_observed_at_utc") == value["sample_observed_at_utc"]
+                    and diagnostic.get("raw_account_id") == self.account_id
+                    and diagnostic.get("raw_status") == value["raw_status"] and not diagnostic.get("error"))
+                if valid:
+                    # v2由本次原生采样产生；拒绝伪造日期或冻结旧sample_age的旧采样。
+                    for field in ("event_observed_at_utc", "sample_observed_at_utc"):
+                        stamp = value[field]
+                        if not isinstance(stamp, str) or not stamp.endswith("Z"):
+                            valid = False
+                            break
+                        parsed = None
+                        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+                            try:
+                                parsed = datetime.datetime.strptime(stamp, fmt)
+                                break
+                            except ValueError:
+                                pass
+                        if parsed is None:
+                            valid = False
+                            break
+                        if field == "sample_observed_at_utc":
+                            wall_age = (datetime.datetime.utcnow() - parsed).total_seconds()
+                            valid = -1 <= wall_age <= 15 and abs(wall_age - value["sample_age_seconds"]) <= 1
+            else:
+                valid = valid and value["age_seconds"] <= 15
+            if value.get("status") == "LOGGED_IN" and not valid:
                 unknown.update(source=value.get("source"), raw_status=value.get("raw_status"),
                                reason="TRADE_LOGIN_POSITIVE_EVIDENCE_UNVERIFIED_OR_STALE")
                 return unknown

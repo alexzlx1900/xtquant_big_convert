@@ -102,7 +102,8 @@ class Fixture:
         self.query_calls.append((account, account_type, detail_type, strategy_name))
         assert account == self.account and account_type == "STOCK"
         if detail_type == "ACCOUNT":
-            return [SimpleNamespace(m_strAccountID=self.account, m_dAvailable=1000.0, m_dBalance=3000.0,
+            # 当前账户状态正向fixture仍须独立真实callback，不能单凭该缓存授权。
+            return [SimpleNamespace(m_strAccountID=self.account, m_strStatus="登录成功", m_dAvailable=1000.0, m_dBalance=3000.0,
                                     m_dFrozenCash=0.0, m_dInstrumentValue=2000.0)]
         if detail_type == "POSITION":
             return [SimpleNamespace(m_strInstrumentID="000001", m_strExchangeID="SZ", m_nVolume=100,
