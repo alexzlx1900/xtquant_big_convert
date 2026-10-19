@@ -426,6 +426,7 @@ class ShmReadOnlyBridge:
             if not required <= set(result["columns"]) or period != "tick" and set(result["columns"]) != required:
                 raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history is missing required price/volume/amount fields")
             previous_tag = ""
+            unavailable_last_price_count = 0
             for tag, row in zip(result["index"], result["rows"]):
                 text = self._history_timestamp(tag, period)
                 compact = text.split(".", 1)[0]
@@ -440,10 +441,16 @@ class ShmReadOnlyBridge:
                     value = record[field]
                     if (isinstance(value, bool) or not isinstance(value, (int, float))
                             or not math.isfinite(value) or value < 0
-                            or field in ("open", "high", "low", "close", "lastPrice") and value == 0):
+                            or field in ("open", "high", "low", "close", "lastPrice") and value == 0
+                            and not (period == "tick" and field == "lastPrice"
+                                     and record.get("volume") == 0 and record.get("amount") == 0)):
                         raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history has unavailable or invalid numeric fields")
+                if period == "tick" and record["lastPrice"] == 0:
+                    unavailable_last_price_count += 1
                 if period == "tick" and "time" in record and (type(record["time"]) is not int or record["time"] <= 0):
                     raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native tick time is invalid")
+            if unavailable_last_price_count:
+                result["source_evidence"]["unavailable_last_price_count"] = unavailable_last_price_count
         if len(json.dumps(result, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")) > HISTORY_PAYLOAD_LIMIT_BYTES:
             raise ReadOnlyRequestError("HISTORY_PAYLOAD_TOO_LARGE", "native history exceeds bounded 8MiB response; request a smaller explicit window/count, no rows were truncated")
         return result

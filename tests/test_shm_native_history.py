@@ -183,6 +183,38 @@ class NativeHistoryTests(FIXTURE.BridgeFixture):
         with pytest.raises(legacy.ShmProtocolError, match="invalid response payload length"):
             self.roundtrip(client, "get_market_data_ex", params=params("tick", count=10000))
 
+    def test_pretrade_zero_price_keeps_native_quote_and_reports_unavailable_count(self):
+        fields = ["time", "lastPrice", "volume", "amount", "askPrice"]
+        native_rows = [[1792372500000, 0, 0, 0, [11.42, 0, 0, 0, 0]],
+                       [1792373400000, 11.48, 5404, 6202490, [11.48, 11.49, 11.5, 11.51, 11.52]]]
+        self.context.get_market_data_ex.return_value = {"000001.SZ": SimpleNamespace(
+            index=["20261019091500000", "20261019093000000"], columns=fields,
+            shape=(2, len(fields)), values=SimpleNamespace(tolist=lambda: native_rows))}
+        result = self.process("get_market_data_ex", params=params("tick", count=2,
+            start_time="20261019000000", end_time="20261019235959"))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["data"]["rows"], native_rows)
+        self.assertEqual(result["data"]["source_evidence"]["row_count"], 2)
+        self.assertEqual(result["data"]["source_evidence"]["unavailable_last_price_count"], 1)
+
+    def test_tick_missing_trade_price_does_not_accept_other_bad_numeric_fields(self):
+        for price, volume, amount in [(0, 1, 0), (0, 0, 1), (-1, 0, 0),
+                                      (None, 0, 0), (float("nan"), 0, 0),
+                                      (False, 0, 0), (0, False, 0), (0, 0, -1)]:
+            with self.subTest(price=price, volume=volume, amount=amount):
+                self.context.get_market_data_ex.return_value = {"000001.SZ": SimpleNamespace(
+                    index=["20260904091500000"], columns=["lastPrice", "volume", "amount"],
+                    shape=(1, 3), values=SimpleNamespace(tolist=lambda: [[price, volume, amount]]))}
+                result = self.process("get_market_data_ex", params=params("tick"))
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["server_error"], "HISTORY_SHAPE_INVALID")
+
+    def test_bar_zero_price_is_still_rejected(self):
+        data = frame()
+        data.values = SimpleNamespace(tolist=lambda: [[11.9, 12, 11.8, 0, 0, 0]])
+        self.context.get_market_data_ex.return_value = {"000001.SZ": data}
+        self.assertEqual(self.process("get_market_data_ex", params=params())["server_error"], "HISTORY_SHAPE_INVALID")
+
 
 @pytest.mark.parametrize("overrides", [
     {"subscribe": True}, {"fill_data": "true"}, {"count": 10001}, {"count": True},
