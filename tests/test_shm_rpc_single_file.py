@@ -27,7 +27,7 @@ ACCOUNT = "SIM_BOOTSTRAP"
 
 class State:
     def __init__(self):
-        self.data, self.lock, self.regions = bytearray(270400), threading.Lock(), []
+        self.data, self.lock, self.regions = bytearray(64 + 8192 + 8 * 1024 * 1024), threading.Lock(), []
 
 
 class Region:
@@ -469,6 +469,45 @@ def test_generated_native_gateway_uses_existing_signature_real_contract_and_empt
     h.close()
 
 
+def test_generated_native_gateway_contract_1258_float_price_replay():
+    # 2026-10-19真实回读字段；仅重放fixture，不调用QMT或外部交易接口。
+    remark = "CO-f3941c6e25c14a23a5ae66f176f3600a"
+
+    def native_submit(*args):
+        row = _native_order_row(account="55013746", contract="1258")
+        row.m_strRemark, row.m_dLimitPrice = remark, 11.120000000000001
+        row.m_strInsertDate, row.m_strInsertTime = "20261019", "104410"
+        h.orders.append(row)
+        return None
+
+    h = Fixture(native_gateway=True, submit=native_submit, account="55013746")
+    try:
+        result = h.call("submit_order", dict(_native_limit_params(), price=11.12, remark=remark))["data"]
+        assert result["status"] == "CONFIRMED" and result["order_sys_id"] == "1258"
+        assert result["automatic_retry"] is False
+        assert h.query_calls[-1] == ("55013746", "STOCK", "ORDER", "")
+    finally:
+        h.close()
+
+
+@pytest.mark.parametrize("native_price", [11.13, 11.12001, 11.12000002, float("nan"), float("inf"), -float("inf")])
+def test_generated_native_gateway_price_identity_still_rejects_real_difference_or_nonfinite(native_price):
+    h = Fixture(native_gateway=True)
+    try:
+        gateway = h.server.bridge.handlers.order_gateway
+        request = h.namespace["_load_embedded"]("bigqmt_signal_trader.models").OrderRequest(
+            signal_id="fixture", account_id=ACCOUNT, action="BUY", stock_code="000001.SZ",
+            volume=100, price=11.12, price_type="LIMIT", strategy_name="local-test", remark="native-short")
+        gateway._submitted[request.remark] = request
+        row = _native_order_row()
+        row.m_dLimitPrice = native_price
+        h.orders.append(row)
+        with pytest.raises((ValueError, RuntimeError)):
+            gateway.query_orders(ACCOUNT, "")
+    finally:
+        h.close()
+
+
 def test_generated_native_gateway_unknown_submit_never_repeats_attempt_for_same_remark():
     submit = mock.Mock(side_effect=RuntimeError("native outcome unknown"))
     h = Fixture(native_gateway=True, submit=submit)
@@ -503,6 +542,142 @@ def test_generated_native_gateway_cancel_requires_unique_remark_remaining_volume
     assert first["automatic_retry"] is False and "attempt already consumed" in second["error"]
     cancel.assert_called_once_with("7620", ACCOUNT, "STOCK", h.context)
     h.close()
+
+
+@pytest.mark.parametrize("status,traded", [(54, 0), (53, 40)])
+def test_generated_native_cancel_confirms_only_fresh_exact_cancelled_contract(status, traded):
+    def native_cancel(*args):
+        h.orders[0].m_nOrderStatus, h.orders[0].m_nVolumeTraded = status, traded
+        return False  # A native synchronous return never proves the final outcome.
+
+    h = Fixture(native_gateway=True, cancel=native_cancel)
+    try:
+        h.orders.append(_native_order_row())
+        params = dict(order_sys_id="7620", user_order_id="native-short")
+        result = h.call("cancel_order", params, request_id="cancel-terminal")['data']
+        assert result["status"] == "CONFIRMED" and result["order_sys_id"] == "7620"
+        assert result["automatic_retry"] is False and not result["error"]
+        evidence = result["result"]
+        assert evidence["cancellation_confirmed"] is True and evidence["order_terminal"] is True
+        assert evidence["confirmation_source"] == "native_query_orders_strict"
+        assert evidence["native_order_status"] == str(status) and evidence["traded_volume"] == traded
+        assert h.call("cancel_order", params, request_id="cancel-terminal")["data"] == result
+        assert h.call("cancel_order", params, request_id="cancel-again")["data"]["status"] == "UNKNOWN"
+    finally:
+        h.close()
+
+
+def test_generated_native_cancel_queries_later_callbacks_without_repeating_native_cancel():
+    cancel = mock.Mock(return_value=True)
+    h = Fixture(native_gateway=True, cancel=cancel)
+    try:
+        h.orders.append(_native_order_row())
+        gateway = h.server.bridge.handlers.order_gateway
+        original, calls = gateway.query_cancel_confirmation, []
+
+        def delayed_confirmation(result):
+            calls.append(True)
+            if len(calls) == 3:
+                h.orders[0].m_nOrderStatus = 54
+            return original(result)
+
+        gateway.query_cancel_confirmation = delayed_confirmation
+        result = h.call("cancel_order", dict(order_sys_id="7620", user_order_id="native-short"))["data"]
+        assert result["status"] == "CONFIRMED" and len(calls) == 3
+        assert cancel.call_count == 1
+    finally:
+        h.close()
+
+
+def test_generated_native_cancel_true_return_without_terminal_query_stays_unknown():
+    cancel = mock.Mock(return_value=True)
+    h = Fixture(native_gateway=True, cancel=cancel)
+    try:
+        h.server.bridge.handlers.order_settle_timeout_seconds = 0.005
+        h.orders.append(_native_order_row())
+        result = h.call("cancel_order", dict(order_sys_id="7620", user_order_id="native-short"))["data"]
+        assert result["status"] == "UNKNOWN" and result["result"]["cancellation_confirmed"] is False
+        assert result["error"] == "CANCEL_CONFIRMATION_DEADLINE; outcome=UNKNOWN"
+        assert cancel.call_count == 1
+    finally:
+        h.close()
+
+
+@pytest.mark.parametrize("status,traded", [(56, 100), (57, 0)])
+def test_generated_native_cancel_does_not_confuse_other_order_terminal_with_cancellation(status, traded):
+    def native_cancel(*args):
+        h.orders[0].m_nOrderStatus, h.orders[0].m_nVolumeTraded = status, traded
+        return True
+
+    h = Fixture(native_gateway=True, cancel=native_cancel)
+    try:
+        h.orders.append(_native_order_row())
+        result = h.call("cancel_order", dict(order_sys_id="7620", user_order_id="native-short"))["data"]
+        assert result["status"] == "UNKNOWN" and result["result"]["cancellation_confirmed"] is False
+        assert result["result"]["order_terminal"] is True
+        assert result["error"] == "CANCELLATION_NOT_CONFIRMED_ORDER_ALREADY_TERMINAL"
+    finally:
+        h.close()
+
+
+@pytest.mark.parametrize("changes", [
+    {"m_strRemark": "foreign"}, {"m_strInstrumentID": "000002"}, {"m_nOffsetFlag": 49, "m_nOpType": 24},
+    {"m_nVolumeTotalOriginal": 200}, {"m_dLimitPrice": 11.43},
+    {"m_nOrderStatus": 54, "m_nVolumeTraded": 20}, {"m_nOrderStatus": 53, "m_nVolumeTraded": 0},
+    {"m_strAccountID": "OTHER"},
+])
+def test_generated_native_cancel_rejects_changed_identity_or_terminal_quantities(changes):
+    def native_cancel(*args):
+        h.orders[0].m_nOrderStatus = 54
+        for key, value in changes.items():
+            setattr(h.orders[0], key, value)
+        return True
+
+    h = Fixture(native_gateway=True, cancel=native_cancel)
+    try:
+        h.server.bridge.handlers.order_settle_timeout_seconds = 0.005
+        h.orders.append(_native_order_row())
+        result = h.call("cancel_order", dict(order_sys_id="7620", user_order_id="native-short"))["data"]
+        assert result["status"] == "UNKNOWN" and result["result"]["cancellation_confirmed"] is False
+        assert result["error"].startswith("CANCEL_CONFIRMATION_LOOKUP_FAILED:")
+    finally:
+        h.close()
+
+
+def test_generated_cancel_lookup_failure_is_explicit_redacted_and_not_retried_as_a_write():
+    def native_cancel(*args):
+        h.server.bridge.handlers.order_gateway.query_orders = mock.Mock(
+            side_effect=RuntimeError("redis://operator:secret@host token=private"))
+        return True
+
+    cancel = mock.Mock(side_effect=native_cancel)
+    h = Fixture(native_gateway=True, cancel=cancel)
+    try:
+        h.server.bridge.handlers.order_settle_timeout_seconds = 0.005
+        h.orders.append(_native_order_row())
+        result = h.call("cancel_order", dict(order_sys_id="7620", user_order_id="native-short"))["data"]
+        assert result["status"] == "UNKNOWN" and result["automatic_retry"] is False
+        assert result["error"] == "CANCEL_CONFIRMATION_LOOKUP_FAILED:RuntimeError; outcome=UNKNOWN"
+        assert "secret" not in json.dumps(result) and "private" not in json.dumps(result)
+        assert cancel.call_count == 1
+    finally:
+        h.close()
+
+
+def test_generated_native_cancel_rejects_traded_volume_regression():
+    def native_cancel(*args):
+        h.orders[0].m_nOrderStatus, h.orders[0].m_nVolumeTraded = 53, 10
+        return True
+
+    h = Fixture(native_gateway=True, cancel=native_cancel)
+    try:
+        h.server.bridge.handlers.order_settle_timeout_seconds = 0.005
+        h.orders.append(_native_order_row(status=55, traded=20))
+        result = h.call("cancel_order", dict(order_sys_id="7620", user_order_id="native-short"))["data"]
+        assert result["status"] == "UNKNOWN" and result["result"]["cancellation_confirmed"] is False
+        assert result["error"].startswith("CANCEL_CONFIRMATION_LOOKUP_FAILED:")
+    finally:
+        h.close()
 
 
 @pytest.mark.parametrize("changes", [{"order_type": 27}, {"price_type": "LATEST_PRICE"},

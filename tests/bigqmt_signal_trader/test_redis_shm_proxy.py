@@ -2,6 +2,7 @@
 """只测外置兼容合同；使用内存 Redis/SHM，不连接真实服务或 QMT。"""
 
 import copy
+import datetime
 import json
 import os
 import sys
@@ -25,6 +26,25 @@ from bigqmt_signal_trader.transports.redis_transport import RedisTransport
 
 
 ACCOUNT = "55013746"
+
+
+def complete_execution_snapshot(value, session_id="execution-sid", native_pid=2852, windows_session_id=1):
+    result = copy.deepcopy(value)
+    stamp = datetime.datetime.fromtimestamp(time.time(), datetime.timezone.utc).isoformat()
+    for name, kind, rows in (("orders_source_evidence", "ORDER", result["orders"]),
+                              ("trades_source_evidence", "DEAL", result["trades"])):
+        result[name] = dict(contract_version=1, account_id=ACCOUNT, account_type="STOCK", detail_type=kind,
+                           source="native_get_trade_detail_data", strategy_name="", queried_at=stamp,
+                           complete=True, status="OK" if rows else "EMPTY", error_code=None,
+                           raw_row_count=len(rows), converted_row_count=len(rows), returned_row_count=len(rows),
+                           skipped_row_count=0, duplicate_row_count=0, unknown_fields=[], row_errors=[])
+    result["source_evidence"] = dict(contract_version=1, account_id=ACCOUNT, complete=True, status="OK",
+                                    source="native_ORDER_DEAL_queries", queried_at=stamp, error_code="",
+                                    raw_row_count=len(result["orders"]) + len(result["trades"]),
+                                    returned_row_count=len(result["orders"]) + len(result["trades"]))
+    for key in ("orders_source_evidence", "trades_source_evidence", "source_evidence"):
+        result[key].update(session_id=session_id, native_pid=native_pid, windows_session_id=windows_session_id)
+    return result
 
 
 class FakePubSub:
@@ -1130,6 +1150,320 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["source_binding"], expected)
         self.assertEqual(proxy.get_cached_response("request-1"), response)
+
+    def _unknown_reconciliation(self, *, method="submit_order", rid="reconcile-rid", redis=None):
+        proxy, redis, _, execution = self.make_proxy(redis=redis, policy="PERSISTENT_SIMULATION_READ_WRITE")
+        identity = dict(user_order_id="CO-original", stock_code="000001.SZ", action="BUY", volume=100, price=11.12)
+        params = (dict(stock_code="000001.SZ", action="BUY", volume=100, price=11.12, remark="CO-original")
+                  if method == "submit_order" else dict(order_sys_id="1258", user_order_id="CO-original"))
+        original = request(method, rid=rid, params=params)
+        execution.result = dict(status="UNKNOWN", automatic_retry=False)
+        proxy.process_request(original)
+        order = dict(identity, order_sys_id="1258", traded_volume=0, status="54", order_time=int(time.time()))
+        order["price"] = 11.120000000000001
+        execution.result = complete_execution_snapshot(dict(account_id=ACCOUNT, orders=[order], trades=[]))
+        return proxy, redis, execution, original, identity
+
+    def test_reconciliation_preview_is_read_only_exact_and_retains_unknown(self):
+        proxy, redis, execution, original, identity = self._unknown_reconciliation()
+        before = copy.deepcopy(redis.hashes)
+        operations = len(redis.operations)
+        preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+        self.assertEqual(preview["status"], "RECONCILIATION_PREVIEW")
+        self.assertTrue(preview["proof"]["terminal_verified"])
+        self.assertFalse(preview["oms_terminal_proven"])
+        self.assertEqual(preview["proof"]["request_result"], "BROKER_ORDER_FOUND")
+        self.assertEqual(redis.hashes, before)
+        self.assertFalse(any(op[0] in ("eval", "publish", "setex", "rpush", "expire")
+                             for op in redis.operations[operations:]))
+        self.assertEqual(execution.calls[-1][0]["method"], "query_execution_snapshot")
+        self.assertEqual(execution.calls[-1][0]["params"]["order_strategy_name"], "")
+        self.assertFalse(proxy.identity_snapshot()["write_ready"])
+
+    def test_exact_unknown_apply_preserves_original_result_and_never_replays_native_write(self):
+        proxy, redis, execution, original, identity = self._unknown_reconciliation()
+        preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+        result = proxy.reconcile_unknown_write(original["request_id"], "1258", identity,
+                    expected_record=preview["expected_record"], operator="human-confirmed", apply=True)
+        self.assertEqual(result["ledger_records_written"], 1)
+        record = json.loads(next(iter(redis.hashes.values()))[original["request_id"]])
+        self.assertEqual(record["state"], "RECONCILED")
+        self.assertEqual(record["response"]["status"], "UNKNOWN")
+        self.assertEqual(record["reconciliation"]["original_result"], record["response"])
+        self.assertEqual(record["reconciled_response"]["status"], "RECONCILED")
+        self.assertTrue(proxy.identity_snapshot()["write_ready"])
+        count = len(execution.calls)
+        response = proxy.process_request(original)
+        self.assertEqual(response["status"], "RECONCILED")
+        self.assertEqual(len(execution.calls), count)
+        restarted, _, _, fresh = self.make_proxy(redis=redis, policy="PERSISTENT_SIMULATION_READ_WRITE")
+        self.assertTrue(restarted.identity_snapshot()["write_ready"])
+        self.assertEqual(restarted.process_request(original)["status"], "RECONCILED")
+        self.assertEqual(len(fresh.calls), 1)
+
+    def test_reconciliation_requires_preview_record_operator_and_no_competing_operation(self):
+        proxy, redis, execution, original, identity = self._unknown_reconciliation()
+        before = copy.deepcopy(redis.hashes)
+        for kwargs in ({"apply": True}, {"apply": True, "expected_record": "different", "operator": "human"},
+                       {"apply": True, "expected_record": "anything", "operator": ""}, {"apply": 1}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ShmProtocolError):
+                proxy.reconcile_unknown_write(original["request_id"], "1258", identity, **kwargs)
+        proxy._lock.acquire()
+        try:
+            with self.assertRaisesRegex(ShmProtocolError, "in-flight"):
+                proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+        finally:
+            proxy._lock.release()
+        self.assertEqual(before, redis.hashes)
+
+    def test_reconciliation_rejects_missing_duplicate_conflicting_or_live_native_order(self):
+        changes = [dict(orders=[]), dict(account_id="other"), dict(trades=[{}])]
+        for fields in ({"status": "50"}, {"status": "54", "traded_volume": 1},
+                       {"order_sys_id": "other"}, {"user_order_id": "other"},
+                       {"stock_code": "600000.SH"}, {"action": "SELL"}, {"volume": 200},
+                       {"volume": True}, {"price": 11.13}, {"price": float("nan")},
+                       {"account_id": "other"}):
+            changes.append(dict(order_change=fields))
+        changes.append(dict(duplicate=True))
+        for change in changes:
+            with self.subTest(change=change):
+                proxy, redis, execution, original, identity = self._unknown_reconciliation()
+                if "order_change" in change:
+                    execution.result["orders"][0].update(change["order_change"])
+                elif "duplicate" in change:
+                    execution.result["orders"] *= 2
+                else:
+                    execution.result.update(change)
+                before = copy.deepcopy(redis.hashes)
+                with self.assertRaises(ShmProtocolError):
+                    proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+                self.assertEqual(before, redis.hashes)
+
+    def test_reconciliation_terminal_fills_require_unique_complete_matching_deals(self):
+        for status, volume in (("53", 40), ("56", 100)):
+            proxy, _, execution, original, identity = self._unknown_reconciliation()
+            execution.result["orders"][0].update(status=status, traded_volume=volume)
+            execution.result["trades"] = [dict(identity, order_sys_id="1258", trade_id="deal-1", volume=volume,
+                                                traded_time=int(time.time()))]
+            execution.result = complete_execution_snapshot(execution.result)
+            preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+            self.assertEqual(preview["proof"]["filled_volume"], volume)
+            for change in ({"trades": []}, {"duplicate": True}, {"trade_change": {"volume": volume - 1}},
+                           {"trade_change": {"price": 11.13}}, {"trade_change": {"user_order_id": "other"}}):
+                original_snapshot = copy.deepcopy(execution.result)
+                if "trade_change" in change:
+                    execution.result["trades"][0].update(change["trade_change"])
+                elif "duplicate" in change:
+                    execution.result["trades"] *= 2
+                else:
+                    execution.result.update(change)
+                with self.subTest(status=status, change=change), self.assertRaises(ShmProtocolError):
+                    proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+                execution.result = original_snapshot
+
+    def test_reconciliation_does_not_clear_other_unknowns_or_operator_block(self):
+        for other_unknown, manual in ((True, False), (False, True), (True, True)):
+            proxy, redis, execution, original, identity = self._unknown_reconciliation()
+            ledger = next(iter(redis.hashes.values()))
+            if other_unknown:
+                other = json.loads(ledger[original["request_id"]])
+                other["request_id"] = "other-unknown"
+                ledger["other-unknown"] = json.dumps(other)
+            if manual:
+                proxy._block_writes("OPERATOR_WRITE_DISABLED")
+            preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+            proxy.reconcile_unknown_write(original["request_id"], "1258", identity,
+                    expected_record=preview["expected_record"], operator="human", apply=True)
+            self.assertFalse(proxy.identity_snapshot()["write_ready"])
+            if manual:
+                self.assertEqual(proxy.identity_snapshot()["write_block_reason"], "OPERATOR_WRITE_DISABLED")
+
+    def test_reconciliation_same_source_fingerprint_and_cas_change_are_hard_stops(self):
+        proxy, redis, execution, original, identity = self._unknown_reconciliation()
+        preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+        wrong_identity = dict(identity, price=11.13)
+        with self.assertRaisesRegex(ShmProtocolError, "original submit"):
+            proxy.reconcile_unknown_write(original["request_id"], "1258", wrong_identity)
+        prior_eval = redis.eval
+        def competing_settlement(script, key_count, key, rid, expected, encoded):
+            record = json.loads(redis.hashes[key][rid])
+            record["token"] = "concurrent-change"
+            redis.hashes[key][rid] = json.dumps(record)
+            return prior_eval(script, key_count, key, rid, expected, encoded)
+        redis.eval = competing_settlement
+        with self.assertRaisesRegex(ShmProtocolError, "CAS rejected"):
+            proxy.reconcile_unknown_write(original["request_id"], "1258", identity,
+                    expected_record=preview["expected_record"], operator="human", apply=True)
+        self.assertEqual(json.loads(next(iter(redis.hashes.values()))[original["request_id"]])["state"], "UNKNOWN")
+        self.assertFalse(proxy.identity_snapshot()["write_ready"])
+        redis.eval = prior_eval
+        proxy._sessions["execution"] = "new-sid"
+        with self.assertRaisesRegex(ShmProtocolError, "same verified sources"):
+            proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+
+    def test_cancel_reconciliation_separates_cancel_confirmation_from_other_terminal_outcomes(self):
+        for status, outcome in (("54", "CANCEL_CONFIRMED"), ("57", "ORDER_TERMINAL_CANCEL_NOT_PROVEN")):
+            proxy, _, execution, original, identity = self._unknown_reconciliation(method="cancel_order")
+            execution.result["orders"][0]["status"] = status
+            preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+            self.assertEqual(preview["proof"]["request_result"], outcome)
+
+    def test_cancel_reconciliation_accepts_original_order_before_cancel_claim_but_not_after(self):
+        with mock.patch("bigqmt_signal_trader.redis_shm_proxy.time.time", return_value=1792377500.5):
+            proxy, _, execution, original, identity = self._unknown_reconciliation(method="cancel_order")
+            execution.result["orders"][0]["order_time"] = int(time.time()) - 60
+            preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+            self.assertEqual(preview["proof"]["request_result"], "CANCEL_CONFIRMED")
+            execution.result["orders"][0]["order_time"] = time.time() + 2
+            with self.assertRaisesRegex(ShmProtocolError, "event time"):
+                proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+
+    def test_reconciliation_commit_reply_loss_is_unknown_never_retried_or_unblocked(self):
+        for commit_before_loss in (False, True):
+            proxy, redis, _, original, identity = self._unknown_reconciliation()
+            preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+            prior_eval = redis.eval
+            calls = []
+            def unknown_cas(*args):
+                calls.append(args)
+                if commit_before_loss:
+                    prior_eval(*args)
+                raise RuntimeError("reply lost")
+            redis.eval = unknown_cas
+            result = proxy.reconcile_unknown_write(original["request_id"], "1258", identity,
+                    expected_record=preview["expected_record"], operator="human", apply=True)
+            self.assertEqual(result["status"], "UNKNOWN")
+            self.assertIsNone(result["ledger_records_written"])
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(result["automatic_retry"])
+            self.assertFalse(proxy.identity_snapshot()["write_ready"])
+            state = json.loads(next(iter(redis.hashes.values()))[original["request_id"]])["state"]
+            self.assertEqual(state, "RECONCILED" if commit_before_loss else "UNKNOWN")
+
+    def test_reconciliation_requires_all_native_completeness_and_query_time_evidence(self):
+        changes = []
+        for key in ("source_evidence", "orders_source_evidence", "trades_source_evidence"):
+            changes.append((key, None))
+            for field, value in (("complete", False), ("account_id", "other"), ("status", "PARTIAL"),
+                                 ("raw_row_count", 123), ("returned_row_count", True),
+                                 ("source", "cached_fixture"), ("error_code", "BAD"),
+                                 ("session_id", "other"), ("native_pid", True), ("windows_session_id", 2),
+                                 ("queried_at", "2001-01-01T00:00:00+00:00")):
+                changes.append((key, {field: value}))
+        for key in ("orders_source_evidence", "trades_source_evidence"):
+            for field, value in (("strategy_name", "filtered"), ("account_type", "FUTURE"),
+                                 ("converted_row_count", 999), ("skipped_row_count", 1),
+                                 ("duplicate_row_count", 1), ("unknown_fields", ["time"]),
+                                 ("row_errors", ["dropped record"]), ("detail_type", "wrong")):
+                changes.append((key, {field: value}))
+        for key, change in changes:
+            with self.subTest(key=key, change=change):
+                proxy, redis, execution, original, identity = self._unknown_reconciliation()
+                if change is None:
+                    execution.result.pop(key)
+                else:
+                    execution.result[key].update(change)
+                before = copy.deepcopy(redis.hashes)
+                with self.assertRaises(ShmProtocolError):
+                    proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+                self.assertEqual(redis.hashes, before)
+
+    def test_reconciliation_rejects_old_missing_future_order_and_deal_event_times(self):
+        for when in (None, 0, True, time.time() - 86400, time.time() + 3600, time.time() - 6):
+            proxy, _, execution, original, identity = self._unknown_reconciliation()
+            execution.result["orders"][0]["order_time"] = when
+            with self.subTest(order_time=when), self.assertRaises(ShmProtocolError):
+                proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+        for when in (None, 0, True, time.time() - 86400, time.time() + 3600):
+            proxy, _, execution, original, identity = self._unknown_reconciliation()
+            execution.result["orders"][0].update(status="56", traded_volume=100)
+            execution.result["trades"] = [dict(identity, order_sys_id="1258", trade_id="deal-1", traded_time=when)]
+            execution.result = complete_execution_snapshot(execution.result)
+            with self.subTest(trade_time=when), self.assertRaises(ShmProtocolError):
+                proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+
+    def test_reconciliation_submit_broker_proxy_clock_tolerance_is_fixed_at_five_seconds(self):
+        with mock.patch("bigqmt_signal_trader.redis_shm_proxy.time.time", return_value=1792377500.0):
+            proxy, _, execution, original, identity = self._unknown_reconciliation()
+            execution.result["orders"][0]["order_time"] = time.time() - 5
+            proof = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)["proof"]
+            self.assertEqual(proof["broker_proxy_clock_offset_seconds"], -5)
+            self.assertEqual(proof["broker_proxy_clock_tolerance_seconds"], 5)
+            self.assertFalse(proof["clocks_assumed_identical"])
+            execution.result["orders"][0]["order_time"] = time.time() - 5.000001
+            with self.assertRaisesRegex(ShmProtocolError, "event time"):
+                proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+
+    def test_reconciliation_real_1258_saved_source_shape_and_two_clock_offset(self):
+        claimed_at, started_at, observed_at = 1792377853.0497353, 1792379479.3395543, 1792379481.008594
+        identity = dict(user_order_id="CO-saved-fixture-1258", stock_code="000001.SZ",
+                        action="BUY", volume=100, price=11.12)
+        binding = dict(read_session_id="1" * 32,
+                       execution_session_id="2" * 32, native_pid=777, windows_session_id=1)
+        params = dict(stock_code="000001.SZ", action="BUY", volume=100, price=11.12, price_type=11,
+                      strategy_name="alex_quant_platform", remark=identity["user_order_id"])
+        with mock.patch("bigqmt_signal_trader.redis_shm_proxy.time.time", return_value=observed_at):
+            snapshot = complete_execution_snapshot(dict(account_id=ACCOUNT, orders=[dict(identity,
+                order_sys_id="1258", traded_volume=0, status="54", price=11.120000000000001,
+                order_time=1792377850, price_type=50, op_type=23, order_type=23)], trades=[]),
+                session_id=binding["execution_session_id"], native_pid=777)
+        snapshot["orders_source_evidence"]["queried_at"] = "2026-10-19T03:11:20.949641+00:00"
+        snapshot["trades_source_evidence"]["queried_at"] = "2026-10-19T03:11:20.956641+00:00"
+        snapshot["source_evidence"]["queried_at"] = snapshot["trades_source_evidence"]["queried_at"]
+        before = copy.deepcopy(snapshot)
+        proxy = object.__new__(RedisShmReadOnlyProxy)
+        proxy.account_id = ACCOUNT
+        proof = proxy._validate_reconciliation_snapshot("submit_order", params, "1258", identity,
+                                                        snapshot, claimed_at, started_at, observed_at, binding)
+        self.assertEqual(proof["business_terminal_status"], "54")
+        self.assertEqual(proof["filled_volume"], 0)
+        self.assertAlmostEqual(proof["broker_proxy_clock_offset_seconds"], -3.0497353, places=6)
+        self.assertEqual(snapshot, before)
+
+    def test_reconciliation_restart_revalidates_saved_facts_original_result_and_replay(self):
+        proxy, redis, _, original, identity = self._unknown_reconciliation()
+        preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+        proxy.reconcile_unknown_write(original["request_id"], "1258", identity,
+                expected_record=preview["expected_record"], operator="human", apply=True)
+        ledger = next(iter(redis.hashes.values()))
+        complete = json.loads(ledger[original["request_id"]])
+        mutations = [
+            lambda r: r.update(reconciliation={"original_state": "UNKNOWN", "terminal_verified": True}, reconciled_response={}),
+            lambda r: r["reconciliation"].pop("snapshot"),
+            lambda r: r["reconciliation"].pop("operator"),
+            lambda r: r.pop("token"),
+            lambda r: r.update(automatic_retry=True),
+            lambda r: r["reconciliation"]["original_result"].update(status="CONFIRMED"),
+            lambda r: r["reconciliation"].update(filled_volume=100),
+            lambda r: r["reconciliation"]["order_identity"].update(price=11.13),
+            lambda r: r["reconciliation"]["source_binding"].update(native_pid=999),
+            lambda r: r["reconciliation"]["snapshot"]["orders_source_evidence"].update(complete=False),
+            lambda r: r["reconciliation"]["snapshot"]["orders"][0].update(order_time=0),
+            lambda r: r["reconciled_response"]["data"].update(order_sys_id="other"),
+            lambda r: r["reconciled_response"].update(request_id="other"),
+            lambda r: r["reconciled_response"].update(session_id="other"),
+            lambda r: r["reconciled_response"].update(automatic_retry=True),
+        ]
+        for mutation in mutations:
+            bad = copy.deepcopy(complete)
+            mutation(bad)
+            ledger[original["request_id"]] = json.dumps(bad)
+            with self.subTest(mutation=mutation), self.assertRaises(ShmProtocolError):
+                self.make_proxy(redis=redis, policy="PERSISTENT_SIMULATION_READ_WRITE")
+        ledger[original["request_id"]] = json.dumps(complete)
+        restarted, _, _, _ = self.make_proxy(redis=redis, policy="PERSISTENT_SIMULATION_READ_WRITE")
+        self.assertTrue(restarted.identity_snapshot()["write_ready"])
+
+    def test_reconciliation_postcheck_failure_keeps_write_block_and_acknowledges_written_record(self):
+        proxy, redis, _, original, identity = self._unknown_reconciliation()
+        preview = proxy.reconcile_unknown_write(original["request_id"], "1258", identity)
+        redis.fail_operation = "hgetall"
+        result = proxy.reconcile_unknown_write(original["request_id"], "1258", identity,
+                expected_record=preview["expected_record"], operator="human", apply=True)
+        self.assertEqual(result["status"], "UNKNOWN")
+        self.assertEqual(result["ledger_records_written"], 1)
+        self.assertFalse(proxy.identity_snapshot()["write_ready"])
+        self.assertEqual(json.loads(next(iter(redis.hashes.values()))[original["request_id"]])["state"], "RECONCILED")
 
     def test_write_capacity_and_read_reclamation_never_evict_persisted_order_record(self):
         clock = [1000.0]

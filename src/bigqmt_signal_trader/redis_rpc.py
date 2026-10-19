@@ -1401,13 +1401,16 @@ class BigQmtRpcHandlers:
                 if str(getattr(o, "user_order_id", "") or "").strip() == request.remark.strip()
             ]
             if by_remark:
-                sysid = str(getattr(by_remark[0], "order_sys_id", "") or "")
-                if sysid:
-                    try:
-                        settlement.result.order_sys_id = sysid
-                    except Exception:
-                        pass
-                return True
+                sysid = str(getattr(by_remark[0], "order_sys_id", "") or "").strip()
+                if len(by_remark) != 1:
+                    raise ValueError("order remark is not unique")
+                if sysid and sysid.upper() not in ("0", "-1", "0.0", "-1.0", "NONE", "NULL", "UNKNOWN"):
+                    settlement.result.order_sys_id = sysid
+                    settlement.server_error = ""
+                    if inline:
+                        self._last_server_error = ""
+                    return True
+                raise ValueError("order contract identity unavailable")
             if not final:
                 # Not there yet. QMT assigns the id asynchronously, so an early
                 # miss is normal -- only a miss at the deadline is a real one.
@@ -1441,9 +1444,15 @@ class BigQmtRpcHandlers:
             if inline:
                 self._last_server_error = message
             return True
-        except Exception:
-            # A failed lookup must not lose the order -- it is already submitted.
-            return True
+        except Exception as exc:
+            # Native errors may contain credentials or account data. Keep only
+            # the type and lookup count; querying again never resubmits an order.
+            message = "ORDER_CONFIRMATION_LOOKUP_FAILED:%s; lookups=%d; outcome=UNKNOWN" % (
+                exc.__class__.__name__, settlement.attempts)
+            settlement.server_error = message
+            if inline:
+                self._last_server_error = message
+            return bool(final)
 
     def _handle_submit_orders_batch(self, params):
         orders = params.get("orders") or []

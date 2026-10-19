@@ -156,7 +156,7 @@ class NativeStockOrderGateway(NativeReadOnlyProvider):
         super().__init__(query, account_id)
         self.context, self.passorder, self.cancel_func = context, passorder_func, cancel_func
         self.models = _load_embedded("bigqmt_signal_trader.models")
-        self._submitted, self._cancel_attempted = {}, set()
+        self._submitted, self._cancel_attempted, self._cancel_snapshots = {}, set(), {}
 
     def validate_submit_params(self, params):
         # handler信用类型转换依赖xtquant；受限普通股票入口不可丢弃显式类型。
@@ -195,7 +195,9 @@ class NativeStockOrderGateway(NativeReadOnlyProvider):
                 row = matched[0]
                 code = _load_embedded("bigqmt_signal_trader.code_utils").normalize_stock_code(request.stock_code)
                 if (row.stock_code != code or row.action != request.action or row.volume != request.volume
-                        or row.price != request.price or row.order_sys_id.upper() in ("0", "-1", "NONE", "NULL", "UNKNOWN")):
+                        or not math.isfinite(row.price) or not math.isfinite(request.price)
+                        or not math.isclose(row.price, request.price, rel_tol=0.0, abs_tol=1e-8)
+                        or row.order_sys_id.strip().upper() in ("", "0", "-1", "0.0", "-1.0", "NONE", "NULL", "UNKNOWN")):
                     raise RuntimeError("native submitted-order identity mismatch")
         return rows
 
@@ -210,7 +212,7 @@ class NativeStockOrderGateway(NativeReadOnlyProvider):
 
     def cancel(self, order_ref):
         contract = str(order_ref.order_sys_id or "").strip()
-        if not contract or contract.upper() in ("0", "-1", "NONE", "NULL", "UNKNOWN"):
+        if not contract or contract.upper() in ("0", "-1", "0.0", "-1.0", "NONE", "NULL", "UNKNOWN"):
             raise ValueError("real native contract required for cancellation")
         if contract in self._cancel_attempted:
             raise RuntimeError("native cancel attempt already consumed for this contract")
@@ -218,9 +220,53 @@ class NativeStockOrderGateway(NativeReadOnlyProvider):
         if (len(rows) != 1 or not order_ref.user_order_id or rows[0].user_order_id != order_ref.user_order_id
                 or rows[0].status not in ("50", "55") or rows[0].traded_volume >= rows[0].volume):
             raise RuntimeError("no unique matching cancelable native order with remaining volume")
+        before = rows[0]
+        if (before.action not in ("BUY", "SELL") or before.volume <= 0
+                or not math.isfinite(before.price) or before.price <= 0):
+            raise RuntimeError("native cancel identity incomplete")
         self._cancel_attempted.add(contract)
-        raw = self.cancel_func(contract, self.account_id, "STOCK", self.context)
-        return self.models.CancelResult(success=bool(raw), message="native cancel return; callback/query required")
+        self._cancel_snapshots[contract] = (before.user_order_id, before.stock_code, before.action,
+                                            before.volume, before.price, before.traded_volume)
+        self.cancel_func(contract, self.account_id, "STOCK", self.context)
+        result = self.models.CancelResult(success=False, message="native cancel returned; strict query required")
+        result.order_sys_id, result.user_order_id = contract, before.user_order_id
+        result.confirmation_pending, result.cancellation_confirmed = True, False
+        result.order_terminal, result.native_write_executed = False, True
+        return result
+
+    def query_cancel_confirmation(self, result):
+        """Only a fresh exact native contract query can confirm cancellation."""
+        contract = str(result.order_sys_id or "")
+        before = self._cancel_snapshots.get(contract)
+        if before is None or before[0] != result.user_order_id:
+            raise RuntimeError("native cancel confirmation attempt identity missing")
+        rows = [row for row in self.query_orders(self.account_id) if row.order_sys_id == contract]
+        if not rows:
+            return result
+        if len(rows) != 1:
+            raise RuntimeError("native cancel contract maps to multiple orders")
+        row = rows[0]
+        if ((row.user_order_id, row.stock_code, row.action, row.volume) != before[:4]
+                or not math.isfinite(row.price) or not math.isclose(row.price, before[4], rel_tol=0.0, abs_tol=1e-8)
+                or row.traded_volume < before[5]):
+            raise RuntimeError("native cancel confirmation identity mismatch")
+        result.native_order_status, result.traded_volume = row.status, row.traded_volume
+        result.volume, result.confirmation_source = row.volume, "native_query_orders_strict"
+        if row.status in ("53", "54"):
+            if ((row.status == "53" and not 0 < row.traded_volume < row.volume)
+                    or (row.status == "54" and row.traded_volume != 0)):
+                raise RuntimeError("native cancellation terminal quantities inconsistent")
+            result.success, result.cancellation_confirmed = True, True
+            result.confirmation_pending, result.order_terminal = False, True
+            result.message = "native original contract cancellation confirmed by strict query"
+        elif row.status in ("56", "57"):
+            if ((row.status == "56" and row.traded_volume != row.volume)
+                    or (row.status == "57" and row.traded_volume != 0)):
+                raise RuntimeError("native order terminal quantities inconsistent")
+            result.confirmation_pending, result.order_terminal = False, True
+            result.confirmation_error = "CANCELLATION_NOT_CONFIRMED_ORDER_ALREADY_TERMINAL"
+            result.message = result.confirmation_error
+        return result
 
 
 def create_native_stock_order_gateway(context, account_id, query, passorder_func, cancel_func):

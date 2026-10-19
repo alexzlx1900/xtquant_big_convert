@@ -180,6 +180,8 @@ def init(ContextInfo):
         execution["SHM_RPC_MAX_SECONDS"] = remaining
         for key in ("read", "execution"):
             _RUNTIMES[key]["get_trade_detail_data"] = query
+            if key == "read":
+                _RUNTIMES[key]["download_history_data"] = globals().get("download_history_data")
             if key == "execution" and read_write:
                 _RUNTIMES[key]["passorder"] = globals().get("passorder")
                 _RUNTIMES[key]["cancel"] = globals().get("cancel")
@@ -194,6 +196,8 @@ def init(ContextInfo):
         read_capabilities = list(_READ_CAPABILITIES)
         if read_server.market_enabled:
             read_capabilities += ["get_local_data", "get_market_data_ex", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"]
+            if callable(read_server.history_downloader):
+                read_capabilities += ["download_history_data"]
         rpc_transport = execution["_load_embedded"]("bigqmt_signal_trader.transports.shm_rpc")
         execution_capabilities = sorted(rpc_transport.READ_METHODS | (rpc_transport.WRITE_METHODS if read_write else frozenset()))
         print("AQP_DUAL_SHM_READY " + json.dumps(dict(

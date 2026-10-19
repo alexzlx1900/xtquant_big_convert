@@ -3,6 +3,7 @@
 import importlib.util
 import sys
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,9 +81,9 @@ class NativeHistoryTests(FIXTURE.BridgeFixture):
             self.assertEqual(result["server_error"], "HISTORY_SHAPE_INVALID")
 
     def test_unsafe_or_unbounded_request_never_calls_native(self):
-        for overrides in ({"subscribe": True}, {"fill_data": True}, {"count": 11},
-                          {"code": "600000.SH"}, {"end_time": "20260905235959"},
-                          {"dividend_type": "front"}, {"download": True}, {"period": "tick"},
+        for overrides in ({"subscribe": True}, {"fill_data": "true"}, {"count": 10001},
+                          {"code": "bad"}, {"end_time": "20260903235959"},
+                          {"dividend_type": "front"}, {"download": True}, {"period": "follow"},
                           {"start_time": "20260904000060"}):
             self.assertFalse(self.process("get_market_data_ex", params=params(**overrides))["ok"])
         self.context.get_market_data_ex.assert_not_called()
@@ -112,10 +113,80 @@ class NativeHistoryTests(FIXTURE.BridgeFixture):
             self.assertEqual(future.result(timeout=1)["index"], [SAMPLES["1m"][0]])
         client.close()
 
+    def test_latest_count_and_native_fill_cover_chart_and_strategy_contracts(self):
+        value = params(period="5m", code="000002.SZ", start_time="", end_time="", count=500, fill_data=True)
+        self.context.get_market_data_ex.return_value = {"000002.SZ": frame()}
+        result = self.process("get_market_data_ex", params=value)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["data"]["source_evidence"]["symbol_scope"], "EXPLICIT_HISTORY_SYMBOL")
+        self.assertIs(result["data"]["source_evidence"]["fill_data"], True)
+        self.context.get_market_data_ex.assert_called_once_with(FIELDS, ["000002.SZ"],
+            period="5m", start_time="", end_time="", count=500,
+            dividend_type="none", fill_data=True, subscribe=False)
+        # 历史代码范围不改变原快照白名单。
+        self.assertFalse(self.process("get_ticks", params={"codes": ["000002.SZ"]})["ok"])
+
+    def test_cross_day_daily_preserves_all_native_rows(self):
+        data = frame("1d")
+        data.index = ["20260903", "20260904"]
+        data.shape = (2, 6)
+        data.values = SimpleNamespace(tolist=lambda: [SAMPLES["1d"][1], SAMPLES["1d"][1]])
+        self.context.get_market_data_ex.return_value = {"000001.SZ": data}
+        result = self.process("get_market_data_ex", params=params("1d", start_time="20260903000000", count=500))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["data"]["index"], ["20260903", "20260904"])
+
+    def test_tick_fields_duplicate_millisecond_and_units_are_preserved(self):
+        fields = ["time", "lastPrice", "volume", "amount", "bidPrice"]
+        stamp = 1788498060123
+        data = SimpleNamespace(index=["20260904130100123", "20260904130100123"], columns=fields,
+            shape=(2, 5), values=SimpleNamespace(tolist=lambda: [[stamp, 11.92, 7431, 8843066, [11.91]]] * 2))
+        self.context.get_market_data_ex.return_value = {"000001.SZ": data}
+        result = self.process("get_market_data_ex", params=params("tick", count=10000))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["data"]["rows"][0], [stamp, 11.92, 7431, 8843066, [11.91]])
+        self.assertEqual(result["data"]["source_evidence"]["row_count"], 2)
+        self.assertEqual(self.context.get_market_data_ex.call_args.args[0], [])
+
+    def test_oversize_history_fails_without_truncation(self):
+        data = SimpleNamespace(index=["20260904130100000"] * 10000,
+            columns=["lastPrice", "volume", "amount", "native_extra"], shape=(10000, 4),
+            values=SimpleNamespace(tolist=lambda: [[11.92, 7431, 8843066, "x" * 1024]] * 10000))
+        self.context.get_market_data_ex.return_value = {"000001.SZ": data}
+        result = self.process("get_market_data_ex", params=params("tick", count=10000))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["server_error"], "HISTORY_PAYLOAD_TOO_LARGE")
+        self.assertIsNone(result["data"])
+
+    def test_download_capability_requires_native_injection_and_void_is_only_requested(self):
+        request = dict(code="000002.SZ", period="tick", start_time="20260904", end_time="20260904")
+        self.assertNotIn("download_history_data", self.process("ping")["data"]["capabilities"])
+        self.assertEqual(self.process("download_history_data", params=request)["server_error"], "CAPABILITY_MISSING")
+        self.bridge.history_downloader = mock.Mock(return_value=None)
+        self.assertIn("download_history_data", self.process("ping")["data"]["capabilities"])
+        result = self.process("download_history_data", params=request)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["data"]["status"], "REQUESTED")
+        self.assertIs(result["data"]["completion_confirmed"], False)
+        self.bridge.history_downloader.assert_called_once_with("000002.SZ", "tick", "20260904", "20260904")
+
+    def test_old_client_rejects_new_large_reply_before_reading_oversize_payload(self):
+        legacy = types.ModuleType("legacy_small_response_transport")
+        source = (ROOT / "src/bigqmt_signal_trader/transports/readonly_shm.py").read_text()
+        exec(compile(source.replace("RESPONSE_CAPACITY = 8 * 1024 * 1024", "RESPONSE_CAPACITY = 262144"),
+                     "<legacy-response-capacity-fixture>", "exec"), legacy.__dict__)
+        client = legacy.ShmReadOnlyClient(FIXTURE.NAME, FIXTURE.ACCOUNT, region=FIXTURE.MemoryRegion(self.state))
+        self.clients.append(client)
+        self.context.get_market_data_ex.return_value = {"000001.SZ": SimpleNamespace(
+            index=["20260904130100000"] * 10000, columns=["lastPrice", "volume", "amount"],
+            shape=(10000, 3), values=SimpleNamespace(tolist=lambda: [[11.92, 7431, 8843066]] * 10000))}
+        with pytest.raises(legacy.ShmProtocolError, match="invalid response payload length"):
+            self.roundtrip(client, "get_market_data_ex", params=params("tick", count=10000))
+
 
 @pytest.mark.parametrize("overrides", [
-    {"subscribe": True}, {"fill_data": True}, {"count": 11}, {"count": True},
-    {"end_time": "20260905235959"}, {"dividend_type": "front"}, {"download": True},
+    {"subscribe": True}, {"fill_data": "true"}, {"count": 10001}, {"count": True},
+    {"end_time": "20260903235959"}, {"dividend_type": "front"}, {"download": True},
 ])
 def test_unsafe_client_params_do_not_open_mailbox(overrides):
     factory = mock.Mock()

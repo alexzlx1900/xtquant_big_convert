@@ -116,10 +116,35 @@ class ShmRpcBridge:
 
     def _write_result(self, method, result, error=""):
         data = to_jsonable(result)
-        sysid = data.get("order_sys_id") if isinstance(data, dict) else None
-        status = "CONFIRMED" if method == "submit_order" and sysid and not error else "UNKNOWN"
+        sysid = str(data.get("order_sys_id") or "").strip() if isinstance(data, dict) else ""
+        valid_contract = sysid.upper() not in ("", "0", "-1", "0.0", "-1.0", "NONE", "NULL", "UNKNOWN")
+        cancellation = (method == "cancel_order" and isinstance(data, dict)
+                        and data.get("cancellation_confirmed") is True and data.get("success") is True
+                        and data.get("order_terminal") is True and data.get("user_order_id")
+                        and data.get("confirmation_source") == "native_query_orders_strict"
+                        and str(data.get("native_order_status")) in ("53", "54"))
+        if not error and isinstance(data, dict):
+            error = data.get("confirmation_error") or ""
+        status = "CONFIRMED" if valid_contract and not error and (method == "submit_order" or cancellation) else "UNKNOWN"
         return dict(status=status, result=data, order_sys_id=str(sysid or ""),
                     automatic_retry=False, error=str(error or ""))
+
+    def _poll_cancel_confirmation(self, settlement):
+        final = time.monotonic() >= settlement["deadline"]
+        result = settlement["result"]
+        try:
+            result = self.handlers.order_gateway.query_cancel_confirmation(result)
+            settlement["result"] = result
+            settlement["error"] = ""
+        except Exception as exc:
+            settlement["error"] = "CANCEL_CONFIRMATION_LOOKUP_FAILED:%s; outcome=UNKNOWN" % exc.__class__.__name__
+        pending = getattr(result, "confirmation_pending", False) is True
+        if not final and (pending or settlement["error"]):
+            return None
+        error = settlement["error"]
+        if pending and not error:
+            error = "CANCEL_CONFIRMATION_DEADLINE; outcome=UNKNOWN"
+        return self._write_result("cancel_order", result, error)
 
     def _trade_login(self):
         unknown = dict(status="UNKNOWN", account_id=self.account_id, session_id=self.mailbox.session_id,
@@ -212,12 +237,20 @@ class ShmRpcBridge:
             sequence, request, response, fingerprint, settlement = self._pending
             if settlement is not None:
                 try:
-                    done = self.handlers._apply_order_lookup(settlement, final=time.monotonic() >= settlement.deadline)
-                    if not done:
-                        return False
-                    response.update(ok=True, data=self._write_result("submit_order", settlement.result, settlement.server_error))
+                    if request["method"] == "cancel_order":
+                        data = self._poll_cancel_confirmation(settlement)
+                        if data is None:
+                            return False
+                    else:
+                        done = self.handlers._apply_order_lookup(settlement, final=time.monotonic() >= settlement.deadline)
+                        if not done:
+                            return False
+                        data = self._write_result("submit_order", settlement.result, settlement.server_error)
+                    response.update(ok=True, data=data)
                 except Exception as exc:
-                    response.update(ok=True, data=self._write_result("submit_order", settlement.result, str(exc)))
+                    result = settlement["result"] if request["method"] == "cancel_order" else settlement.result
+                    response.update(ok=True, data=self._write_result(request["method"], result,
+                        "WRITE_CONFIRMATION_FAILED:%s; outcome=UNKNOWN" % exc.__class__.__name__))
                 self._finish(sequence, request, response, fingerprint)
             if self.mailbox.publish_response(sequence, response):
                 self._pending = None
@@ -304,6 +337,9 @@ class ShmRpcBridge:
                 result = self._read_with_evidence(method, business_params) if method in READ_METHODS else self.handlers.handle(method, business_params)
                 if method in WRITE_METHODS:
                     settlement = self.handlers.take_pending_settlement()
+                    if (method == "cancel_order" and getattr(result, "confirmation_pending", False) is True
+                            and callable(getattr(self.handlers.order_gateway, "query_cancel_confirmation", None))):
+                        settlement = dict(result=result, error="", deadline=time.monotonic() + self.handlers.order_settle_timeout_seconds)
                     response.update(ok=True, data=self._write_result(method, result))
                     if settlement is not None:
                         self._pending = (sequence, request, response, fingerprint, settlement)

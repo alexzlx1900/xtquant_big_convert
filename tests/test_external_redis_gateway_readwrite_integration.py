@@ -214,13 +214,14 @@ def test_formal_gateway_reads_native_evidence_then_submits_cancels_and_consumes_
                 "7620", profile_id="sim-stock", account_id=ACCOUNT,
                 order_sysid="7620", user_order_id=REMARK,
             ))
-            assert cancelled["status"] == "UNKNOWN" and cancelled["automatic_retry"] is False
+            assert cancelled["status"] == "CANCELLED" and cancelled["automatic_retry"] is False
+            assert cancelled["cancel_result"]["result"]["cancellation_confirmed"] is True
             assert len(h.cancel_calls) == 1
             rows = await h.operation(h.read.query_orders_with_evidence())
             assert rows["source_evidence"]["complete"] is True and len(rows["orders"]) == 1
             reports = await h.operation(h.order.poll_execution_events_once())
             assert any(item["event"].get("status") == 54 for item in reports["events"])
-            assert h.proxy.identity_snapshot()["write_block_reason"]
+            assert h.proxy.identity_snapshot()["write_ready"] is True
         finally:
             await h.close()
 

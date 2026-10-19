@@ -22,6 +22,7 @@ READONLY_MAX_SECONDS = 60
 READONLY_PERSISTENT_READONLY = False  # 仅显式55013746禁写驻留候选；默认仍有界。
 READONLY_PERSISTENT_MARKET_RPC = False  # 双源读写候选显式开放已有市场只读方法。
 RPC_REVISION = "shm-readonly-single-file-v2"
+HISTORY_PAYLOAD_LIMIT_BYTES = 8 * 1024 * 1024 - 16384
 _EMBEDDED_SOURCES = {}  # BUILD_READONLY_EMBEDDED
 _MODULE_CACHE = {}
 _ORIGINAL_IMPORT = builtins.__import__
@@ -125,6 +126,7 @@ class ShmReadOnlyBridge:
         self.pending = None
         self.closed = False
         self.market_enabled = READONLY_ENABLE_MARKET_RPC is True
+        self.history_downloader = globals().get("download_history_data")
         self.event_lock = threading.Lock()
         self.events = []
         self.event_sequence = 0
@@ -183,6 +185,10 @@ class ShmReadOnlyBridge:
             allowed_methods = ("ping", "get_positions", "get_full_tick", "get_ticks", "get_asset", "query_orders", "query_trades")
             if self.market_enabled:
                 allowed_methods += ("get_local_data", "get_market_data_ex", "subscribe_quote", "poll_quote_events", "unsubscribe_quote")
+                if callable(self.history_downloader):
+                    allowed_methods += ("download_history_data",)
+            if method == "download_history_data" and self.market_enabled and not callable(self.history_downloader):
+                raise ReadOnlyRequestError("CAPABILITY_MISSING", "native download_history_data is not injected")
             if method not in allowed_methods:
                 raise ReadOnlyRequestError("METHOD_DENIED", "method is outside the readonly allowlist")
             expires_at = fields.get("read_expires_at_unix")
@@ -209,7 +215,7 @@ class ShmReadOnlyBridge:
                         "windows_session_id": self.windows_session_id,
                         "background_threads": False, "callback_thread_id": self.callback_thread_id,
                         "session_id": self.mailbox.session_id, "native_pid": self.mailbox.server_pid, "capabilities": list(allowed_methods)}
-            elif method in ("get_local_data", "get_market_data_ex", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"):
+            elif method in ("get_local_data", "get_market_data_ex", "download_history_data", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"):
                 data = self.market_request(method, params)
                 data.update(account_id=self.account_id, session_id=self.mailbox.session_id,
                             native_pid=self.mailbox.server_pid, windows_session_id=self.windows_session_id)
@@ -314,109 +320,168 @@ class ShmReadOnlyBridge:
         }, sort_keys=True))
         return response
 
-    def market_request(self, method, params):
-        if method in ("get_local_data", "get_market_data_ex"):
-            allowed = {"account_id", "code", "period", "start_time", "end_time", "count", "divid_type"}
-            if method == "get_market_data_ex":
-                allowed = {"account_id", "code", "period", "start_time", "end_time", "count", "dividend_type", "fill_data", "subscribe"}
-            if set(params) - allowed:
-                raise ReadOnlyRequestError("INVALID_PARAMS", "unsupported history parameter")
-            code, period = params.get("code"), params.get("period")
-            start, end, count = params.get("start_time"), params.get("end_time"), params.get("count")
-            if (code not in self.quote_symbols or period not in ("1m", "1d")
-                    or params.get("divid_type", "none") != "none" or type(count) is not int or not 1 <= count <= 10
-                    or any(not isinstance(v, str) or len(v) != 14 or not v.isdigit() for v in (start, end))
-                    or start > end):
-                raise ReadOnlyRequestError("INVALID_PARAMS", "history requires allowlisted symbol, period, times and count 1-10")
-            if method == "get_market_data_ex" and (
-                    start[:8] != end[:8] or params.get("dividend_type", "none") != "none"
-                    or params.get("fill_data") is not False or params.get("subscribe") is not False):
-                raise ReadOnlyRequestError("INVALID_PARAMS", "native cached history requires one day and fill_data/subscribe=False")
-            for value in (start, end):
+    @staticmethod
+    def _history_symbol(code):
+        return (isinstance(code, str) and len(code) == 9
+                and all("0" <= char <= "9" for char in code[:6]) and code[6:] in (".SH", ".SZ", ".BJ"))
+
+    @staticmethod
+    def _history_timestamp(value, period):
+        text = str(value)
+        if period == "tick" and len(text) in (10, 13) and text.isdigit():
+            seconds = int(text) / (1000.0 if len(text) == 13 else 1.0)
+            stamp = _dt.datetime.fromtimestamp(seconds, _dt.timezone(_dt.timedelta(hours=8)))
+            return stamp.strftime("%Y%m%d%H%M%S") + ".%03d" % (stamp.microsecond // 1000)
+        if period == "tick" and len(text) == 17 and text.isdigit():
+            text = text[:14] + "." + text[14:]
+        compact, separator, fraction = text.partition(".")
+        expected = 8 if period == "1d" else 14
+        if (len(compact) != expected or not compact.isdigit()
+                or separator and (period != "tick" or not fraction.isdigit() or len(fraction) > 6)):
+            raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history index is not a supported timestamp")
+        try:
+            _dt.datetime.strptime(compact, "%Y%m%d" if period == "1d" else "%Y%m%d%H%M%S")
+        except ValueError:
+            raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history index is not a valid timestamp")
+        return text
+
+    def _history_request(self, method, params):
+        allowed = {"account_id", "code", "period", "start_time", "end_time", "count", "divid_type"}
+        if method == "get_market_data_ex":
+            allowed = {"account_id", "code", "period", "start_time", "end_time", "count", "dividend_type", "fill_data", "subscribe"}
+        code, period = params.get("code"), params.get("period")
+        start, end, count = params.get("start_time"), params.get("end_time"), params.get("count")
+        if (set(params) - allowed or not self._history_symbol(code)
+                or period not in ("1m", "5m", "15m", "30m", "60m", "1d", "tick")
+                or params.get("divid_type", "none") != "none" or type(count) is not int or not 1 <= count <= 10000
+                or any(not isinstance(v, str) or (v and (len(v) != 14 or not v.isdigit())) for v in (start, end))
+                or start and end and start > end):
+            raise ReadOnlyRequestError("INVALID_PARAMS", "history requires an explicit SH/SZ/BJ symbol, supported period, count 1-10000 and ordered optional times")
+        if method == "get_market_data_ex" and (
+                params.get("dividend_type", "none") != "none" or type(params.get("fill_data")) is not bool
+                or params.get("subscribe") is not False):
+            raise ReadOnlyRequestError("INVALID_PARAMS", "native cached history requires explicit fill_data boolean and subscribe=False")
+        for value in (start, end):
+            if value:
                 try:
-                    _dt.datetime(int(value[:4]), int(value[4:6]), int(value[6:8]), int(value[8:10]), int(value[10:12]), int(value[12:14]))
+                    _dt.datetime.strptime(value, "%Y%m%d%H%M%S")
                 except ValueError:
                     raise ReadOnlyRequestError("INVALID_PARAMS", "history timestamp is invalid")
-            result = {"status": "UNAVAILABLE", "code": code, "period": period, "index": [], "columns": [], "rows": [],
-                      "source_evidence": {"native_method": method, "count": count, "start_time": start, "end_time": end,
-                                          "divid_type": "none", "row_count": 0}}
-            if method == "get_market_data_ex":
-                result["source_evidence"].update(dividend_type="none", fill_data=False, subscribe=False)
-            native = getattr(self.context, method, None)
-            if not callable(native):
-                result["source_evidence"]["reason"] = "NATIVE_METHOD_UNAVAILABLE"
-                return result
-            if method == "get_market_data_ex":
-                raw = native(["open", "high", "low", "close", "volume", "amount"], [code],
-                             period=period, start_time=start, end_time=end, count=count,
-                             dividend_type="none", fill_data=False, subscribe=False)
-                if raw is not None:
-                    if not isinstance(raw, dict) or set(raw) - {code}:
-                        raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history escaped the requested symbol")
-                    if code not in raw:
-                        result.update(status="EMPTY")
-                        result["source_evidence"]["reason"] = "NATIVE_CODE_ABSENT"
-                        return result
-                    raw = raw[code]
-            else:
-                raw = native(stock_code=code, period=period, start_time=start, end_time=end, count=count, divid_type="none")
-            if raw is None:
-                result["source_evidence"]["reason"] = "NATIVE_RETURNED_NONE"
-                return result
-            if isinstance(raw, dict):
-                index = list(raw)
-                if (len(index) > count or any(not isinstance(row, dict) or len(row) > 64 for row in raw.values())
-                        or any((type(tag) is not int and not isinstance(tag, str)) or isinstance(tag, bool)
-                               or (type(tag) is int and tag <= 0) or (isinstance(tag, str) and (not tag or len(tag) > 32)) for tag in index)):
-                    raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history must contain bounded timetag rows")
-                columns = []
-                for row in raw.values():
-                    for field in row:
-                        if not isinstance(field, str):
-                            raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "history field must be a string")
-                        if field not in columns:
-                            columns.append(field)
-                # Keep sparse native rows explicitly; absent fields remain None, never filled from another row.
-                rows = [[raw[tag].get(field) for field in columns] for tag in index]
-                result["native_rows"] = self.serializer([{ "index": tag, "fields": raw[tag]} for tag in index])
-            else:
-                if not all(hasattr(raw, attr) for attr in ("index", "columns", "values", "shape")) or len(raw.shape) != 2:
-                    raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "history requires native timetag mapping or two-dimensional frame")
-                rows = raw.values.tolist()
-                columns = list(raw.columns)
-                index = list(raw.index)
-            if len(rows) > count or len(index) != len(rows) or any(len(row) != len(columns) for row in rows):
-                raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "history exceeds count or has inconsistent axes")
-            if len(columns) > 64:
-                raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "history field count exceeds bounded shape")
-            result.update(status="OK" if rows else "EMPTY", index=self.serializer(index), columns=self.serializer(columns), rows=self.serializer(rows))
-            result["source_evidence"]["row_count"] = len(rows)
-            if method == "get_market_data_ex" and rows:
-                if (len(set(result["columns"])) != len(result["columns"])
-                        or set(result["columns"]) != {"open", "high", "low", "close", "volume", "amount"}):
-                    raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native cached history requires six OHLCV fields")
-                previous_tag = ""
-                for tag in result["index"]:
-                    text = str(tag)
-                    expected_length = 14 if period == "1m" else 8
-                    if (len(text) != expected_length or not text.isdigit()
-                            or text[:8] != start[:8] or text <= previous_tag
-                            or (period == "1m" and not start <= text <= end)):
-                        raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history index is outside the requested window or unordered")
-                    try:
-                        _dt.datetime.strptime(text, "%Y%m%d%H%M%S" if period == "1m" else "%Y%m%d")
-                    except ValueError:
-                        raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history index is not a valid timestamp")
-                    previous_tag = text
-                for row in result["rows"]:
-                    for field, value in zip(result["columns"], row):
-                        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                                or not math.isfinite(value) or value < 0
-                                or (field in ("open", "high", "low", "close") and value == 0)):
-                            raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history has unavailable or invalid numeric fields")
-            if len(json.dumps(result, ensure_ascii=True, allow_nan=False).encode("ascii")) > 32768:
-                raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history payload exceeds bounded size")
+        result = {"status": "UNAVAILABLE", "code": code, "period": period, "index": [], "columns": [], "rows": [],
+                  "source_evidence": {"native_method": method, "count": count, "start_time": start, "end_time": end,
+                                      "divid_type": "none", "row_count": 0, "cache_only": True,
+                                      "download_performed": False, "row_limit": 10000, "payload_limit_bytes": HISTORY_PAYLOAD_LIMIT_BYTES,
+                                      "symbol_scope": "EXPLICIT_HISTORY_SYMBOL", "requested_symbol": code}}
+        if method == "get_market_data_ex":
+            result["source_evidence"].update(dividend_type="none", fill_data=params["fill_data"], subscribe=False)
+        native = getattr(self.context, method, None)
+        if not callable(native):
+            result["source_evidence"]["reason"] = "NATIVE_METHOD_UNAVAILABLE"
             return result
+        if method == "get_market_data_ex":
+            fields = [] if period == "tick" else ["open", "high", "low", "close", "volume", "amount"]
+            raw = native(fields, [code], period=period, start_time=start, end_time=end, count=count,
+                         dividend_type="none", fill_data=params["fill_data"], subscribe=False)
+            if raw is not None:
+                if not isinstance(raw, dict) or set(raw) - {code}:
+                    raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history escaped the requested symbol")
+                if code not in raw:
+                    result.update(status="EMPTY")
+                    result["source_evidence"]["reason"] = "NATIVE_CODE_ABSENT"
+                    return result
+                raw = raw[code]
+        else:
+            raw = native(stock_code=code, period=period, start_time=start, end_time=end, count=count, divid_type="none")
+        if raw is None:
+            result["source_evidence"]["reason"] = "NATIVE_RETURNED_NONE"
+            return result
+        if isinstance(raw, dict):
+            index = list(raw)
+            if len(index) > count or any(not isinstance(row, dict) or len(row) > 64 for row in raw.values()):
+                raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history must contain bounded timetag rows")
+            columns = []
+            for row in raw.values():
+                for field in row:
+                    if not isinstance(field, str) or not 1 <= len(field) <= 64:
+                        raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "history field must be a bounded string")
+                    if field not in columns:
+                        columns.append(field)
+            rows = [[raw[tag].get(field) for field in columns] for tag in index]
+            result["native_rows"] = self.serializer([{"index": tag, "fields": raw[tag]} for tag in index])
+        else:
+            if not all(hasattr(raw, attr) for attr in ("index", "columns", "values", "shape")) or len(raw.shape) != 2:
+                raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "history requires native timetag mapping or two-dimensional frame")
+            if raw.shape[0] > count or raw.shape[1] > 64:
+                raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native frame exceeds requested bounded shape")
+            rows, columns, index = raw.values.tolist(), list(raw.columns), list(raw.index)
+        if (len(rows) > count or len(index) != len(rows) or len(columns) > 64
+                or any(not isinstance(field, str) or not 1 <= len(field) <= 64 for field in columns)
+                or len(set(columns)) != len(columns)
+                or any(len(row) != len(columns) for row in rows)):
+            raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "history exceeds count or has inconsistent axes")
+        result.update(status="OK" if rows else "EMPTY", index=self.serializer(index), columns=self.serializer(columns), rows=self.serializer(rows))
+        result["source_evidence"]["row_count"] = len(rows)
+        if method == "get_market_data_ex" and rows:
+            required = {"lastPrice", "volume", "amount"} if period == "tick" else {"open", "high", "low", "close", "volume", "amount"}
+            if not required <= set(result["columns"]) or period != "tick" and set(result["columns"]) != required:
+                raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history is missing required price/volume/amount fields")
+            previous_tag = ""
+            for tag, row in zip(result["index"], result["rows"]):
+                text = self._history_timestamp(tag, period)
+                compact = text.split(".", 1)[0]
+                lower = start[:8] if period == "1d" else start
+                upper = end[:8] if period == "1d" else end
+                if (lower and compact < lower or upper and compact > upper
+                        or previous_tag and (text < previous_tag or period != "tick" and text == previous_tag)):
+                    raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history index escaped the requested window or is unordered")
+                previous_tag = text
+                record = dict(zip(result["columns"], row))
+                for field in required:
+                    value = record[field]
+                    if (isinstance(value, bool) or not isinstance(value, (int, float))
+                            or not math.isfinite(value) or value < 0
+                            or field in ("open", "high", "low", "close", "lastPrice") and value == 0):
+                        raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history has unavailable or invalid numeric fields")
+                if period == "tick" and "time" in record and (type(record["time"]) is not int or record["time"] <= 0):
+                    raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native tick time is invalid")
+        if len(json.dumps(result, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")) > HISTORY_PAYLOAD_LIMIT_BYTES:
+            raise ReadOnlyRequestError("HISTORY_PAYLOAD_TOO_LARGE", "native history exceeds bounded 8MiB response; request a smaller explicit window/count, no rows were truncated")
+        return result
+
+    def _download_request(self, params):
+        if not callable(self.history_downloader):
+            raise ReadOnlyRequestError("CAPABILITY_MISSING", "native download_history_data is not injected")
+        allowed = {"account_id", "code", "period", "start_time", "end_time", "incrementally"}
+        code, period = params.get("code"), params.get("period")
+        start, end = params.get("start_time"), params.get("end_time")
+        incremental = params.get("incrementally")
+        if (set(params) - allowed or not self._history_symbol(code) or period not in ("tick", "1m", "5m", "1d")
+                or type(incremental) not in (bool, type(None))
+                or any(not isinstance(value, str) or len(value) != 8 or not value.isdigit() for value in (start, end))
+                or start != end):
+            raise ReadOnlyRequestError("INVALID_PARAMS", "download requires an explicit SH/SZ/BJ symbol and one trading day")
+        try:
+            _dt.datetime.strptime(start, "%Y%m%d")
+        except ValueError:
+            raise ReadOnlyRequestError("INVALID_PARAMS", "download trading day is invalid")
+        args = (code, period, start, end)
+        if incremental is None:
+            returned = self.history_downloader(*args)
+        else:
+            returned = self.history_downloader(*args, incrementally=incremental)
+        if returned is False:
+            raise ReadOnlyRequestError("NATIVE_DOWNLOAD_REJECTED", "native history download returned False")
+        return {"status": "REQUESTED", "code": code, "period": period,
+                "completion_confirmed": False, "readback_required": True,
+                "source_evidence": {"native_method": "download_history_data", "start_time": start,
+                                    "end_time": end, "incrementally": incremental,
+                                    "native_returned_none": returned is None}}
+
+    def market_request(self, method, params):
+        if method in ("get_local_data", "get_market_data_ex"):
+            return self._history_request(method, params)
+        if method == "download_history_data":
+            return self._download_request(params)
         if method == "subscribe_quote":
             if (set(params) - {"account_id", "code", "period", "result_type", "dividend_type"}
                     or params.get("code") not in self.quote_symbols

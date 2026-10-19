@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from bigqmt_signal_trader.models import OrderSubmitResult
-from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers
+from bigqmt_signal_trader.models import OrderRequest, OrderSubmitResult
+from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers, OrderSettlement
 from bigqmt_signal_trader.shm_rpc_bridge import ShmRpcBridge
 from bigqmt_signal_trader.transports.readonly_shm import MAP_SIZE, ShmReadOnlyClient, ShmProtocolError
 from bigqmt_signal_trader.transports.shm_rpc import ShmRpcClient, ShmRpcError
@@ -141,6 +141,65 @@ def test_missing_contract_and_cancel_are_unknown_not_fake_success():
     value = h.execute(lambda: h.client.call("cancel_order", {"order_sys_id": "REAL-SYSID"}))
     assert value["status"] == "UNKNOWN" and len(h.gateway.cancels) == 1
     h.close()
+
+
+def test_order_lookup_failure_remains_pending_until_deadline_and_retains_redacted_evidence():
+    h = Harness(True)
+    try:
+        request = OrderRequest(signal_id="lookup", account_id=ACCOUNT, stock_code="000001.SZ", action="BUY",
+                               volume=100, price=11.12, price_type="LIMIT", strategy_name="", remark="exact")
+        settlement = OrderSettlement(request, OrderSubmitResult("SUBMITTED", "exact"), 0)
+
+        def failed_query(*args):
+            raise RuntimeError("redis://user:secret@host token=private")
+
+        h.gateway.query_orders = failed_query
+        assert h.handlers._apply_order_lookup(settlement, final=False) is False
+        assert settlement.server_error == "ORDER_CONFIRMATION_LOOKUP_FAILED:RuntimeError; lookups=1; outcome=UNKNOWN"
+        assert h.handlers._apply_order_lookup(settlement, final=True) is True
+        assert "lookups=2" in settlement.server_error
+        assert "secret" not in settlement.server_error and "private" not in settlement.server_error
+        assert not settlement.result.order_sys_id and h.gateway.submits == []
+    finally:
+        h.close()
+
+
+def test_order_lookup_transient_failure_can_be_confirmed_by_later_query_without_resubmission():
+    h = Harness(True)
+    try:
+        request = OrderRequest(signal_id="lookup", account_id=ACCOUNT, stock_code="000001.SZ", action="BUY",
+                               volume=100, price=11.12, price_type="LIMIT", strategy_name="", remark="exact")
+        settlement = OrderSettlement(request, OrderSubmitResult("SUBMITTED", "exact"), 0)
+        calls = []
+
+        def lookup(*args):
+            calls.append(True)
+            if len(calls) == 1:
+                raise RuntimeError("temporary native query failure")
+            return [SimpleNamespace(user_order_id="exact", order_sys_id="1258")]
+
+        h.gateway.query_orders = lookup
+        assert h.handlers._apply_order_lookup(settlement) is False
+        assert "outcome=UNKNOWN" in settlement.server_error
+        assert h.handlers._apply_order_lookup(settlement) is True
+        assert settlement.result.order_sys_id == "1258" and settlement.server_error == ""
+        assert len(calls) == 2 and h.gateway.submits == []
+    finally:
+        h.close()
+
+
+@pytest.mark.parametrize("contracts", [["1258", "1259"], ["UNKNOWN"], [""], ["  "], ["0.0"], ["-1.0"]])
+def test_order_lookup_cannot_confirm_duplicate_remark_or_invalid_contract(contracts):
+    h = Harness(True)
+    try:
+        request = OrderRequest(signal_id="lookup", account_id=ACCOUNT, stock_code="000001.SZ", action="BUY",
+                               volume=100, price=11.12, price_type="LIMIT", strategy_name="", remark="exact")
+        settlement = OrderSettlement(request, OrderSubmitResult("SUBMITTED", "exact"), 0)
+        h.gateway.query_orders = lambda *args: [SimpleNamespace(user_order_id="exact", order_sys_id=value) for value in contracts]
+        assert h.handlers._apply_order_lookup(settlement, final=True) is True
+        assert not settlement.result.order_sys_id and "outcome=UNKNOWN" in settlement.server_error
+    finally:
+        h.close()
 
 
 def test_timeout_poison_and_late_request_not_executed():

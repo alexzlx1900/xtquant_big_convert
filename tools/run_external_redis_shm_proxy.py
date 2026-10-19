@@ -249,14 +249,135 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
     return result
 
 
+def validate_reconciliation_plan(value, *, apply=False):
+    """只接受数据文件；原 UNKNOWN 原文由预览返回，禁止猜测或自动补写。"""
+    allowed = {"request_id", "order_sys_id", "order_identity", "expected_record", "operator", "stopped_proxy_pid"}
+    if not isinstance(value, dict) or set(value) - allowed:
+        raise ValueError("an exact single-RID reconciliation JSON plan is required")
+    RedisShmReadOnlyProxy._request_id(value)
+    identity = value.get("order_identity")
+    if (not isinstance(value.get("order_sys_id"), str) or not value["order_sys_id"]
+            or not isinstance(identity, dict) or set(identity) != {
+                "user_order_id", "stock_code", "action", "volume", "price"}
+            or not isinstance(identity.get("user_order_id"), str) or not identity["user_order_id"]
+            or not isinstance(identity.get("stock_code"), str) or not identity["stock_code"]
+            or identity.get("action") not in ("BUY", "SELL")
+            or type(identity.get("volume")) is not int or identity["volume"] <= 0
+            or type(identity.get("price")) not in (int, float)
+            or not math.isfinite(identity["price"]) or identity["price"] <= 0):
+        raise ValueError("complete explicit original order identity is required")
+    if apply and (not isinstance(value.get("expected_record"), str) or not value["expected_record"]
+                  or not isinstance(value.get("operator"), str) or not value["operator"].strip()
+                  or len(value["operator"]) > 128):
+        raise ValueError("apply requires the exact previewed record and an explicit operator")
+    if "stopped_proxy_pid" in value:
+        _integer(value["stopped_proxy_pid"], "stopped_proxy_pid", 1, 0xFFFFFFFF)
+    return dict(value)
+
+
+def confirmed_proxy_stopped(pid):
+    """不停止进程；只核对执行清单中已确认的唯一旧代理 PID 已退出。"""
+    if os.name != "nt":
+        raise RuntimeError("proxy-exit confirmation requires Windows")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        if ctypes.get_last_error() == 87:
+            return True
+        raise RuntimeError("the explicitly identified proxy exit could not be confirmed")
+    try:
+        status = ctypes.c_uint32()
+        if not kernel.GetExitCodeProcess(handle, ctypes.byref(status)):
+            raise RuntimeError("the explicitly identified proxy exit could not be read")
+        return status.value != 259
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def run_reconciliation(value, plan, *, apply=False, redis_factory=None, shm_factory=None):
+    """一次有界只读核对及可选单记录 CAS；不启动接收循环或发单。"""
+    config = validate_config(value)
+    plan = validate_reconciliation_plan(plan, apply=apply)
+    if config["runtime_policy"] != "PERSISTENT_SIMULATION_READ_WRITE":
+        raise ValueError("reconciliation requires the existing persistent simulation read/write sources")
+    if windows_session_id(os.getpid()) != config["windows_session"] or windows_session_id(config["native_pid"]) != config["windows_session"]:
+        raise RuntimeError("consumer and native source must share the explicit Windows session")
+    old_proxy_pid = _integer(plan.get("stopped_proxy_pid"), "stopped_proxy_pid", 1, 0xFFFFFFFF)
+    if old_proxy_pid in (os.getpid(), config["native_pid"]) or not confirmed_proxy_stopped(old_proxy_pid):
+        raise RuntimeError("the independently identified unique old proxy must be stopped before mailbox inspection")
+    redis_client, proxy, clients, errors = None, None, [], []
+    result = dict(status="FAILED", account_id=ACCOUNT, request_id=plan["request_id"],
+                  automatic_retry=False, native_write_calls=0, ledger_records_written=0)
+    try:
+        redis_client = (redis_factory or create_redis_client)(config["redis"])
+        transport = RedisTransport(redis_client, account_id=ACCOUNT)
+        factory = shm_factory or ShmReadOnlyClient
+        clients.append(factory(config["read_name"], ACCOUNT))
+        clients.append(factory(config["execution_name"], ACCOUNT))
+        proxy = RedisShmReadOnlyProxy(transport, clients[0], clients[1],
+            expected_readonly_session_id=config["read_session_id"],
+            expected_execution_session_id=config["execution_session_id"],
+            expected_native_pid=config["native_pid"], timeout_seconds=config["timeout_seconds"],
+            max_requests=0, runtime_policy=config["runtime_policy"], allow_order_methods=True,
+            read_cache_capacity=config["read_cache_capacity"], write_ledger_capacity=config["write_ledger_capacity"],
+            expected_windows_session_id=config["windows_session"])
+        if config["start_write_blocked"]:
+            proxy._block_writes("OPERATOR_WRITE_DISABLED")
+        proxy.verify_identity()
+        result.update(proxy.reconcile_unknown_write(plan["request_id"], plan["order_sys_id"], plan["order_identity"],
+                      expected_record=plan.get("expected_record"), operator=plan.get("operator"), apply=apply))
+        if not apply:
+            result["apply_plan"] = dict(plan, expected_record=result["expected_record"], operator="")
+    except Exception as exc:
+        result.update(status="FAILED", error_type=type(exc).__name__,
+                      error_message=_safe_message(exc, config["redis"]))
+    finally:
+        if proxy is not None:
+            try:
+                proxy.close()
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+        for client in clients:
+            try:
+                client.close()
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+        if redis_client is not None:
+            try:
+                redis_client.connection_pool.disconnect()
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+        result.update(cleanup_errors=errors, resources_closed=not errors, runtime_running=False)
+        if errors:
+            result["status"] = "UNKNOWN"
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="当次双SHM来源与Redis目标JSON，不执行配置代码")
-    parser.add_argument("--run", action="store_true", help="仅在另获实机授权后显式运行；默认dry-run")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--run", action="store_true", help="仅在另获实机授权后显式运行；默认dry-run")
+    action.add_argument("--inspect-reconciliation", action="store_true", help="已核实唯一旧代理退出后，只读核对精确RID，不更改账本")
+    action.add_argument("--apply-reconciliation", action="store_true", help="仅显式CAS已预览的精确UNKNOWN记录，不重发订单")
+    parser.add_argument("--reconcile-plan", type=Path, help="精确RID/合同/原订单身份及可选预览原记录的JSON")
     args = parser.parse_args(argv)
+    config = {}
     try:
         config = validate_config(json.loads(args.config.read_text(encoding="utf-8-sig")))
-        if args.run:
+        plan = (validate_reconciliation_plan(json.loads(args.reconcile_plan.read_text(encoding="utf-8-sig")),
+                    apply=args.apply_reconciliation) if args.reconcile_plan is not None else None)
+        if (args.inspect_reconciliation or args.apply_reconciliation) and plan is None:
+            raise ValueError("explicit reconciliation JSON plan required")
+        if args.run and plan is not None:
+            raise ValueError("normal queue runner cannot be combined with reconciliation")
+        if args.inspect_reconciliation or args.apply_reconciliation:
+            result = run_reconciliation(config, plan, apply=args.apply_reconciliation)
+        elif args.run:
             result = run_candidate(config)
         else:
             result = dict(status="DRY_RUN", account_id=ACCOUNT, allow_order_methods=config["allow_order_methods"],
@@ -264,11 +385,13 @@ def main(argv=None):
                           start_write_blocked=config["start_write_blocked"],
                           native_pid=config["native_pid"], windows_session=config["windows_session"],
                           max_seconds=config["max_seconds"], max_requests=config["max_requests"],
-                          connections_created=0, full_duration_acceptance_proved=False)
+                          connections_created=0, full_duration_acceptance_proved=False,
+                          reconciliation_plan_validated=plan is not None, runtime_preflight_verified=False)
     except Exception as exc:
-        result = dict(status="FAILED", error_type=type(exc).__name__, automatic_retry=False)
+        result = dict(status="FAILED", error_type=type(exc).__name__, automatic_retry=False,
+                      error_message=_safe_message(exc, config.get("redis", {})))
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0 if result["status"] in ("DRY_RUN", "BOUNDED_STOP", "STOP_REQUESTED") else 1
+    return 0 if result["status"] in ("DRY_RUN", "BOUNDED_STOP", "STOP_REQUESTED", "RECONCILIATION_PREVIEW", "RECONCILED") else 1
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 # coding: utf-8
 """将独立只读邮箱适配为 Gateway 的同步 RPC 客户端。"""
 
+import datetime as _dt
 import math
 import threading
 import uuid
@@ -8,7 +9,7 @@ import uuid
 from .readonly_shm import ShmBusyError, ShmProtocolError, ShmReadOnlyClient, validate_name
 
 
-MARKET_RPC_METHODS = frozenset(("get_local_data", "get_market_data_ex", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"))
+MARKET_RPC_METHODS = frozenset(("get_local_data", "get_market_data_ex", "download_history_data", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"))
 
 
 READONLY_RPC_METHODS = frozenset((
@@ -81,24 +82,43 @@ class ShmReadOnlyRpcClient:
         allowed = {
             "get_local_data": {"account_id", "code", "period", "start_time", "end_time", "count", "divid_type"},
             "get_market_data_ex": {"account_id", "code", "period", "start_time", "end_time", "count", "dividend_type", "fill_data", "subscribe"},
+            "download_history_data": {"account_id", "code", "period", "start_time", "end_time", "incrementally"},
             "subscribe_quote": {"account_id", "code", "period", "dividend_type", "result_type"},
             "poll_quote_events": {"account_id", "after_sequence"},
             "unsubscribe_quote": {"account_id", "subscription_id"},
         }[method]
         if set(values) - allowed:
             raise ShmProtocolError("unsupported market parameter")
-        if method in ("get_local_data", "get_market_data_ex", "subscribe_quote"):
+        if method in ("get_local_data", "get_market_data_ex", "download_history_data", "subscribe_quote"):
             ShmReadOnlyRpcClient._quote_params({"code": values.get("code")})
         if method in ("get_local_data", "get_market_data_ex"):
             start, end, count = values.get("start_time"), values.get("end_time"), values.get("count")
-            if (values.get("period") not in ("1m", "1d") or values.get("divid_type", "none") != "none"
-                    or type(count) is not int or not 1 <= count <= 10
-                    or any(not isinstance(v, str) or len(v) != 14 or not v.isdigit() for v in (start, end)) or start > end):
+            if (values.get("period") not in ("1m", "5m", "15m", "30m", "60m", "1d", "tick")
+                    or values.get("divid_type", "none") != "none" or type(count) is not int or not 1 <= count <= 10000
+                    or any(not isinstance(v, str) or v and (len(v) != 14 or not v.isdigit()) for v in (start, end))
+                    or start and end and start > end):
                 raise ShmProtocolError("history requires bounded period, times and count")
+            for value in (start, end):
+                if value:
+                    try:
+                        _dt.datetime.strptime(value, "%Y%m%d%H%M%S")
+                    except ValueError:
+                        raise ShmProtocolError("history timestamp is invalid")
             if method == "get_market_data_ex" and (
-                    start[:8] != end[:8] or values.get("dividend_type", "none") != "none"
-                    or values.get("fill_data") is not False or values.get("subscribe") is not False):
-                raise ShmProtocolError("native cached history requires one day and fill_data/subscribe=False")
+                    values.get("dividend_type", "none") != "none"
+                    or type(values.get("fill_data")) is not bool or values.get("subscribe") is not False):
+                raise ShmProtocolError("native cached history requires explicit fill_data and subscribe=False")
+        elif method == "download_history_data":
+            start, end = values.get("start_time"), values.get("end_time")
+            if (values.get("period") not in ("tick", "1m", "5m", "1d")
+                    or type(values.get("incrementally")) not in (bool, type(None))
+                    or any(not isinstance(v, str) or len(v) != 8 or not v.isdigit() for v in (start, end))
+                    or start != end):
+                raise ShmProtocolError("download requires one explicit trading day and supported period")
+            try:
+                _dt.datetime.strptime(start, "%Y%m%d")
+            except ValueError:
+                raise ShmProtocolError("download trading day is invalid")
         elif method == "subscribe_quote":
             if (values.get("period", "tick") != "tick" or values.get("dividend_type", "none") != "none"
                     or values.get("result_type", "dict") != "dict"):

@@ -65,6 +65,136 @@ def test_default_cli_dry_run_never_constructs_connections_or_prints_credentials(
     denied.assert_not_called()
 
 
+def reconciliation_plan():
+    return dict(request_id="4644075e811a4e2e942782ad0f2e930a", order_sys_id="1258",
+                stopped_proxy_pid=11092,
+                order_identity=dict(user_order_id="CO-original", stock_code="000001.SZ",
+                                    action="BUY", volume=100, price=11.12))
+
+
+def test_reconciliation_cli_default_is_offline_and_apply_requires_exact_preview(tmp_path, monkeypatch, capsys):
+    path, plan_path = tmp_path / "config.json", tmp_path / "plan.json"
+    value = config(runtime_policy="PERSISTENT_SIMULATION_READ_WRITE", allow_order_methods=True,
+                   source_deadline_unix=None, max_seconds=0, max_requests=0)
+    path.write_text(json.dumps(value))
+    plan_path.write_text(json.dumps(reconciliation_plan()))
+    denied = mock.Mock(side_effect=AssertionError("offline reconciliation dry-run must not connect"))
+    monkeypatch.setattr(RUNNER, "run_reconciliation", denied)
+    monkeypatch.setattr(RUNNER, "create_redis_client", denied)
+    assert RUNNER.main(["--config", str(path), "--reconcile-plan", str(plan_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["connections_created"] == 0
+    assert RUNNER.main(["--config", str(path), "--reconcile-plan", str(plan_path), "--apply-reconciliation"]) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "FAILED"
+    denied.assert_not_called()
+
+
+def reconciliation_fixture():
+    value = config(runtime_policy="PERSISTENT_SIMULATION_READ_WRITE", allow_order_methods=True,
+                   native_pid=2852, source_deadline_unix=None, max_seconds=0, max_requests=0,
+                   start_write_blocked=True)
+    provider = PROXY_FIXTURES.FakeRedis()
+    provider.connection_pool = SimpleNamespace(disconnect=mock.Mock())
+    identity = reconciliation_plan()["order_identity"]
+    snapshot = PROXY_FIXTURES.complete_execution_snapshot(dict(account_id="55013746",
+        orders=[dict(identity, order_sys_id="1258", status="54", traded_volume=0, order_time=int(time.time()))], trades=[]),
+        session_id=value["execution_session_id"])
+    clients = []
+
+    def factory(name, account):
+        route = "readonly" if name == value["read_name"] else "execution"
+        client = PROXY_FIXTURES.FakeRawClient(route)
+        client.mailbox.session_id = value["read_session_id" if route == "readonly" else "execution_session_id"]
+        client.runtime_policy = "PERSISTENT_READONLY" if route == "readonly" else value["runtime_policy"]
+        client.allow_order_methods = route == "execution"
+        client.result = snapshot
+        clients.append(client)
+        return client
+
+    seed_read, seed_exec = factory(value["read_name"], "55013746"), factory(value["execution_name"], "55013746")
+    seed = RUNNER.RedisShmReadOnlyProxy(PROXY_FIXTURES.RedisTransport(provider, account_id="55013746"),
+        seed_read, seed_exec, expected_readonly_session_id=value["read_session_id"],
+        expected_execution_session_id=value["execution_session_id"], expected_native_pid=2852,
+        runtime_policy=value["runtime_policy"], allow_order_methods=True, max_requests=0)
+    seed.verify_identity()
+    seed_exec.result = dict(status="UNKNOWN", automatic_retry=False)
+    original = PROXY_FIXTURES.request("submit_order", rid=reconciliation_plan()["request_id"],
+        params=dict(stock_code="000001.SZ", action="BUY", volume=100, price=11.12, remark="CO-original"))
+    original["expected_source_binding"] = seed.identity_snapshot()["source_binding"]
+    seed.process_request(original)
+    seed.close()
+    clients.clear()
+    return value, provider, clients, factory
+
+
+def test_reconciliation_runner_only_queries_native_and_preserves_operator_block(monkeypatch):
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    monkeypatch.setattr(RUNNER, "confirmed_proxy_stopped", lambda pid: pid == 11092)
+    value, provider, clients, factory = reconciliation_fixture()
+    before = json.dumps(provider.hashes, sort_keys=True)
+    preview = RUNNER.run_reconciliation(value, reconciliation_plan(), redis_factory=lambda target: provider, shm_factory=factory)
+    assert preview["status"] == "RECONCILIATION_PREVIEW" and preview["resources_closed"]
+    assert json.dumps(provider.hashes, sort_keys=True) == before
+    assert all(call[0]["method"] in ("ping", "query_execution_snapshot") for client in clients for call in client.calls)
+    assert all(client.closed for client in clients)
+    apply_plan = dict(preview["apply_plan"], operator="human-reviewed")
+    result = RUNNER.run_reconciliation(value, apply_plan, apply=True,
+                                      redis_factory=lambda target: provider, shm_factory=factory)
+    assert result["status"] == "RECONCILED" and result["ledger_records_written"] == 1
+    assert result["native_write_calls"] == 0 and result["writes_blocked"]
+    assert result["write_block_reason"] == "OPERATOR_WRITE_DISABLED"
+    record = json.loads(next(iter(provider.hashes.values()))[apply_plan["request_id"]])
+    assert record["response"]["status"] == "UNKNOWN" and record["state"] == "RECONCILED"
+    provider.connection_pool.disconnect.assert_has_calls([mock.call(), mock.call()])
+
+
+def test_reconciliation_runner_rejects_foreign_session_before_any_connection(monkeypatch):
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 2)
+    value = config(runtime_policy="PERSISTENT_SIMULATION_READ_WRITE", allow_order_methods=True,
+                   source_deadline_unix=None, max_seconds=0, max_requests=0)
+    denied = mock.Mock()
+    with pytest.raises(RuntimeError, match="share"):
+        RUNNER.run_reconciliation(value, reconciliation_plan(), redis_factory=denied, shm_factory=denied)
+    denied.assert_not_called()
+
+
+def test_reconciliation_runner_rejects_live_or_unidentified_proxy_before_connections(monkeypatch):
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    stopped = mock.Mock(return_value=False)
+    monkeypatch.setattr(RUNNER, "confirmed_proxy_stopped", stopped)
+    value = config(runtime_policy="PERSISTENT_SIMULATION_READ_WRITE", allow_order_methods=True,
+                   source_deadline_unix=None, max_seconds=0, max_requests=0)
+    denied = mock.Mock()
+    with pytest.raises(RuntimeError, match="unique old proxy"):
+        RUNNER.run_reconciliation(value, reconciliation_plan(), redis_factory=denied, shm_factory=denied)
+    without_pid = reconciliation_plan()
+    without_pid.pop("stopped_proxy_pid")
+    with pytest.raises(ValueError, match="stopped_proxy_pid"):
+        RUNNER.run_reconciliation(value, without_pid, redis_factory=denied, shm_factory=denied)
+    denied.assert_not_called()
+
+
+@pytest.mark.parametrize("corruption", ["session", "pid", "partial_evidence"])
+def test_explicit_legacy_shm_factory_cannot_bypass_source_or_fact_validation(monkeypatch, corruption):
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    monkeypatch.setattr(RUNNER, "confirmed_proxy_stopped", lambda pid: pid == 11092)
+    value, provider, _, factory = reconciliation_fixture()
+    before = json.dumps(provider.hashes, sort_keys=True)
+    def explicit_factory(name, account):
+        client = factory(name, account)
+        if name == value["execution_name"]:
+            if corruption == "session":
+                client.mailbox.session_id = "old-or-foreign-session"
+            elif corruption == "pid":
+                client.mailbox.server_pid = 999
+            else:
+                client.result["orders_source_evidence"]["complete"] = False
+        return client
+    result = RUNNER.run_reconciliation(value, reconciliation_plan(),
+                redis_factory=lambda target: provider, shm_factory=explicit_factory)
+    assert result["status"] == "FAILED" and result["ledger_records_written"] == 0
+    assert json.dumps(provider.hashes, sort_keys=True) == before
+
+
 def test_source_or_relative_budget_too_short_rejects_before_factories(monkeypatch):
     monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
     factory = mock.Mock(side_effect=AssertionError("insufficient budget must not create resources"))

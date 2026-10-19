@@ -30,7 +30,7 @@ CODE = "000001.SZ"
 
 class State:
     def __init__(self):
-        self.data = bytearray(270400)
+        self.data = bytearray(64 + 8192 + 8 * 1024 * 1024)
         self.lock = threading.Lock()
         self.regions = []
 
@@ -533,6 +533,7 @@ def test_actual_generated_write_submit_exact_cancel_events_and_source_evidence(m
     events = h.call("execution", "poll_execution_events", {"after_sequence": 0})["data"]
     assert events["events"][0]["event"]["order_sys_id"] == "SIM-FIXTURE-001"
     refs = dict(order_sys_id="SIM-FIXTURE-001", user_order_id="fixed-local-sim")
+    h.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge.handlers.order_settle_timeout_seconds = 0.005
     cancelled = h.call("execution", "cancel_order", refs, request_id="fixed-local-cancel")
     assert cancelled["data"]["status"] == "UNKNOWN" and cancelled["data"]["automatic_retry"] is False
     assert h.call("execution", "cancel_order", refs, request_id="fixed-local-cancel")["data"] == cancelled["data"]
@@ -678,3 +679,28 @@ def test_explicit_persistent_simulation_cli_generates_reviewable_read_write_cand
     assert read["_SERVER"] is execution["_SERVER"] is None
     for payload in namespace["_SOURCE_PAYLOADS"].values():
         ast.parse(base64.b64decode(payload).decode("utf-8"), feature_version=(3, 6))
+
+
+@pytest.mark.parametrize("native_available", [False, True])
+def test_dual_generated_history_download_capability_follows_actual_native_injection(monkeypatch, native_available):
+    h = Fixture(monkeypatch, **read_write_settings(enable_market_rpc=True))
+    _, submit, cancel = _enable_fixture_simulation_orders(h)
+    downloader = mock.Mock(return_value=None)
+    if native_available:
+        h.namespace["download_history_data"] = downloader
+    h.start()
+    ping = h.call("read", "ping")["data"]
+    assert ("download_history_data" in ping["capabilities"]) is native_available
+    response = h.call("read", "download_history_data", dict(code="000002.SZ", period="tick",
+        start_time="20261016", end_time="20261016", incrementally=None))
+    if native_available:
+        assert response["ok"] and response["data"]["status"] == "REQUESTED"
+        assert response["data"]["completion_confirmed"] is False
+        assert response["data"]["session_id"] == ping["session_id"]
+        downloader.assert_called_once_with("000002.SZ", "tick", "20261016", "20261016")
+    else:
+        assert response["ok"] is False and response["server_error"] == "CAPABILITY_MISSING"
+        downloader.assert_not_called()
+    submit.assert_not_called()
+    cancel.assert_not_called()
+    h.close()

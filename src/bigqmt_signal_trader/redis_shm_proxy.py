@@ -28,6 +28,8 @@ EXECUTION_METHODS = frozenset((
 QUOTE_METHODS = frozenset(("get_ticks", "get_full_tick"))
 RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMULATION_READ_WRITE"))
 _WRITE_LEDGER_KEY = "aqp:redis_shm:write_ledger:55013746:v1"
+# 柜台订单秒精度时钟与代理本机时钟不同；1258真实样本偏差为-3.049735秒。
+_BROKER_PROXY_CLOCK_TOLERANCE_SECONDS = 5.0
 _CLAIM_WRITE = """
 local prior = redis.call('HGET', KEYS[1], ARGV[1])
 if prior then return {0, prior} end
@@ -122,6 +124,7 @@ class RedisShmReadOnlyProxy:
         self._capabilities = frozenset()
         self._writes_blocked = False
         self._write_block_reason = ""
+        self._operator_write_blocked = False
         self._write_record_count = 0
         self._operation_phase = "INITIALIZED"
         self._request_context = {}
@@ -212,6 +215,8 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("request expected_source_binding must exactly match the verified native sources")
 
     def _block_writes(self, reason):
+        if reason == "OPERATOR_WRITE_DISABLED":
+            self._operator_write_blocked = True
         self._writes_blocked = True
         self._write_block_reason = self._write_block_reason or reason
 
@@ -230,9 +235,11 @@ class RedisShmReadOnlyProxy:
                     or not isinstance(record.get("fingerprint"), str)
                     or not isinstance(record.get("binding"), dict)
                     or record["binding"].get("account_id") != self.account_id
-                    or record.get("state") not in ("CLAIMED", "CONFIRMED", "UNKNOWN", "PUBLISH_PENDING", "PUBLISH_UNCONFIRMED")):
+                    or record.get("state") not in ("CLAIMED", "CONFIRMED", "UNKNOWN", "PUBLISH_PENDING", "PUBLISH_UNCONFIRMED", "RECONCILED")):
                 raise ShmProtocolError("persistent write ledger identity is malformed")
-            if record["state"] != "CONFIRMED":
+            if record["state"] == "RECONCILED":
+                self._validate_reconciled_record(record)
+            elif record["state"] != "CONFIRMED":
                 self._block_writes("PERSISTED_WRITE_UNCONFIRMED")
 
     def _validate_identity_data(self, route, data):
@@ -431,9 +438,10 @@ class RedisShmReadOnlyProxy:
             if (not isinstance(prior, dict) or prior.get("request_id") != request["request_id"]
                     or prior.get("fingerprint") != fingerprint or prior.get("binding") != record["binding"]):
                 raise ShmProtocolError("persisted write RID has conflicting parameters or source binding")
-            if prior.get("state") == "CONFIRMED" and isinstance(prior.get("response"), dict):
-                self._check_response(request, prior["response"], self._sessions["execution"])
-                return None, copy.deepcopy(prior["response"])
+            replay = prior.get("reconciled_response") if prior.get("state") == "RECONCILED" else prior.get("response")
+            if prior.get("state") in ("CONFIRMED", "RECONCILED") and isinstance(replay, dict):
+                self._check_response(request, replay, self._sessions["execution"])
+                return None, copy.deepcopy(replay)
             response = self._response(request, "prior write is unconfirmed; do not resend",
                                       "PERSISTED_WRITE_UNCONFIRMED", unknown=True)
             if isinstance(prior.get("response"), dict):
@@ -453,6 +461,348 @@ class RedisShmReadOnlyProxy:
                                      request["request_id"], reservation, encoded) != 1:
             raise ShmProtocolError("write settlement identity changed; do not resend")
         return encoded
+
+    def _reconciliation_record(self, request_id, expected_record=None):
+        """只读取精确 RID；旧请求、来源、原 UNKNOWN 必须完整保留。"""
+        self._request_id({"request_id": request_id})
+        encoded = self.transport.redis.hget(_WRITE_LEDGER_KEY, request_id)
+        if encoded is None:
+            raise ShmProtocolError("the exact write record does not exist")
+        encoded = decode_text(encoded)
+        if expected_record is not None and encoded != expected_record:
+            raise ShmProtocolError("write record changed since the explicit preview")
+        record = json.loads(encoded)
+        if (not isinstance(record, dict) or record.get("request_id") != request_id
+                or record.get("state") != "UNKNOWN" or record.get("binding") != self._write_binding()
+                or not isinstance(record.get("token"), str) or not record["token"]
+                or not isinstance(record.get("response"), dict)):
+            raise ShmProtocolError("only the original UNKNOWN record on the same verified sources may be reconciled")
+        original = json.loads(record.get("fingerprint", ""))
+        if (not isinstance(original, list) or len(original) != 4 or type(original[0]) is not int
+                or original[:2] != [1, self.account_id]
+                or original[2] not in ("submit_order", "cancel_order") or not isinstance(original[3], dict)):
+            raise ShmProtocolError("single submit/cancel fingerprint required; batch recovery is unavailable")
+        response = record["response"]
+        if (response.get("request_id") != request_id or response.get("account_id") != self.account_id
+                or response.get("method") != original[2] or response.get("status") != "UNKNOWN"):
+            raise ShmProtocolError("original UNKNOWN response identity mismatch")
+        return encoded, record, original[2], original[3]
+
+    @staticmethod
+    def _validate_reconciliation_target(method, params, order_sys_id, order_identity):
+        if (not isinstance(order_sys_id, str) or not order_sys_id
+                or not isinstance(order_identity, dict) or set(order_identity) != {
+                    "user_order_id", "stock_code", "action", "volume", "price"}):
+            raise ShmProtocolError("explicit contract and complete original order identity required")
+        identity = dict(order_identity)
+        if (not isinstance(identity["user_order_id"], str) or not identity["user_order_id"]
+                or not isinstance(identity["stock_code"], str) or not identity["stock_code"]
+                or identity["action"] not in ("BUY", "SELL") or type(identity["volume"]) is not int
+                or identity["volume"] <= 0 or type(identity["price"]) not in (int, float)
+                or not math.isfinite(identity["price"]) or identity["price"] <= 0):
+            raise ShmProtocolError("invalid original order identity")
+        if method == "submit_order":
+            tag = str(params.get("remark") or params.get("order_remark") or "").strip()
+            if not tag and params.get("signal_id"):
+                tag = "bqrpc:%s" % params["signal_id"]
+            expected = dict(user_order_id=tag, stock_code=params.get("stock_code"),
+                            action=params.get("action"), volume=params.get("volume", params.get("order_volume")),
+                            price=params.get("price"))
+            if expected != identity:
+                raise ShmProtocolError("preview identity does not exactly match original submit parameters/remark")
+        elif (str(params.get("order_sys_id") or params.get("order_sysid") or params.get("order_id") or "") != order_sys_id
+                or params.get("user_order_id") != identity["user_order_id"]):
+            raise ShmProtocolError("preview contract/remark does not match original cancel parameters")
+        return identity
+
+    @staticmethod
+    def _evidence_timestamp(value):
+        if not isinstance(value, str) or not value.endswith(("+00:00", "Z")):
+            raise ShmProtocolError("native query evidence requires an explicit UTC timestamp")
+        text = value[:-6] if value.endswith("+00:00") else value[:-1]
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.datetime.strptime(text, fmt).replace(tzinfo=datetime.timezone.utc).timestamp()
+            except ValueError:
+                pass
+        raise ShmProtocolError("native query evidence timestamp is invalid")
+
+    def _validate_reconciliation_snapshot(self, method, params, order_sys_id, order_identity,
+                                          data, claimed_at, query_started_at, observed_at, source_binding):
+        identity = self._validate_reconciliation_target(method, params, order_sys_id, order_identity)
+        if (not isinstance(source_binding, dict) or set(source_binding) != {
+                "read_session_id", "execution_session_id", "native_pid", "windows_session_id"}
+                or any(not isinstance(source_binding.get(key), str) or not source_binding[key]
+                       for key in ("read_session_id", "execution_session_id"))
+                or source_binding["read_session_id"] == source_binding["execution_session_id"]
+                or type(source_binding.get("native_pid")) is not int or source_binding["native_pid"] <= 0
+                or type(source_binding.get("windows_session_id")) is not int or source_binding["windows_session_id"] < 0):
+            raise ShmProtocolError("native evidence requires a complete original dual-source binding")
+        for timestamp in (claimed_at, query_started_at, observed_at):
+            if type(timestamp) not in (int, float) or not math.isfinite(timestamp) or timestamp <= 0:
+                raise ShmProtocolError("original claim and native query timestamps are required")
+        if not claimed_at <= observed_at or not query_started_at <= observed_at <= query_started_at + 60:
+            raise ShmProtocolError("native evidence observation falls outside its query deadline")
+        if (not isinstance(data, dict) or data.get("account_id") != self.account_id
+                or not isinstance(data.get("orders"), list) or not isinstance(data.get("trades"), list)
+                or len(data["orders"]) > 10000 or len(data["trades"]) > 10000):
+            raise ShmProtocolError("native full-account snapshot is missing or exceeds the recovery bound")
+        try:
+            evidence_bytes = json.dumps(data, sort_keys=True, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ShmProtocolError("native recovery evidence is not finite JSON data") from exc
+        if len(evidence_bytes) > 2 * 1024 * 1024:
+            raise ShmProtocolError("native recovery evidence exceeds the fixed 2 MiB record bound")
+        counts = []
+        for key, kind, rows in (("orders_source_evidence", "ORDER", data["orders"]),
+                                ("trades_source_evidence", "DEAL", data["trades"])):
+            evidence = data.get(key)
+            if (not isinstance(evidence, dict) or type(evidence.get("contract_version")) is not int
+                    or evidence["contract_version"] != 1 or evidence.get("account_id") != self.account_id
+                    or evidence.get("account_type") != "STOCK" or evidence.get("detail_type") != kind
+                    or evidence.get("source") != "native_get_trade_detail_data"
+                    or evidence.get("strategy_name") != "" or evidence.get("complete") is not True
+                    or evidence.get("status") != ("OK" if rows else "EMPTY")
+                    or evidence.get("error_code") not in (None, "")
+                    or evidence.get("unknown_fields") != [] or evidence.get("row_errors") != []
+                    or any(type(evidence.get(field)) is not int or evidence[field] != len(rows)
+                           for field in ("raw_row_count", "converted_row_count", "returned_row_count"))
+                    or any(type(evidence.get(field)) is not int or evidence[field] != 0
+                           for field in ("skipped_row_count", "duplicate_row_count"))):
+                raise ShmProtocolError("native order/deal completeness evidence is missing or inconsistent")
+            if (evidence.get("session_id") != source_binding["execution_session_id"]
+                    or type(evidence.get("native_pid")) is not int
+                    or evidence["native_pid"] != source_binding["native_pid"]
+                    or type(evidence.get("windows_session_id")) is not int
+                    or evidence["windows_session_id"] != source_binding["windows_session_id"]):
+                raise ShmProtocolError("native order/deal evidence source identity differs from the original session")
+            when = self._evidence_timestamp(evidence.get("queried_at"))
+            if not query_started_at - 1 <= when <= observed_at + 1:
+                raise ShmProtocolError("native order/deal query evidence is stale or future")
+            counts.append(len(rows))
+        aggregate = data.get("source_evidence")
+        if (not isinstance(aggregate, dict) or type(aggregate.get("contract_version")) is not int
+                or aggregate["contract_version"] != 1 or aggregate.get("account_id") != self.account_id
+                or aggregate.get("source") != "native_ORDER_DEAL_queries" or aggregate.get("complete") is not True
+                or aggregate.get("status") != "OK" or aggregate.get("error_code") not in (None, "")
+                or any(type(aggregate.get(field)) is not int or aggregate[field] != sum(counts)
+                       for field in ("raw_row_count", "returned_row_count"))
+                or aggregate.get("queried_at") != data["trades_source_evidence"]["queried_at"]):
+            raise ShmProtocolError("native aggregate snapshot completeness evidence is inconsistent")
+        if (aggregate.get("session_id") != source_binding["execution_session_id"]
+                or type(aggregate.get("native_pid")) is not int or aggregate["native_pid"] != source_binding["native_pid"]
+                or type(aggregate.get("windows_session_id")) is not int
+                or aggregate["windows_session_id"] != source_binding["windows_session_id"]):
+            raise ShmProtocolError("native aggregate evidence source identity differs from the original session")
+        related = lambda row: (row.get("order_sys_id") == order_sys_id
+                               or row.get("user_order_id") == identity["user_order_id"])
+        if any(not isinstance(row, dict) or not isinstance(row.get("order_sys_id"), str)
+               or not row["order_sys_id"] or not isinstance(row.get("user_order_id"), str)
+               for row in data["orders"] + data["trades"]):
+            raise ShmProtocolError("native snapshot contains malformed rows")
+        orders = [row for row in data["orders"] if related(row)]
+        trades = [row for row in data["trades"] if related(row)]
+        if len(orders) != 1:
+            raise ShmProtocolError("the exact contract/remark must identify one native order")
+        order = orders[0]
+        for row in orders + trades:
+            if (row.get("account_id", self.account_id) != self.account_id
+                    or row.get("order_sys_id") != order_sys_id
+                    or any(row.get(field) != identity[field] for field in ("user_order_id", "stock_code", "action"))):
+                raise ShmProtocolError("native contract/remark/account/order identity conflict")
+        price = order.get("price")
+        if (type(order.get("volume")) is not int or order["volume"] != identity["volume"]
+                or type(price) not in (int, float) or not math.isfinite(price)
+                or not math.isclose(price, identity["price"], rel_tol=0.0, abs_tol=1e-8)):
+            raise ShmProtocolError("native quantity/limit price differs from the original order")
+        status, filled = order.get("status"), order.get("traded_volume")
+        if (status not in ("53", "54", "56", "57") or type(filled) is not int
+                or not 0 <= filled <= identity["volume"]
+                or (status in ("54", "57") and filled != 0)
+                or (status == "53" and not 0 < filled < identity["volume"])
+                or (status == "56" and filled != identity["volume"])):
+            raise ShmProtocolError("native order is not an unambiguous cancelled/rejected/filled terminal result")
+        shanghai = datetime.timezone(datetime.timedelta(hours=8))
+        order_time = order.get("order_time")
+        if (type(order_time) not in (int, float) or not math.isfinite(order_time) or order_time <= 0
+                or order_time > observed_at + 1
+                or (method == "submit_order" and order_time < claimed_at - _BROKER_PROXY_CLOCK_TOLERANCE_SECONDS)
+                or (method == "cancel_order" and order_time > claimed_at + 1)
+                or datetime.datetime.fromtimestamp(order_time, shanghai).date() !=
+                    datetime.datetime.fromtimestamp(claimed_at, shanghai).date()):
+            raise ShmProtocolError("native order event time does not match the original claim trading day")
+        seen, quantity = set(), 0
+        for trade in trades:
+            trade_id, volume, trade_price = trade.get("trade_id"), trade.get("volume"), trade.get("price")
+            trade_time = trade.get("traded_time")
+            if (not isinstance(trade_id, str) or not trade_id or trade_id in seen
+                    or type(volume) is not int or volume <= 0 or type(trade_price) not in (int, float)
+                    or not math.isfinite(trade_price) or trade_price <= 0
+                    or (identity["action"] == "BUY" and trade_price > identity["price"] + 1e-8)
+                    or (identity["action"] == "SELL" and trade_price < identity["price"] - 1e-8)
+                    or type(trade_time) not in (int, float) or not math.isfinite(trade_time)
+                    or not order_time <= trade_time <= observed_at + 1
+                    or datetime.datetime.fromtimestamp(trade_time, shanghai).date() !=
+                        datetime.datetime.fromtimestamp(claimed_at, shanghai).date()):
+                raise ShmProtocolError("native deal identity/quantity/price/time is invalid or duplicated")
+            seen.add(trade_id)
+            quantity += volume
+        if quantity != filled:
+            raise ShmProtocolError("native deal quantities do not close the terminal order")
+        return dict(order_sys_id=order_sys_id, order_identity=identity, order=copy.deepcopy(order),
+                    trades=copy.deepcopy(trades), terminal_verified=True,
+                    request_result="BROKER_ORDER_FOUND" if method == "submit_order" else
+                        ("CANCEL_CONFIRMED" if status in ("53", "54") else "ORDER_TERMINAL_CANCEL_NOT_PROVEN"),
+                    business_terminal_status=status, filled_volume=filled,
+                    broker_order_time_precision="seconds", clocks_assumed_identical=False,
+                    broker_proxy_clock_offset_seconds=order_time - claimed_at,
+                    broker_proxy_clock_tolerance_seconds=_BROKER_PROXY_CLOCK_TOLERANCE_SECONDS,
+                    snapshot=copy.deepcopy(data), original_claimed_at_unix=claimed_at,
+                    query_started_at_unix=query_started_at, observed_at_unix=observed_at)
+
+    def _terminal_reconciliation_proof(self, method, params, order_sys_id, order_identity, claimed_at):
+        """新请求只读原生完整账户订单/成交；不接受外部传入的订单证明。"""
+        self._validate_reconciliation_target(method, params, order_sys_id, order_identity)
+        for route in self._clients:
+            self._check_client(route)
+        now = time.time()
+        query = dict(schema_version=1, request_id=uuid.uuid4().hex, account_id=self.account_id,
+                     method="query_execution_snapshot", params=dict(account_id=self.account_id,
+                         order_strategy_name="", trade_strategy_name=""),
+                     read_expires_at_unix=now + self.timeout_seconds)
+        response = self._clients["execution"].send_request(query, timeout_seconds=self.timeout_seconds)
+        for route in self._clients:
+            self._check_client(route)
+        self._check_response(query, response, self._sessions["execution"])
+        if time.time() >= query["read_expires_at_unix"] or not response["ok"] or response.get("status") == "UNKNOWN":
+            raise ShmProtocolError("fresh native execution snapshot was not confirmed")
+        proof = self._validate_reconciliation_snapshot(method, params, order_sys_id, order_identity,
+                    response["data"], claimed_at, now, time.time(), self._source_binding())
+        proof.update(source_binding=self._source_binding(), evidence_request_id=query["request_id"],
+                     evidence_sequence=response["sequence"])
+        return proof
+
+    def _validate_reconciled_record(self, record):
+        """启动只信完整保存事实；RECONCILED 标签或布尔值本身不解除停写。"""
+        proof, original, replay = record.get("reconciliation"), record.get("response"), record.get("reconciled_response")
+        if (not isinstance(proof, dict) or proof.get("original_state") != "UNKNOWN"
+                or proof.get("terminal_verified") is not True or not isinstance(original, dict)
+                or record.get("automatic_retry") is not False
+                or not isinstance(record.get("token"), str) or not record["token"]
+                or record["binding"].get("runtime_policy") != "PERSISTENT_SIMULATION_READ_WRITE"
+                or record["binding"].get("allow_order_methods") is not True
+                or proof.get("original_result") != original or original.get("status") != "UNKNOWN"
+                or original.get("automatic_retry") is not False
+                or original.get("request_id") != record.get("request_id")
+                or original.get("account_id") != self.account_id or not isinstance(replay, dict)
+                or not isinstance(proof.get("operator"), str) or not proof["operator"].strip()
+                or type(proof.get("reconciled_at_unix")) not in (int, float)
+                or not math.isfinite(proof["reconciled_at_unix"])
+                or proof.get("original_claimed_at_unix") != record.get("claimed_at_unix")
+                or not isinstance(proof.get("source_binding"), dict)
+                or any(proof["source_binding"].get(field) != record["binding"].get(field)
+                       for field in ("read_session_id", "execution_session_id", "native_pid", "windows_session_id"))
+                or not isinstance(proof.get("evidence_request_id"), str) or not proof["evidence_request_id"]
+                or type(proof.get("evidence_sequence")) is not int or proof["evidence_sequence"] <= 0):
+            raise ShmProtocolError("persistent reconciliation has incomplete original result/source/evidence")
+        fingerprint = json.loads(record["fingerprint"])
+        if (not isinstance(fingerprint, list) or len(fingerprint) != 4
+                or type(fingerprint[0]) is not int or fingerprint[:2] != [1, self.account_id]
+                or fingerprint[2] not in ("submit_order", "cancel_order") or not isinstance(fingerprint[3], dict)
+                or original.get("method") != fingerprint[2]):
+            raise ShmProtocolError("persistent reconciliation original fingerprint is invalid")
+        validated = self._validate_reconciliation_snapshot(fingerprint[2], fingerprint[3],
+            proof.get("order_sys_id"), proof.get("order_identity"), proof.get("snapshot"),
+            record.get("claimed_at_unix"), proof.get("query_started_at_unix"), proof.get("observed_at_unix"),
+            proof.get("source_binding"))
+        if any(proof.get(field) != value for field, value in validated.items()):
+            raise ShmProtocolError("persistent reconciliation facts conflict with its saved native evidence")
+        if not proof["observed_at_unix"] <= proof["reconciled_at_unix"]:
+            raise ShmProtocolError("persistent reconciliation apply time predates observation")
+        expected_data = dict(status="RECONCILED", order_sys_id=proof["order_sys_id"],
+                             user_order_id=proof["order_identity"]["user_order_id"],
+                             request_result=proof["request_result"], business_terminal_status=proof["business_terminal_status"],
+                             filled_volume=proof["filled_volume"], automatic_retry=False)
+        if (replay.get("status") != "RECONCILED" or replay.get("ok") is not True
+                or replay.get("automatic_retry") is not False
+                or replay.get("data") != expected_data or replay.get("source_binding") != proof["source_binding"]
+                or replay.get("sequence") != proof["evidence_sequence"]
+                or replay.get("session_id") != record["binding"].get("execution_session_id")):
+            raise ShmProtocolError("persistent reconciliation replay differs from saved facts")
+        self._check_response(dict(schema_version=1, request_id=record["request_id"], account_id=self.account_id,
+                                  method=fingerprint[2]), replay, record["binding"]["execution_session_id"])
+
+    def reconcile_unknown_write(self, request_id, order_sys_id, order_identity, *,
+                                expected_record=None, operator=None, apply=False):
+        """显式单 RID 核对。默认只读预览；apply 仅 CAS 原账本，不发业务消息。
+
+        终态核对不把原提交改为 CONFIRMED，也不宣称 OMS 回报已经落地。
+        """
+        if not self._lock.acquire(False):
+            raise ShmProtocolError("proxy already has an in-flight operation")
+        try:
+            self._ensure_open()
+            if not self._verified or not self.allow_order_methods:
+                raise ShmProtocolError("verified simulation read/write sources are required")
+            if type(apply) is not bool or (apply and (not isinstance(expected_record, str) or not expected_record
+                    or not isinstance(operator, str) or not operator.strip() or len(operator) > 128)):
+                raise ShmProtocolError("apply requires exact previewed record and explicit operator")
+            encoded, record, method, params = self._reconciliation_record(request_id, expected_record)
+            proof = self._terminal_reconciliation_proof(method, params, order_sys_id, order_identity,
+                                                        record.get("claimed_at_unix"))
+            if decode_text(self.transport.redis.hget(_WRITE_LEDGER_KEY, request_id)) != encoded:
+                raise ShmProtocolError("write record changed during native evidence collection")
+            preview = dict(status="RECONCILIATION_PREVIEW", request_id=request_id, account_id=self.account_id,
+                           expected_record=encoded, proof=proof, ledger_records_written=0,
+                           native_write_calls=0, original_result_preserved=True, oms_terminal_proven=False)
+            if not apply:
+                return preview
+            reconciled = copy.deepcopy(record)
+            reconciled.update(state="RECONCILED", reconciliation=dict(proof, original_state=record["state"],
+                                original_result=copy.deepcopy(record["response"]), operator=operator.strip(),
+                                reconciled_at_unix=time.time()))
+            replay = copy.deepcopy(record["response"])
+            replay.update(status="RECONCILED", ok=True, error="", server_error="", automatic_retry=False,
+                          session_id=self._sessions["execution"], sequence=proof["evidence_sequence"],
+                          data=dict(status="RECONCILED", order_sys_id=order_sys_id,
+                                    user_order_id=order_identity["user_order_id"],
+                                    request_result=proof["request_result"],
+                                    business_terminal_status=proof["business_terminal_status"],
+                                    filled_volume=proof["filled_volume"], automatic_retry=False),
+                          source_binding=self._source_binding())
+            reconciled["reconciled_response"] = replay
+            replacement = json.dumps(reconciled, sort_keys=True, allow_nan=False, separators=(",", ":"))
+            try:
+                committed = self.transport.redis.eval(_SETTLE_WRITE, 1, _WRITE_LEDGER_KEY, request_id, encoded, replacement)
+            except Exception as exc:
+                self._block_writes("RECONCILIATION_COMMIT_UNCONFIRMED")
+                preview.update(status="UNKNOWN", ledger_records_written=None, automatic_retry=False,
+                               error="reconciliation CAS result is unknown: %s" % type(exc).__name__,
+                               writes_blocked=True, write_block_reason=self._write_block_reason)
+                return preview
+            if committed != 1:
+                raise ShmProtocolError("write reconciliation CAS rejected; do not retry automatically")
+            self._replays.pop(request_id, None)
+            # 只撤销已核销账本带来的门禁；人工停写和其他未知项继续生效。
+            if self._write_block_reason in ("PERSISTED_WRITE_UNCONFIRMED", "NATIVE_WRITE_RESULT_UNKNOWN"):
+                self._writes_blocked, self._write_block_reason = False, ""
+            if self._operator_write_blocked:
+                self._block_writes("OPERATOR_WRITE_DISABLED")
+            try:
+                if decode_text(self.transport.redis.hget(_WRITE_LEDGER_KEY, request_id)) != replacement:
+                    raise ShmProtocolError("reconciliation exact readback changed")
+                self._inspect_write_ledger()
+            except Exception as exc:
+                self._block_writes("RECONCILIATION_POSTCHECK_UNCONFIRMED")
+                preview.update(status="UNKNOWN", ledger_records_written=1, automatic_retry=False,
+                               error="reconciliation postcheck is unknown: %s" % type(exc).__name__,
+                               writes_blocked=True, write_block_reason=self._write_block_reason)
+                return preview
+            preview.update(status="RECONCILED", ledger_records_written=1,
+                           writes_blocked=self._writes_blocked, write_block_reason=self._write_block_reason)
+            return preview
+        finally:
+            self._lock.release()
 
     def _response(self, request, error, code, *, unknown=False):
         response = dict(schema_version=1, request_id=request.get("request_id"), account_id=self.account_id,

@@ -32,7 +32,7 @@ ACCOUNT = "SIM_TEST_ACCOUNT"
 
 class MemoryState:
     def __init__(self):
-        self.data = bytearray(270400)
+        self.data = bytearray(64 + 8192 + 8 * 1024 * 1024)
         self.lock = threading.Lock()
         self.views = []
 
@@ -483,7 +483,8 @@ class MailboxProtocolTest(BridgeFixture):
         self.assertEqual(bytes(self.state.data), before)
 
     def test_oversized_response_is_explicit_failure_not_truncated(self):
-        self.context.get_full_tick = lambda codes: {codes[0]: {"lastPrice": 11.57, "time": 1791874800000, "large": "x" * 270000}}
+        self.context.get_full_tick = lambda codes: {codes[0]: {"lastPrice": 11.57, "time": 1791874800000,
+            "large": "x" * (self.transport.RESPONSE_CAPACITY + 1024)}}
         response = self.roundtrip(self.client(), "get_full_tick", params={"codes": ["000001.SZ"]})
         self.assertFalse(response["ok"])
         self.assertEqual(response["server_error"], "RESPONSE_TOO_LARGE")
@@ -763,6 +764,20 @@ class Win32FailurePathTest(unittest.TestCase):
             self.transport.Win32Region(NAME, create=True, kernel=self.kernel)
         self.kernel.CloseHandle.assert_called_once_with(101)
 
+    def test_new_client_refuses_old_smaller_mapping_and_preserves_wire_offsets(self):
+        legacy_size = 64 + 8192 + 262144
+        self.assertEqual(self.transport.HEADER_SIZE, 64)
+        self.assertEqual(self.transport.REQUEST_OFFSET, 64)
+        self.assertEqual(self.transport.RESPONSE_OFFSET, 8256)
+        self.assertEqual(self.transport.RESPONSE_CAPACITY, 8 * 1024 * 1024)
+        self.kernel.MapViewOfFile.side_effect = lambda mapping, access, high, low, size: (
+            ctypes.addressof(self.buffer) if size <= legacy_size else None)
+        with self.assertRaisesRegex(self.transport.ShmNativeError, "MapViewOfFile"):
+            self.transport.Win32Region(NAME, create=False, kernel=self.kernel)
+        self.kernel.CreateFileMappingW.assert_not_called()
+        self.kernel.MapViewOfFile.assert_called_once_with(101, 6, 0, 0, self.transport.MAP_SIZE)
+        self.kernel.CloseHandle.assert_called_once_with(101)
+
     def test_mutex_creation_failure_releases_view_and_mapping(self):
         self.kernel.CreateMutexW.return_value = None
         with self.assertRaisesRegex(self.transport.ShmNativeError, "mutex open/create"):
@@ -1029,8 +1044,8 @@ class MarketRpcTest(BridgeFixture):
         self.assertEqual(self.history()["data"]["status"], "EMPTY")
         self.context.get_local_data.return_value = None
         self.assertEqual(self.history()["data"]["status"], "UNAVAILABLE")
-        for args in ({"count": 0}, {"count": True}, {"count": 11}, {"period": "tick"}, {"divid_type": "front"},
-                     {"code": "600000.SH"}, {"start_time": "20260230090000"}, {"download": True}):
+        for args in ({"count": 0}, {"count": True}, {"count": 10001}, {"period": "follow"}, {"divid_type": "front"},
+                     {"code": "bad"}, {"start_time": "20260230090000"}, {"download": True}):
             self.assertFalse(self.history(**args)["ok"])
         self.context.get_local_data.return_value = {1: {}, 2: {}, 3: {}}
         self.assertEqual(self.history()["server_error"], "HISTORY_SHAPE_INVALID")
