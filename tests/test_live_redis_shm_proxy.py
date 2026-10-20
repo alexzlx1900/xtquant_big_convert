@@ -101,7 +101,7 @@ def test_live_configuration_requires_explicit_environment_account_policy_and_ini
         RUNNER.validate_config(config(**changes))
 
 
-@pytest.mark.parametrize("field", ["environment", "start_write_blocked", "runtime_policy"])
+@pytest.mark.parametrize("field", ["environment", "runtime_policy"])
 def test_live_configuration_missing_permission_fields_is_rejected_offline(field):
     value = config()
     value.pop(field)
@@ -109,12 +109,71 @@ def test_live_configuration_missing_permission_fields_is_rejected_offline(field)
         RUNNER.validate_config(value)
 
 
-def test_live_proxy_constructor_cannot_omit_or_disable_initial_write_block():
-    for blocked in (False, None, 1):
+def test_live_proxy_constructor_cannot_disable_initial_write_block_without_authorization():
+    for blocked in (False, 1):
         with pytest.raises(ValueError, match="start_write_blocked"):
             make_proxy(start_write_blocked=blocked)
+    proxy, _, _, _ = make_proxy(start_write_blocked=None)
+    assert proxy.identity_snapshot()["writes_blocked"] is True
     with pytest.raises(ValueError, match="expected Windows session"):
         make_proxy(expected_windows_session_id=None)
+
+
+def test_live_default_authorization_and_restart_configuration_remain_write_blocked():
+    value = config()
+    value.pop("start_write_blocked")
+    parsed = RUNNER.validate_config(value)
+    assert parsed["start_write_blocked"] is True and parsed["live_write_authorized"] is False
+    for _ in range(2):
+        proxy, _, _, _ = make_proxy()
+        assert proxy.identity_snapshot()["write_ready"] is False
+
+
+@pytest.mark.parametrize("authorized", [None, 0, 1, "true"])
+def test_live_authorization_flag_is_strict_boolean(authorized):
+    with pytest.raises(ValueError, match="live_write_authorized"):
+        RUNNER.validate_config(config(live_write_authorized=authorized))
+    with pytest.raises(ValueError, match="live_write_authorized"):
+        make_proxy(live_write_authorized=authorized)
+
+
+def test_explicit_live_authorization_allows_future_configured_write_capability():
+    parsed = RUNNER.validate_config(config(live_write_authorized=True, start_write_blocked=False))
+    assert parsed["live_write_authorized"] is True and parsed["start_write_blocked"] is False
+    proxy, provider, _, execution = make_proxy(live_write_authorized=True, start_write_blocked=False)
+    assert proxy.identity_snapshot()["write_ready"] is True
+    execution.result = dict(status="SUBMITTED", order_sys_id="LIVE_FIXTURE_ONLY")
+    value = request("submit_order")
+    response = proxy.process_request(value)
+    assert response["ok"] is True and response["environment"] == "LIVE"
+    assert len(execution.calls) == 2
+    assert proxy.process_request(value) == response
+    assert len(execution.calls) == 2
+    record = json.loads(provider.hashes[LEDGER][value["request_id"]])
+    assert record["state"] == "CONFIRMED" and record["binding"]["environment"] == "LIVE"
+
+
+def test_explicit_authorization_cannot_override_unknown_ledger_on_restart():
+    proxy, provider, _, execution = make_proxy(live_write_authorized=True, start_write_blocked=False)
+    execution.result = dict(status="UNKNOWN", error="fixture native result unknown")
+    value = request("submit_order")
+    response = proxy.process_request(value)
+    assert response["status"] == "UNKNOWN" and len(execution.calls) == 2
+    assert proxy.identity_snapshot()["writes_blocked"] is True
+    restarted, _, _, fresh = make_proxy(provider=provider, live_write_authorized=True, start_write_blocked=False)
+    assert restarted.identity_snapshot()["writes_blocked"] is True
+    assert restarted.identity_snapshot()["write_ready"] is False
+    duplicate = restarted.process_request(value)
+    assert duplicate["status"] == "UNKNOWN" and len(fresh.calls) == 1
+    rejected = restarted.process_request(request("submit_order", rid="another-live-fixture"))
+    assert rejected["ok"] is False and "blocked" in rejected["error"] and len(fresh.calls) == 1
+
+
+def test_live_authorization_flag_cannot_expand_sim_policy():
+    value = config(account_id="55013746", environment="SIM", runtime_policy="PERSISTENT_SIMULATION_READ_WRITE",
+                   live_write_authorized=True)
+    with pytest.raises(ValueError, match="LIVE-only"):
+        RUNNER.validate_config(value)
 
 
 def test_live_identity_and_namespace_are_account_scoped_and_start_blocked():

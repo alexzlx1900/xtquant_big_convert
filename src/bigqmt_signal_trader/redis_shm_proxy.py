@@ -69,7 +69,8 @@ class RedisShmReadOnlyProxy:
                  timeout_seconds=5.0, max_requests=1000, deadline_unix=None,
                  runtime_policy="BOUNDED", allow_order_methods=False,
                  read_cache_capacity=1000, write_ledger_capacity=1000,
-                 expected_windows_session_id=None, environment="SIM", start_write_blocked=None):
+                 expected_windows_session_id=None, environment="SIM", start_write_blocked=None,
+                 live_write_authorized=False):
         validate_account_policy(account_id, environment, runtime_policy)
         if redis_transport.account_id != account_id:
             raise ValueError("transport account must match the explicit account")
@@ -93,8 +94,13 @@ class RedisShmReadOnlyProxy:
             raise ValueError("write permission must explicitly match the account read/write policy")
         if start_write_blocked is not None and type(start_write_blocked) is not bool:
             raise ValueError("start_write_blocked must be a boolean")
-        if environment == "LIVE" and start_write_blocked is not True:
-            raise ValueError("LIVE must explicitly start_write_blocked=true")
+        if type(live_write_authorized) is not bool or (environment != "LIVE" and live_write_authorized):
+            raise ValueError("live_write_authorized must be an explicit LIVE-only boolean")
+        if environment == "LIVE":
+            if start_write_blocked is None:
+                start_write_blocked = True
+            if not start_write_blocked and not live_write_authorized:
+                raise ValueError("LIVE start_write_blocked=false requires explicit live_write_authorized=true")
         if runtime_policy == "BOUNDED":
             if type(max_requests) is not int or not 1 <= max_requests <= 1000:
                 raise ValueError("max_requests must be within [1, 1000]")
@@ -112,6 +118,7 @@ class RedisShmReadOnlyProxy:
         self.transport = redis_transport
         self.account_id = account_id
         self.environment = environment
+        self.live_write_authorized = live_write_authorized
         self._write_ledger_key = "aqp:redis_shm:write_ledger:%s:v1" % account_id
         self.timeout_seconds = float(timeout_seconds)
         self.max_requests = max_requests
@@ -201,6 +208,8 @@ class RedisShmReadOnlyProxy:
                     write_ready=self.allow_order_methods and not self._writes_blocked,
                     read_source=copy.deepcopy(self._source_identity["readonly"]),
                     execution_source=copy.deepcopy(self._source_identity["execution"]))
+        if self.environment == "LIVE":
+            result["live_write_authorized"] = self.live_write_authorized
         if "windows_session_id" in self._source_identity["execution"]:
             result["windows_session_id"] = self._source_identity["execution"]["windows_session_id"]
         binding = self._source_binding()

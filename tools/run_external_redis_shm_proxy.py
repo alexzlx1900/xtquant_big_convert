@@ -60,11 +60,14 @@ def validate_config(value, now_unix=None):
     result = dict(value)
     result["environment"] = environment
     result["runtime_policy"] = policy
+    result["live_write_authorized"] = value.get("live_write_authorized", False)
+    if type(result["live_write_authorized"]) is not bool or (environment != "LIVE" and result["live_write_authorized"]):
+        raise ValueError("live_write_authorized must be an explicit LIVE-only boolean")
     result["start_write_blocked"] = value.get("start_write_blocked", policy in WRITE_POLICIES)
     if type(result["start_write_blocked"]) is not bool:
         raise ValueError("start_write_blocked must be an explicit boolean")
-    if environment == "LIVE" and value.get("start_write_blocked") is not True:
-        raise ValueError("LIVE must explicitly start_write_blocked=true")
+    if environment == "LIVE" and not result["start_write_blocked"] and not result["live_write_authorized"]:
+        raise ValueError("LIVE start_write_blocked=false requires explicit live_write_authorized=true")
     result["native_pid"] = _integer(value.get("native_pid"), "native_pid", 1, 0xFFFFFFFF)
     result["windows_session"] = _integer(value.get("windows_session"), "windows_session", 0, 0xFFFFFFFF)
     for field, prefix in (("read_name", "Local\\AQP_SHM_READONLY_"), ("execution_name", "Local\\AQP_SHM_TRADE_")):
@@ -155,6 +158,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
     result = dict(status="FAILED", account_id=config["account_id"], environment=config["environment"], automatic_retry=False,
                   allow_order_methods=config["allow_order_methods"], runtime_policy=config["runtime_policy"],
                   start_write_blocked=config["start_write_blocked"],
+                  live_write_authorized=config["live_write_authorized"],
                   writes_blocked=config["start_write_blocked"], write_ready=False,
                   write_block_reason="OPERATOR_WRITE_DISABLED" if config["start_write_blocked"] else "",
                   processed_requests=0, received_requests=0, full_duration_acceptance_proved=False)
@@ -172,6 +176,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         proxy = RedisShmReadOnlyProxy(
             redis_transport=transport, readonly_client=clients[0], execution_client=clients[1],
             account_id=config["account_id"], environment=config["environment"],
+            live_write_authorized=config["live_write_authorized"],
             start_write_blocked=config["start_write_blocked"], expected_readonly_session_id=config["read_session_id"],
             expected_execution_session_id=config["execution_session_id"],
             expected_native_pid=config["native_pid"], timeout_seconds=config["timeout_seconds"],
@@ -323,6 +328,7 @@ def run_reconciliation(value, plan, *, apply=False, redis_factory=None, shm_fact
         clients.append(factory(config["execution_name"], config["account_id"]))
         proxy = RedisShmReadOnlyProxy(transport, clients[0], clients[1],
             account_id=config["account_id"], environment=config["environment"], start_write_blocked=config["start_write_blocked"],
+            live_write_authorized=config["live_write_authorized"],
             expected_readonly_session_id=config["read_session_id"],
             expected_execution_session_id=config["execution_session_id"],
             expected_native_pid=config["native_pid"], timeout_seconds=config["timeout_seconds"],
@@ -387,6 +393,7 @@ def main(argv=None):
             result = dict(status="DRY_RUN", account_id=config["account_id"], environment=config["environment"], allow_order_methods=config["allow_order_methods"],
                           runtime_policy=config["runtime_policy"],
                           start_write_blocked=config["start_write_blocked"],
+                          live_write_authorized=config["live_write_authorized"],
                           native_pid=config["native_pid"], windows_session=config["windows_session"],
                           max_seconds=config["max_seconds"], max_requests=config["max_requests"],
                           connections_created=0, full_duration_acceptance_proved=False,
