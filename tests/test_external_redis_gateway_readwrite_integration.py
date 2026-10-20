@@ -20,6 +20,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from bigqmt_signal_trader.redis_shm_proxy import RedisShmReadOnlyProxy
 from bigqmt_signal_trader.transports.redis_transport import RedisTransport
+from bigqmt_signal_trader.transports.readonly_shm_client import ShmReadOnlyRpcClient
+from bigqmt_signal_trader.transports.readonly_shm import ShmProtocolError
 from test_external_redis_dual_shm_integration import DUAL, MemoryRedis
 
 
@@ -48,7 +50,7 @@ def gateway_modules(monkeypatch):
 
 class Harness:
     def __init__(self, monkeypatch, gateway, *, allow_writes=True, unknown_submit=False,
-                 live=False, start_write_blocked=None, live_write_authorized=False):
+                 live=False, start_write_blocked=None, live_write_authorized=False, symbols=None):
         self.allow_writes, self.unknown_submit = allow_writes, unknown_submit
         self.account = "8882152350" if live else ACCOUNT
         self.environment = "LIVE" if live else "SIM"
@@ -62,6 +64,7 @@ class Harness:
             persistent_readonly=not allow_writes, persistent_live_read_write=live,
             persistent_simulation_read_write=allow_writes and not live,
             enable_market_rpc=allow_writes,
+            symbols=[CODE] if symbols is None else symbols,
         )
         self.gateway, self.redis = gateway, MemoryRedis()
         self.orders, self.submit_calls, self.cancel_calls = [], [], []
@@ -415,3 +418,76 @@ def test_live_unknown_native_submission_blocks_second_order_and_keeps_account_re
             await h.close()
 
     asyncio.run(run())
+
+
+def test_live_sixty_seven_quote_symbols_cross_generated_source_proxy_and_formal_adapter(monkeypatch, gateway_modules):
+    symbols = ["%06d.SH" % code for code in range(600000, 600067)]
+    h = Harness(monkeypatch, gateway_modules, live=True, symbols=symbols)
+    native_calls = []
+    original = h.source.context.get_full_tick
+
+    def native_ticks(codes):
+        native_calls.append(list(codes))
+        return original(codes)
+
+    h.source.context.get_full_tick = native_ticks
+
+    async def run():
+        try:
+            await h.start()
+            quotes = await h.operation(h.read.query_quotes(symbols))
+            assert set(quotes) == set(symbols) and len(quotes) == 67
+            assert all(quote["last_price"] == 11.47 for quote in quotes.values())
+            full = await h.operation(asyncio.to_thread(h.read._get_client().call, "get_full_tick", {"codes": symbols}))
+            assert set(full) == set(symbols) and all(tick["lastPrice"] == 11.47 for tick in full.values())
+            assert native_calls == [symbols, symbols]
+            assert h.proxy.identity_snapshot()["environment"] == "LIVE"
+            assert h.proxy.identity_snapshot()["writes_blocked"] is True
+            assert not h.submit_calls and not h.cancel_calls
+        finally:
+            await h.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("live,count,limit", [(True, 129, 128), (False, 65, 64)])
+@pytest.mark.parametrize("method", ["get_ticks", "get_full_tick"])
+def test_proxy_quote_limit_rejects_live_129_and_sim_65_before_native_io(monkeypatch, gateway_modules, live, count, limit, method):
+    symbols = ["%06d.SH" % code for code in range(600000, 600000 + count)]
+    h = Harness(monkeypatch, gateway_modules, live=live, symbols=symbols[:limit])
+    native_calls = []
+    original = h.source.context.get_full_tick
+
+    def native_ticks(codes):
+        native_calls.append(list(codes))
+        return original(codes)
+
+    h.source.context.get_full_tick = native_ticks
+
+    async def run():
+        try:
+            await h.start()
+            # 绕过页面层数量校验，仍走正式Gateway客户端和真实Redis wire，
+            # 证明拒绝来自代理本身，而不是只验证原生白名单或前端限制。
+            with pytest.raises(Exception):
+                await h.operation(asyncio.to_thread(h.read._get_client().call, method, {"codes": symbols}))
+            # 拒绝在真实代理响应wire中可核对；现有客户端会将缺session_id的
+            # 拒绝信封标成route mismatch，不把该既有表现伪装为原生处理。
+            responses = [json.loads(value) for key, value in h.redis.values.items()
+                         if key.startswith("bigqmt:rpc:resp:%s:" % h.account)]
+            rejected = [value for value in responses if value.get("server_error") == "PROXY_REQUEST_REJECTED"]
+            assert len(rejected) == 1 and rejected[0]["method"] == method
+            assert "1-%s" % limit in rejected[0]["error"]
+            assert not native_calls and not h.submit_calls and not h.cancel_calls
+            assert h.proxy.stopped is False
+        finally:
+            await h.close()
+
+    asyncio.run(run())
+
+
+def test_direct_readonly_quote_client_keeps_default_sixty_four_symbol_limit():
+    symbols = ["%06d.SH" % code for code in range(600000, 600067)]
+    with pytest.raises(ShmProtocolError, match="1-64"):
+        ShmReadOnlyRpcClient._quote_params({"codes": symbols})
+    assert ShmReadOnlyRpcClient._quote_params({"codes": symbols}, max_symbols=128)["codes"] == symbols

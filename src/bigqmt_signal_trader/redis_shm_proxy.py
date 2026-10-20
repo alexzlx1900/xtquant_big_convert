@@ -446,7 +446,7 @@ class RedisShmReadOnlyProxy:
         if params.get("account_id", self.account_id) != self.account_id or account != self.account_id:
             raise ShmProtocolError("nested account mismatch")
         if method in QUOTE_METHODS:
-            ShmReadOnlyRpcClient._quote_params(params)
+            ShmReadOnlyRpcClient._quote_params(params, max_symbols=128 if self.environment == "LIVE" else 64)
         if method in MARKET_RPC_METHODS:
             ShmReadOnlyRpcClient._market_params(method, params)
         if method == "get_asset" and type(params.get("include_source_evidence", False)) is not bool:

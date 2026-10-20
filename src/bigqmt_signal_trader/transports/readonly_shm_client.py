@@ -60,18 +60,20 @@ class ShmReadOnlyRpcClient:
             raise ValueError("timeout must be finite and within (0, 60] seconds")
 
     @staticmethod
-    def _quote_params(values):
+    def _quote_params(values, *, max_symbols=64):
+        if type(max_symbols) is not int or max_symbols not in (64, 128):
+            raise ShmProtocolError("explicit quote limit must be 64 or 128")
         if set(values) - {"account_id", "codes", "code"} or ("codes" in values) == ("code" in values):
             raise ShmProtocolError("provide exactly one quote selector")
         codes = values.get("codes", values.get("code"))
         if isinstance(codes, str):
             codes = [codes]
-        if (not isinstance(codes, list) or not 1 <= len(codes) <= 64
+        if (not isinstance(codes, list) or not 1 <= len(codes) <= max_symbols
                 or any(not isinstance(code, str) or len(code) != 9
                        or not all("0" <= char <= "9" for char in code[:6])
                        or code[6:] not in (".SH", ".SZ", ".BJ") for code in codes)
                 or len(set(codes)) != len(codes)):
-            raise ShmProtocolError("codes must contain 1-64 unique SH/SZ/BJ symbols")
+            raise ShmProtocolError("codes must contain 1-%s unique SH/SZ/BJ symbols" % max_symbols)
         result = dict(values)
         result.pop("code", None)
         result["codes"] = list(codes)
