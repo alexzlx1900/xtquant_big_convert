@@ -83,8 +83,9 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         raise ValueError("independent readonly mailbox name required")
     if not isinstance(execution_name, str) or not re.fullmatch(r"Local\\AQP_SHM_TRADE_[A-Za-z0-9_-]{1,58}", execution_name):
         raise ValueError("independent execution mailbox name required")
-    if not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= 64 or any(not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", code) for code in symbols) or len(set(symbols)) != len(symbols):
-        raise ValueError("1-64 unique confirmed SH/SZ/BJ symbols required")
+    symbol_limit = 128 if environment == "LIVE" else 64
+    if not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= symbol_limit or any(not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", code) for code in symbols) or len(set(symbols)) != len(symbols):
+        raise ValueError("1-%d unique confirmed SH/SZ/BJ symbols required" % symbol_limit)
     read = _configure_source(READ_BUILDER.build_source(), {
         "BIGQMT_ACCOUNT_ID": account_id, "BIGQMT_ENVIRONMENT": environment, "READONLY_SHM_NAME": read_name,
         "READONLY_SYMBOLS": list(symbols), "READONLY_MAX_SECONDS": max_seconds,

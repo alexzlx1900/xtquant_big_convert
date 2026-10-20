@@ -16,7 +16,7 @@ BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 BIGQMT_ENVIRONMENT = "SIM"
 READONLY_SHM_NAME = "Local\\AQP_SHM_READONLY_SIM"
 READONLY_SYMBOL = "000001.SZ"
-READONLY_SYMBOLS = None  # None 保留旧单股票配置；显式列表最多 64 只。
+READONLY_SYMBOLS = None  # None 保留旧单股票配置；SIM最多64、显式LIVE最多128只。
 READONLY_ENABLE_MARKET_RPC = False
 READONLY_MAX_REQUESTS = 180
 READONLY_MAX_SECONDS = 60
@@ -95,12 +95,13 @@ class ShmReadOnlyBridge:
         if not isinstance(BIGQMT_ACCOUNT_ID, str) or not BIGQMT_ACCOUNT_ID or BIGQMT_ACCOUNT_ID == "YOUR_ACCOUNT_ID" or len(BIGQMT_ACCOUNT_ID) > 64:
             raise ValueError("configure the confirmed simulation account")
         symbols = [READONLY_SYMBOL] if READONLY_SYMBOLS is None else READONLY_SYMBOLS
-        if (not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= 64
+        symbol_limit = 128 if BIGQMT_ENVIRONMENT == "LIVE" and READONLY_PERSISTENT_LIVE_READ_WRITE is True else 64
+        if (not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= symbol_limit
                 or any(not isinstance(symbol, str) or len(symbol) != 9
                        or not all("0" <= char <= "9" for char in symbol[:6])
                        or symbol[6:] not in (".SH", ".SZ", ".BJ") for symbol in symbols)
                 or len(set(symbols)) != len(symbols)):
-            raise ValueError("configure 1-64 unique SH/SZ/BJ quote symbols")
+            raise ValueError("configure 1-%d unique SH/SZ/BJ quote symbols" % symbol_limit)
         if (type(READONLY_PERSISTENT_READONLY) is not bool or type(READONLY_PERSISTENT_MARKET_RPC) is not bool
                 or type(READONLY_PERSISTENT_LIVE_READ_WRITE) is not bool
                 or type(READONLY_ENABLE_MARKET_RPC) is not bool):
@@ -130,6 +131,7 @@ class ShmReadOnlyBridge:
         self.account_id = BIGQMT_ACCOUNT_ID
         self.environment = BIGQMT_ENVIRONMENT
         self.quote_symbols = tuple(symbols)
+        self.quote_symbol_limit = symbol_limit
         self.callback_thread_id = threading.get_ident()
         self.windows_session_id = None
         self.created_at = time.monotonic()
@@ -262,10 +264,10 @@ class ShmReadOnlyBridge:
                 codes = params.get("codes", params.get("code"))
                 if isinstance(codes, str):
                     codes = [codes]
-                if (not isinstance(codes, list) or not 1 <= len(codes) <= 64
+                if (not isinstance(codes, list) or not 1 <= len(codes) <= self.quote_symbol_limit
                         or any(not isinstance(code, str) for code in codes)
                         or len(set(codes)) != len(codes)):
-                    raise ReadOnlyRequestError("INVALID_PARAMS", "codes must contain 1-64 unique symbols")
+                    raise ReadOnlyRequestError("INVALID_PARAMS", "codes must contain 1-%d unique symbols" % self.quote_symbol_limit)
                 if any(code not in self.quote_symbols for code in codes):
                     raise ReadOnlyRequestError("SYMBOL_DENIED", "quote symbol is outside the configured allowlist")
                 data = self.context.get_full_tick(codes)

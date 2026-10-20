@@ -26,6 +26,19 @@ BUILDER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BUILDER)
 ACCOUNT = "55013746"
 CODE = "000001.SZ"
+# 生产保存批次17166的67个非零持仓代码；报价与Win32/QMT均仍是本地fixture。
+LIVE_SAVED_POSITION_SYMBOLS_20261020 = """
+000929.SZ 001336.SZ 002008.SZ 002012.SZ 002098.SZ 002188.SZ 002247.SZ
+002274.SZ 002278.SZ 002316.SZ 002344.SZ 002381.SZ 002409.SZ 002427.SZ
+002482.SZ 002494.SZ 002529.SZ 002629.SZ 002652.SZ 002671.SZ 002715.SZ
+002760.SZ 002778.SZ 002843.SZ 002861.SZ 003015.SZ 003016.SZ 003032.SZ
+300220.SZ 300405.SZ 300417.SZ 300500.SZ 300535.SZ 300605.SZ 300614.SZ
+300621.SZ 300635.SZ 301167.SZ 600137.SH 600149.SH 600455.SH 600493.SH
+600561.SH 600697.SH 600768.SH 600778.SH 600847.SH 600883.SH 603022.SH
+603117.SH 603214.SH 603717.SH 603860.SH 603879.SH 603908.SH 605567.SH
+688021.SH 688067.SH 688092.SH 688217.SH 688565.SH 688573.SH 688659.SH
+688681.SH 688695.SH 688701.SH 688793.SH
+""".split()
 
 
 class State:
@@ -876,3 +889,57 @@ def test_live_partial_quote_source_evidence_keeps_environment_and_raw_failure(mo
     assert response["data"]["source_evidence"]["complete"] is False
     assert response["data"]["invalid_symbols"] == [CODE]
     h.close()
+
+
+@pytest.mark.parametrize("method", ["get_ticks", "get_full_tick"])
+def test_live_generated_reads_all_67_saved_position_symbols_in_existing_mailbox(monkeypatch, method, record_property):
+    codes = LIVE_SAVED_POSITION_SYMBOLS_20261020
+    assert len(codes) == len(set(codes)) == 67
+    h = Fixture(monkeypatch, **live_settings(symbols=codes))
+    h.context.get_full_tick = lambda requested: {code: dict(lastPrice=11.47, time=1792110000000,
+        lastClose=11.4, open=11.4, high=11.5, low=11.3, amount=1000000.0, volume=1000,
+        askPrice=[11.48, 11.49, 11.50, 11.51, 11.52], bidPrice=[11.47, 11.46, 11.45, 11.44, 11.43],
+        askVol=[100] * 5, bidVol=[100] * 5) for code in requested}
+    h.start()
+    response = h.call("read", method, {"codes": codes})
+    assert response["ok"] and response["environment"] == "LIVE" and set(response["data"]) == set(codes)
+    transport = h.transports["read"]
+    assert transport.REQUEST_CAPACITY == 8192 and transport.RESPONSE_CAPACITY == 8 * 1024 * 1024
+    raw = transport.encode_payload(response, transport.RESPONSE_CAPACITY)
+    record_property("live_67_%s_response_bytes" % method, len(raw))
+    assert len(raw) < 8 * 1024 * 1024
+    h.close()
+
+
+@pytest.mark.parametrize("environment,count,allowed", [("SIM", 65, False), ("LIVE", 128, True), ("LIVE", 129, False)])
+def test_generated_quote_symbol_capacity_is_live_specific(monkeypatch, environment, count, allowed):
+    codes = ["%06d.SZ" % number for number in range(count)]
+    values = live_settings(symbols=codes) if environment == "LIVE" else dict(symbols=codes)
+    if not allowed:
+        with pytest.raises(ValueError, match="1-%d unique" % (128 if environment == "LIVE" else 64)):
+            BUILDER.build_source(**settings(**values))
+        return
+    h = Fixture(monkeypatch, **values)
+    h.start()
+    response = h.call("read", "get_ticks", {"codes": codes})
+    assert response["ok"] and len(response["data"]) == 128
+    assert h.call("read", "get_ticks", {"codes": codes + ["999999.SZ"]})["server_error"] == "INVALID_PARAMS"
+    h.close()
+
+
+@pytest.mark.parametrize("codes", [[], [CODE, CODE], ["bad.SZ"], ["000001.XX"]])
+def test_live_large_whitelist_still_rejects_empty_duplicate_and_invalid_symbols(codes):
+    with pytest.raises(ValueError):
+        BUILDER.build_source(**settings(**live_settings(symbols=codes)))
+
+
+def test_sim_generated_request_limit_remains_64_and_live_still_enforces_exact_whitelist(monkeypatch):
+    sim_codes = ["%06d.SZ" % number for number in range(64)]
+    sim = Fixture(monkeypatch, symbols=sim_codes)
+    sim.start()
+    assert sim.call("read", "get_ticks", {"codes": sim_codes + ["999999.SZ"]})["server_error"] == "INVALID_PARAMS"
+    sim.close()
+    live = Fixture(monkeypatch, **live_settings(symbols=LIVE_SAVED_POSITION_SYMBOLS_20261020))
+    live.start()
+    assert live.call("read", "get_ticks", {"codes": ["999999.SZ"]})["server_error"] == "SYMBOL_DENIED"
+    live.close()
