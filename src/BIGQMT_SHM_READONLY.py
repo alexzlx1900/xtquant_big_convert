@@ -13,6 +13,7 @@ import types
 
 
 BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
+BIGQMT_ENVIRONMENT = "SIM"
 READONLY_SHM_NAME = "Local\\AQP_SHM_READONLY_SIM"
 READONLY_SYMBOL = "000001.SZ"
 READONLY_SYMBOLS = None  # None 保留旧单股票配置；显式列表最多 64 只。
@@ -21,6 +22,7 @@ READONLY_MAX_REQUESTS = 180
 READONLY_MAX_SECONDS = 60
 READONLY_PERSISTENT_READONLY = False  # 仅显式55013746禁写驻留候选；默认仍有界。
 READONLY_PERSISTENT_MARKET_RPC = False  # 双源读写候选显式开放已有市场只读方法。
+READONLY_PERSISTENT_LIVE_READ_WRITE = False  # 仅显式实盘双源候选，读源始终禁写。
 RPC_REVISION = "shm-readonly-single-file-v2"
 HISTORY_PAYLOAD_LIMIT_BYTES = 8 * 1024 * 1024 - 16384
 _EMBEDDED_SOURCES = {}  # BUILD_READONLY_EMBEDDED
@@ -100,12 +102,23 @@ class ShmReadOnlyBridge:
                 or len(set(symbols)) != len(symbols)):
             raise ValueError("configure 1-64 unique SH/SZ/BJ quote symbols")
         if (type(READONLY_PERSISTENT_READONLY) is not bool or type(READONLY_PERSISTENT_MARKET_RPC) is not bool
+                or type(READONLY_PERSISTENT_LIVE_READ_WRITE) is not bool
                 or type(READONLY_ENABLE_MARKET_RPC) is not bool):
             raise ValueError("explicit boolean persistent readonly selection required")
+        if BIGQMT_ENVIRONMENT not in ("SIM", "LIVE"):
+            raise ValueError("explicit SIM/LIVE environment required")
+        if BIGQMT_ENVIRONMENT == "LIVE":
+            if (not READONLY_PERSISTENT_LIVE_READ_WRITE or not READONLY_PERSISTENT_READONLY
+                    or not all("0" <= char <= "9" for char in BIGQMT_ACCOUNT_ID)
+                    or BIGQMT_ACCOUNT_ID == "55013746"):
+                raise ValueError("LIVE read source requires explicit persistent LIVE policy and live numeric account")
+        elif READONLY_PERSISTENT_LIVE_READ_WRITE:
+            raise ValueError("persistent LIVE policy requires LIVE environment")
         if READONLY_PERSISTENT_MARKET_RPC and (not READONLY_PERSISTENT_READONLY or not READONLY_ENABLE_MARKET_RPC):
             raise ValueError("persistent market opt-in requires explicit persistent readonly market source")
         if READONLY_PERSISTENT_READONLY:
-            if (BIGQMT_ACCOUNT_ID != "55013746" or (READONLY_ENABLE_MARKET_RPC and not READONLY_PERSISTENT_MARKET_RPC)
+            if ((BIGQMT_ACCOUNT_ID != "55013746" and not READONLY_PERSISTENT_LIVE_READ_WRITE)
+                    or (READONLY_ENABLE_MARKET_RPC and not READONLY_PERSISTENT_MARKET_RPC)
                     or type(READONLY_MAX_REQUESTS) is not int or READONLY_MAX_REQUESTS != 0
                     or type(READONLY_MAX_SECONDS) is not int or READONLY_MAX_SECONDS != 0):
                 raise ValueError("persistent readonly requires simulation55013746, explicit market opt-in and zero budgets")
@@ -115,6 +128,7 @@ class ShmReadOnlyBridge:
             raise RuntimeError("QMT native readonly query functions are unavailable")
         self.context = context
         self.account_id = BIGQMT_ACCOUNT_ID
+        self.environment = BIGQMT_ENVIRONMENT
         self.quote_symbols = tuple(symbols)
         self.callback_thread_id = threading.get_ident()
         self.windows_session_id = None
@@ -153,6 +167,7 @@ class ShmReadOnlyBridge:
             "schema_version": 1,
             "request_id": request_id if isinstance(request_id, str) and len(request_id) <= 128 else "",
             "account_id": self.account_id,
+            "environment": self.environment,
             "method": method if isinstance(method, str) and len(method) <= 64 else "",
             "session_id": self.mailbox.session_id,
             "sequence": fields.get("sequence") if sequence is None else sequence,
@@ -177,6 +192,8 @@ class ShmReadOnlyBridge:
                 raise ReadOnlyRequestError("SEQUENCE_MISMATCH", "request sequence does not match the mailbox")
             if fields.get("account_id") != self.account_id:
                 raise ReadOnlyRequestError("ACCOUNT_MISMATCH", "account_id mismatch")
+            if fields.get("environment", None if self.environment == "LIVE" else "SIM") != self.environment:
+                raise ReadOnlyRequestError("ENVIRONMENT_MISMATCH", "request environment mismatch")
             params = fields.get("params", {})
             if not isinstance(params, dict):
                 raise ReadOnlyRequestError("INVALID_PARAMS", "params must be an object")
@@ -205,7 +222,7 @@ class ShmReadOnlyBridge:
             else:
                 self.seen_request_ids.add(request_id)
             if method == "ping":
-                data = {"pong": True, "account_id": self.account_id, "allow_order_methods": False,
+                data = {"pong": True, "account_id": self.account_id, "environment": self.environment, "allow_order_methods": False,
                         "rpc_revision": RPC_REVISION, "server_time": _dt.datetime.now(),
                         "transport": "shm_readonly",
                         "runtime_policy": "PERSISTENT_READONLY" if self.persistent_readonly else "BOUNDED_READONLY",
@@ -312,7 +329,8 @@ class ShmReadOnlyBridge:
             response["server_error"] = exc.code if isinstance(exc, ReadOnlyRequestError) else "QMT_QUERY_FAILED"
         if isinstance(response["data"], dict) and isinstance(response["data"].get("source_evidence"), dict):
             response["data"]["source_evidence"].update(session_id=self.mailbox.session_id,
-                native_pid=self.mailbox.server_pid, windows_session_id=self.windows_session_id)
+                native_pid=self.mailbox.server_pid, windows_session_id=self.windows_session_id,
+                environment=self.environment)
         self.request_count += 1
         print("AQP_SHM_READONLY_RPC " + json.dumps({
             "request_id": response["request_id"], "method": response["method"], "sequence": response["sequence"],
@@ -671,7 +689,7 @@ def init(ContextInfo):
         print("AQP_SHM_READONLY_INIT_FAILED %s: %s" % (type(exc).__name__, exc))
         raise
     print("AQP_SHM_READONLY_READY " + json.dumps({
-        "account_id": _SERVER.account_id, "name": READONLY_SHM_NAME, "symbol": READONLY_SYMBOL,
+        "account_id": _SERVER.account_id, "environment": _SERVER.environment, "name": READONLY_SHM_NAME, "symbol": READONLY_SYMBOL,
         "symbols": list(_SERVER.quote_symbols),
         "session_id": _SERVER.mailbox.session_id, "native_pid": _SERVER.mailbox.server_pid,
         "windows_session_id": _SERVER.windows_session_id,

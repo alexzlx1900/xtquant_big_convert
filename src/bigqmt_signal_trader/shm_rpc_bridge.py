@@ -17,7 +17,8 @@ from .transports.shm_rpc import READ_METHODS, WRITE_METHODS
 class ShmRpcBridge:
     def __init__(self, *, name, account_id, handlers, allow_order_methods=False,
                  region=None, event_capacity=64, replay_capacity=1024, trade_login_reader=None,
-                 persistent_readonly=False, persistent_simulation_read_write=False):
+                 persistent_readonly=False, persistent_simulation_read_write=False,
+                 environment="SIM", persistent_live_read_write=False):
         if not isinstance(account_id, str) or not account_id or handlers.account_id != account_id:
             raise ValueError("handler fixed account mismatch")
         if type(allow_order_methods) is not bool or handlers.allow_order_methods is not allow_order_methods:
@@ -28,11 +29,21 @@ class ShmRpcBridge:
         if (type(persistent_simulation_read_write) is not bool or persistent_readonly and persistent_simulation_read_write
                 or persistent_simulation_read_write and (account_id != "55013746" or allow_order_methods is not True)):
             raise ValueError("persistent read-write replay requires explicit fixed simulation writes")
+        if environment not in ("SIM", "LIVE") or type(persistent_live_read_write) is not bool:
+            raise ValueError("explicit SIM/LIVE environment and boolean LIVE policy required")
+        if environment == "LIVE":
+            if (not persistent_live_read_write or persistent_readonly or persistent_simulation_read_write
+                    or allow_order_methods is not True or account_id == "55013746"
+                    or len(account_id) > 64 or not all("0" <= char <= "9" for char in account_id)):
+                raise ValueError("LIVE bridge requires exclusive persistent LIVE writes and live numeric account")
+        elif persistent_live_read_write:
+            raise ValueError("persistent LIVE policy requires LIVE environment")
         if type(event_capacity) is not int or not 1 <= event_capacity <= 128 or type(replay_capacity) is not int or not 1 <= replay_capacity <= 10000:
             raise ValueError("bounded capacities required")
         if getattr(handlers, "settle_orders_inline", False):
             raise ValueError("inline blocking settlement is unsupported")
         self.account_id, self.handlers = account_id, handlers
+        self.environment = environment
         self.allow_order_methods = allow_order_methods
         self.trade_login_reader = trade_login_reader
         self._thread = threading.get_ident()
@@ -41,7 +52,8 @@ class ShmRpcBridge:
         self._replays, self._replay_capacity = {}, replay_capacity
         self.persistent_readonly = persistent_readonly
         self.persistent_simulation_read_write = persistent_simulation_read_write
-        self.persistent = persistent_readonly or persistent_simulation_read_write
+        self.persistent_live_read_write = persistent_live_read_write
+        self.persistent = persistent_readonly or persistent_simulation_read_write or persistent_live_read_write
         self.runtime_metadata = {}
         self._read_replay_expiries = {}
         self._pending = None
@@ -111,7 +123,7 @@ class ShmRpcBridge:
 
     def _response(self, sequence, request):
         return dict(schema_version=1, sequence=sequence, session_id=self.mailbox.session_id,
-                    request_id=request.get("request_id"), account_id=self.account_id,
+                    request_id=request.get("request_id"), account_id=self.account_id, environment=self.environment,
                     method=request.get("method"), ok=False, data=None, error="", server_error="",
                     handled_at=datetime.datetime.utcnow().isoformat())
 
@@ -226,7 +238,8 @@ class ShmRpcBridge:
             evidence = value.get(key)
             if isinstance(evidence, dict):
                 value[key] = dict(evidence, session_id=self.mailbox.session_id,
-                    native_pid=self.mailbox.server_pid, windows_session_id=self.runtime_metadata.get("windows_session_id"))
+                    native_pid=self.mailbox.server_pid, windows_session_id=self.runtime_metadata.get("windows_session_id"),
+                    environment=self.environment)
         return value
 
     def _read_with_evidence(self, method, params):
@@ -311,6 +324,8 @@ class ShmRpcBridge:
                 raise ShmProtocolError("request protocol identity mismatch")
             if request.get("account_id") != self.account_id or not isinstance(params, dict):
                 raise ShmProtocolError("fixed account/params mismatch")
+            if request.get("environment", None if self.environment == "LIVE" else "SIM") != self.environment:
+                raise ShmProtocolError("request environment mismatch")
             nested = params.get("account", self.account_id)
             if isinstance(nested, dict):
                 nested = nested.get("account_id", nested.get("accountID", nested.get("id")))
@@ -346,7 +361,7 @@ class ShmRpcBridge:
                 raise ShmProtocolError("request deadline expired/invalid; not executed")
             validated = True
             if method == "ping":
-                result = dict(pong=True, transport="shm_rpc", account_id=self.account_id,
+                result = dict(pong=True, transport="shm_rpc", account_id=self.account_id, environment=self.environment,
                               allow_order_methods=self.allow_order_methods, session_id=self.mailbox.session_id,
                               native_pid=self.mailbox.server_pid, capabilities=sorted(READ_METHODS | (WRITE_METHODS if self.allow_order_methods else frozenset())))
                 result.update(self.runtime_metadata)

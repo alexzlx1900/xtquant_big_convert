@@ -93,6 +93,7 @@ def settings(**overrides):
 class Fixture:
     def __init__(self, monkeypatch, **overrides):
         self.settings = settings(**overrides)
+        self.account = self.settings.get("account_id", ACCOUNT)
         self.source = BUILDER.build_source(**self.settings)
         self.namespace = {}
         original_import = builtins.__import__
@@ -124,12 +125,12 @@ class Fixture:
 
     def query(self, account, account_type, kind, strategy_name=""):
         self.query_calls.append((account, account_type, kind, strategy_name))
-        assert (account, account_type) == (ACCOUNT, "STOCK")
+        assert (account, account_type) == (self.account, "STOCK")
         if kind == "POSITION":
             return [types.SimpleNamespace(m_strInstrumentID="000001", m_strExchangeID="SZ", m_nVolume=100,
                 m_nCanUseVolume=100, m_dOpenPrice=10.0, m_dMarketValue=1147.0, m_dLastPrice=11.47)]
         if kind == "ACCOUNT":
-            return [types.SimpleNamespace(m_strAccountID=ACCOUNT, m_strStatus="登录成功", m_dAvailable=1000.0, m_dBalance=2147.0,
+            return [types.SimpleNamespace(m_strAccountID=self.account, m_strStatus="登录成功", m_dAvailable=1000.0, m_dBalance=2147.0,
                 m_dFrozenCash=0.0, m_dInstrumentValue=1147.0)]
         return []
 
@@ -137,12 +138,16 @@ class Fixture:
         assert self.namespace["init"](self.context) is None
         for key, transport in self.transports.items():
             name = self.settings["read_name" if key == "read" else "execution_name"]
-            self.clients[key] = transport.ShmReadOnlyClient(name, ACCOUNT)
+            self.clients[key] = transport.ShmReadOnlyClient(name, self.account)
 
     def call(self, key, method, params=None, **overrides):
         request = dict(schema_version=1, request_id="dual-%s-%s" % (key, time.monotonic_ns()),
-            account_id=ACCOUNT, method=method, params=params or {})
+            account_id=self.account, method=method, params=params or {})
+        if self.settings.get("environment") == "LIVE":
+            request["environment"] = "LIVE"
         request.update(overrides)
+        if request.get("environment") is None:
+            request.pop("environment", None)
         callback = self.namespace["aqp_shm_readonly_adjust" if key == "read" else "aqp_shm_rpc_adjust"]
         with ThreadPoolExecutor(1) as pool:
             future = pool.submit(self.clients[key].send_request, request, 1.0)
@@ -462,16 +467,16 @@ def _enable_fixture_simulation_orders(h, fail_submit=False):
     def query(account, account_type, kind, strategy_name=""):
         if kind == "ORDER":
             h.query_calls.append((account, account_type, kind, strategy_name))
-            assert (account, account_type) == (ACCOUNT, "STOCK")
+            assert (account, account_type) == (h.account, "STOCK")
             return orders
         return ordinary_query(account, account_type, kind, strategy_name)
 
     def submit(action, order_type, account, code, price_type, price, volume, strategy, quick, remark, context):
         assert (action, order_type, account, code, price_type, volume, quick, context) == (
-            23, 1101, ACCOUNT, CODE, 11, 100, 2, h.context)
+            23, 1101, h.account, CODE, 11, 100, 2, h.context)
         if fail_submit:
             raise OSError("fixture native result unconfirmed after call")
-        orders.append(types.SimpleNamespace(m_strAccountID=ACCOUNT, m_strInstrumentID="000001",
+        orders.append(types.SimpleNamespace(m_strAccountID=h.account, m_strInstrumentID="000001",
             m_strExchangeID="SZ", m_nVolumeTotalOriginal=volume, m_nVolumeTraded=0,
             m_nOrderStatus=50, m_nOffsetFlag=48, m_dLimitPrice=price, m_strOrderSysID="SIM-FIXTURE-001",
             m_strRemark=remark, m_strStrategyName=strategy, m_nOpType=23, m_nOrderPriceType=50,
@@ -484,7 +489,7 @@ def _enable_fixture_simulation_orders(h, fail_submit=False):
 
 def _fixture_native_login(h):
     # 只注入原生回调输入，执行实际生成的登录解析与写门禁；非真实QMT登录证明。
-    h.namespace["account_callback"](h.context, dict(m_strAccountID=ACCOUNT, m_strStatus="登录成功", m_nStatus=0))
+    h.namespace["account_callback"](h.context, dict(m_strAccountID=h.account, m_strStatus="登录成功", m_nStatus=0))
 
 
 def test_generated_persistent_simulation_read_write_has_real_separate_handshakes_and_single_binding(monkeypatch, capsys):
@@ -703,4 +708,171 @@ def test_dual_generated_history_download_capability_follows_actual_native_inject
         downloader.assert_not_called()
     submit.assert_not_called()
     cancel.assert_not_called()
+    h.close()
+
+
+def live_settings(**changes):
+    values = dict(account_id="8765432100", environment="LIVE", persistent_live_read_write=True,
+                  hard_deadline_unix=None, max_seconds=0, max_requests=0, enable_market_rpc=True)
+    values.update(changes)
+    return values
+
+
+@pytest.mark.parametrize("changes", [
+    {"environment": "SIM"}, {"environment": "live"}, {"persistent_live_read_write": False},
+    {"persistent_live_read_write": 1}, {"account_id": ACCOUNT}, {"account_id": "LIVE_TEST"},
+    {"account_id": "１２３４"}, {"account_id": ""}, {"account_id": "1" * 65},
+    {"persistent_simulation_read_write": True}, {"persistent_readonly": True},
+    {"max_seconds": 1}, {"max_requests": 1}, {"hard_deadline_unix": 9999999999},
+])
+def test_live_dual_builder_rejects_implicit_mixed_simulation_and_bounded_policies(changes):
+    with pytest.raises(ValueError):
+        BUILDER.build_source(**settings(**live_settings(**changes)))
+
+
+def test_live_generated_handshakes_and_account_evidence_preserve_live_environment(monkeypatch, capsys):
+    h = Fixture(monkeypatch, **live_settings())
+    _, submit, cancel = _enable_fixture_simulation_orders(h)
+    h.start()
+    ready = json.loads(next(line.split(" ", 1)[1] for line in capsys.readouterr().out.splitlines()
+                            if line.startswith("AQP_DUAL_SHM_READY ")))
+    assert ready["environment"] == "LIVE" and ready["account_id"] == h.account
+    assert ready["runtime_policy"] == "PERSISTENT_LIVE_READ_WRITE"
+    assert ready["read_session_id"] != ready["execution_session_id"]
+    assert h.context.accounts == [h.account] and h.namespace["handlebar"](h.context) is None
+    for key, policy, write_allowed in (("read", "PERSISTENT_READONLY", False),
+                                       ("execution", "PERSISTENT_LIVE_READ_WRITE", True)):
+        response = h.call(key, "ping")
+        assert response["environment"] == "LIVE" and response["data"]["environment"] == "LIVE"
+        assert response["data"]["runtime_policy"] == policy
+        assert response["data"]["allow_order_methods"] is write_allowed
+        assert response["data"]["source_deadline_unix"] is None
+        assert response["data"]["max_seconds"] == response["data"]["max_requests"] == 0
+        for method in ("get_asset", "get_positions", "query_orders", "query_trades"):
+            response = h.call(key, method, {"include_source_evidence": True})
+            assert response["ok"] and response["environment"] == "LIVE", response
+            evidence = response["data"]["source_evidence"]
+            assert evidence["environment"] == "LIVE" and evidence["account_id"] == h.account
+            assert evidence["native_pid"] == os.getpid() and evidence["windows_session_id"] == 1
+    snapshot = h.call("execution", "query_execution_snapshot", {"order_strategy_name": ""})["data"]
+    for field in ("source_evidence", "orders_source_evidence", "trades_source_evidence"):
+        assert snapshot[field]["environment"] == "LIVE"
+    assert h.call("read", "submit_order")["ok"] is False
+    blocked = h.call("execution", "submit_order", dict(stock_code=CODE, action="BUY", volume=100, price=10.5))
+    assert blocked["data"]["status"] == "BLOCKED" and blocked["data"]["native_write_executed"] is False
+    submit.assert_not_called()
+    cancel.assert_not_called()
+    h.close()
+
+
+@pytest.mark.parametrize("environment", [None, "SIM", "live"])
+@pytest.mark.parametrize("key", ["read", "execution"])
+def test_live_generated_native_rejects_missing_or_mismatched_environment_before_business(monkeypatch, key, environment):
+    h = Fixture(monkeypatch, **live_settings())
+    _, submit, cancel = _enable_fixture_simulation_orders(h)
+    h.start()
+    response = h.call(key, "get_asset", environment=environment)
+    assert response["ok"] is False and "environment mismatch" in response["error"]
+    assert h.query_calls == []
+    submit.assert_not_called()
+    cancel.assert_not_called()
+    h.close()
+
+
+def test_live_generated_unknown_write_is_retained_and_not_resent(monkeypatch):
+    h = Fixture(monkeypatch, **live_settings())
+    _, submit, cancel = _enable_fixture_simulation_orders(h, fail_submit=True)
+    h.start()
+    _fixture_native_login(h)
+    params = dict(stock_code=CODE, action="BUY", volume=100, price=10.5, remark="local-live-fixture")
+    original = h.call("execution", "submit_order", params, request_id="live-local-unknown")
+    assert original["environment"] == "LIVE" and original["data"]["status"] == "UNKNOWN"
+    assert original["data"]["automatic_retry"] is False and submit.call_count == 1
+    repeated = h.call("execution", "submit_order", params, request_id="live-local-unknown")
+    assert repeated["data"] == original["data"] and submit.call_count == 1
+    conflict = h.call("execution", "submit_order", dict(params, volume=200), request_id="live-local-unknown")
+    assert conflict["ok"] is False and submit.call_count == 1
+    cancel.assert_not_called()
+    h.close()
+
+
+@pytest.mark.parametrize("field,value", [("BIGQMT_ENVIRONMENT", "SIM"), ("BIGQMT_ACCOUNT_ID", ACCOUNT),
+                                        ("SHM_RPC_PERSISTENT_LIVE_READ_WRITE", False)])
+def test_live_generated_payload_tampering_rejected_before_account_binding(monkeypatch, field, value):
+    h = Fixture(monkeypatch, **live_settings())
+    h.namespace["_RUNTIMES"]["execution"][field] = value
+    with pytest.raises(RuntimeError, match="runtime policy changed"):
+        h.namespace["init"](h.context)
+    assert h.context.accounts == [] and all(not state.regions for state in h.states.values())
+    h.writes.assert_not_called()
+
+
+def test_live_cli_generates_only_reviewable_candidate_without_native_execution(tmp_path):
+    path = tmp_path / "AQP_LIVE_DUAL_SOURCE.py"
+    args = [sys.executable, str(ROOT / "tools/build_dual_shm_single_file.py"), "--output", str(path),
+        "--account-id", "8765432100", "--environment", "LIVE", "--persistent-live-read-write",
+        "--native-pid", str(os.getpid()), "--windows-session", "1",
+        "--read-name", "Local\\AQP_SHM_READONLY_LIVE_FIXTURE",
+        "--execution-name", "Local\\AQP_SHM_TRADE_LIVE_FIXTURE", "--symbols", CODE,
+        "--max-seconds", "0", "--max-requests", "0", "--enable-market-rpc"]
+    result = subprocess.run(args, text=True, capture_output=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "no native process started" in result.stdout
+    source = path.read_text(encoding="utf-8")
+    ast.parse(source, feature_version=(3, 6))
+    source.encode("ascii").decode("gbk")
+    namespace = {}
+    exec(compile(source, str(path), "exec"), namespace)
+    assert namespace["DUAL_SHM_SETTINGS"]["environment"] == "LIVE"
+    assert namespace["DUAL_SHM_SETTINGS"]["persistent_live_read_write"] is True
+    assert namespace["_RUNTIMES"]["execution"]["_SERVER"] is None
+
+
+@pytest.mark.parametrize("kind", ["read", "execution"])
+def test_live_single_source_builders_require_explicit_account_environment_policy_and_mailbox(kind):
+    builder = BUILDER.READ_BUILDER if kind == "read" else BUILDER.EXECUTION_BUILDER
+    kwargs = dict(account_id="8765432100", environment="LIVE", persistent_live_read_write=True,
+                  name="Local\\AQP_SHM_%s_LIVE_SINGLE_FIXTURE" % ("READONLY" if kind == "read" else "TRADE"))
+    if kind == "execution":
+        kwargs.update(native_stock_gateway=True, max_seconds=0, max_requests=0)
+    source = builder.build_source(**kwargs)
+    ast.parse(source, feature_version=(3, 6))
+    namespace = {}
+    exec(compile(source, "<single-live-source>", "exec"), namespace)
+    assert namespace["BIGQMT_ENVIRONMENT"] == "LIVE" and namespace["_SERVER"] is None
+    for changes in ({"environment": "SIM"}, {"persistent_live_read_write": False},
+                    {"account_id": ACCOUNT}, {"name": None}):
+        with pytest.raises(ValueError):
+            builder.build_source(**dict(kwargs, **changes))
+
+
+def test_live_generated_successful_native_submission_keeps_account_and_cancel_identity(monkeypatch):
+    h = Fixture(monkeypatch, **live_settings())
+    orders, submit, cancel = _enable_fixture_simulation_orders(h)
+    h.start()
+    _fixture_native_login(h)
+    response = h.call("execution", "submit_order", dict(stock_code=CODE, action="BUY", volume=100,
+        price=10.5, remark="local-live-confirmed"), request_id="live-local-submit")
+    assert response["ok"] and response["environment"] == "LIVE"
+    assert response["data"]["status"] == "CONFIRMED" and submit.call_count == 1
+    h.namespace["order_callback"](h.context, orders[0])
+    event = h.call("execution", "poll_execution_events", {"after_sequence": 0})
+    assert event["environment"] == "LIVE" and event["data"]["events"][0]["account_id"] == h.account
+    h.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge.handlers.order_settle_timeout_seconds = 0.005
+    cancelled = h.call("execution", "cancel_order", dict(order_sys_id="SIM-FIXTURE-001",
+        user_order_id="local-live-confirmed"), request_id="live-local-cancel")
+    assert cancelled["data"]["status"] == "UNKNOWN" and cancelled["data"]["automatic_retry"] is False
+    cancel.assert_called_once_with("SIM-FIXTURE-001", h.account, "STOCK", h.context)
+    h.close()
+
+
+def test_live_partial_quote_source_evidence_keeps_environment_and_raw_failure(monkeypatch):
+    h = Fixture(monkeypatch, **live_settings())
+    h.start()
+    h.context.get_full_tick = lambda codes: {CODE: dict(lastPrice=0.0, time=1792110000000)}
+    response = h.call("read", "get_full_tick", {"codes": [CODE]})
+    assert response["ok"] is False and response["environment"] == "LIVE"
+    assert response["data"]["source_evidence"]["environment"] == "LIVE"
+    assert response["data"]["source_evidence"]["complete"] is False
+    assert response["data"]["invalid_symbols"] == [CODE]
     h.close()

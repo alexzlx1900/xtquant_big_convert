@@ -4,6 +4,7 @@
 import argparse
 import ast
 import base64
+import re
 from pathlib import Path
 
 
@@ -17,7 +18,18 @@ SOURCE_FILES = {
 }
 
 
-def build_source():
+def build_source(account_id=None, environment="SIM", persistent_live_read_write=False, name=None):
+    if name is not None and (not isinstance(name, str) or not re.fullmatch(r"Local\\AQP_SHM_READONLY_[A-Za-z0-9_-]{1,58}", name)):
+        raise ValueError("explicit independent read mailbox required")
+    if environment not in ("SIM", "LIVE") or type(persistent_live_read_write) is not bool:
+        raise ValueError("explicit SIM/LIVE environment and boolean LIVE policy required")
+    if environment == "LIVE":
+        if (not persistent_live_read_write or not isinstance(account_id, str) or not account_id
+                or len(account_id) > 64 or account_id == "55013746" or name is None
+                or not all("0" <= char <= "9" for char in account_id)):
+            raise ValueError("LIVE read source requires explicit persistent LIVE policy and live numeric account")
+    elif persistent_live_read_write:
+        raise ValueError("persistent LIVE policy requires LIVE environment")
     sources = {name: (ROOT / path).read_text(encoding="utf-8") for name, path in SOURCE_FILES.items()}
     rpc_source = (ROOT / "src/bigqmt_signal_trader/redis_rpc.py").read_text(encoding="utf-8")
     tree = ast.parse(rpc_source)
@@ -31,6 +43,17 @@ def build_source():
     sources["aqp_readonly_serializer"] = "import datetime as _dt\nimport math\n\n" + "\n\n".join(helpers)
     embedded = {name: base64.b64encode(source.encode("utf-8")).decode("ascii") for name, source in sources.items()}
     entry = (ROOT / "src/BIGQMT_SHM_READONLY.py").read_text(encoding="utf-8")
+    settings = {"BIGQMT_ACCOUNT_ID": account_id, "BIGQMT_ENVIRONMENT": environment, "READONLY_SHM_NAME": name}
+    if persistent_live_read_write:
+        settings.update(READONLY_PERSISTENT_LIVE_READ_WRITE=True, READONLY_PERSISTENT_READONLY=True,
+                        READONLY_MAX_SECONDS=0, READONLY_MAX_REQUESTS=0)
+    lines = entry.splitlines(keepends=True)
+    for node in reversed(ast.parse(entry).body):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            key = node.targets[0].id
+            if key in settings and settings[key] is not None:
+                lines[node.lineno - 1:node.end_lineno] = ["%s = %r\n" % (key, settings[key])]
+    entry = "".join(lines)
     marker = "_EMBEDDED_SOURCES = {}  # BUILD_READONLY_EMBEDDED"
     if entry.count(marker) != 1:
         raise RuntimeError("readonly build marker is missing or duplicated")
@@ -46,8 +69,13 @@ def build_source():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--account-id")
+    parser.add_argument("--name")
+    parser.add_argument("--environment", choices=("SIM", "LIVE"), default="SIM")
+    parser.add_argument("--persistent-live-read-write", action="store_true")
     args = parser.parse_args()
-    source = build_source()
+    source = build_source(account_id=args.account_id, environment=args.environment,
+                          persistent_live_read_write=args.persistent_live_read_write, name=args.name)
     # 已存在产物不覆盖，便于审查候选与保持可恢复性。
     with args.output.open("x", encoding="utf-8", newline="\n") as stream:
         stream.write(source)

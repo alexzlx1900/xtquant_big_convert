@@ -1,5 +1,5 @@
 # coding: utf-8
-"""构建固定模拟账户双SHM入口；默认禁写，显式模拟读写不在QMT内初始化Redis。"""
+"""构建固定账户双SHM入口；默认模拟禁写，实盘须显式政策，不在QMT内初始化Redis。"""
 
 import argparse
 import ast
@@ -43,24 +43,35 @@ def _configure_source(source, settings):
 def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
                  execution_name, symbols, account_id=ACCOUNT, max_seconds=900,
                  max_requests=1000, enable_market_rpc=False, persistent_readonly=False,
-                 persistent_simulation_read_write=False):
-    if account_id != ACCOUNT:
+                 persistent_simulation_read_write=False, environment="SIM", persistent_live_read_write=False):
+    if environment not in ("SIM", "LIVE"):
+        raise ValueError("explicit SIM/LIVE environment required")
+    if environment == "LIVE":
+        if (persistent_live_read_write is not True or not isinstance(account_id, str) or not account_id
+                or len(account_id) > 64 or account_id == ACCOUNT
+                or not all("0" <= char <= "9" for char in account_id)):
+            raise ValueError("LIVE build requires explicit persistent LIVE policy and live numeric account")
+    elif persistent_live_read_write:
+        raise ValueError("persistent LIVE policy requires LIVE environment")
+    elif account_id != ACCOUNT:
         raise ValueError("this candidate is limited to simulation account 55013746")
     if type(native_pid) is not int or native_pid <= 0 or type(windows_session) is not int or windows_session < 0:
         raise ValueError("explicit native PID and Windows session required")
-    if type(persistent_readonly) is not bool or type(persistent_simulation_read_write) is not bool:
+    if (type(persistent_readonly) is not bool or type(persistent_simulation_read_write) is not bool
+            or type(persistent_live_read_write) is not bool):
         raise ValueError("persistent readonly selection must be explicit boolean")
-    if persistent_readonly and persistent_simulation_read_write:
+    if sum((persistent_readonly, persistent_simulation_read_write, persistent_live_read_write)) > 1:
         raise ValueError("choose exactly one persistent runtime policy")
-    persistent = persistent_readonly or persistent_simulation_read_write
+    read_write = persistent_simulation_read_write or persistent_live_read_write
+    persistent = persistent_readonly or read_write
     if persistent_readonly:
         if (hard_deadline_unix is not None or type(max_seconds) is not int or max_seconds != 0
                 or type(max_requests) is not int or max_requests != 0 or enable_market_rpc is not False):
             raise ValueError("persistent readonly requires no deadline, explicit zero budgets and market disabled")
-    elif persistent_simulation_read_write:
+    elif read_write:
         if (hard_deadline_unix is not None or type(max_seconds) is not int or max_seconds != 0
                 or type(max_requests) is not int or max_requests != 0):
-            raise ValueError("persistent simulation read-write requires no deadline and explicit zero budgets")
+            raise ValueError("persistent read-write requires no deadline and explicit zero budgets")
     else:
         if isinstance(hard_deadline_unix, bool) or not isinstance(hard_deadline_unix, (int, float)) or not math.isfinite(hard_deadline_unix) or hard_deadline_unix <= 0:
             raise ValueError("finite positive absolute deadline required")
@@ -75,30 +86,36 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
     if not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= 64 or any(not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", code) for code in symbols) or len(set(symbols)) != len(symbols):
         raise ValueError("1-64 unique confirmed SH/SZ/BJ symbols required")
     read = _configure_source(READ_BUILDER.build_source(), {
-        "BIGQMT_ACCOUNT_ID": account_id, "READONLY_SHM_NAME": read_name,
+        "BIGQMT_ACCOUNT_ID": account_id, "BIGQMT_ENVIRONMENT": environment, "READONLY_SHM_NAME": read_name,
         "READONLY_SYMBOLS": list(symbols), "READONLY_MAX_SECONDS": max_seconds,
         "READONLY_MAX_REQUESTS": max_requests, "READONLY_ENABLE_MARKET_RPC": enable_market_rpc,
         "READONLY_PERSISTENT_READONLY": persistent,
-        "READONLY_PERSISTENT_MARKET_RPC": persistent_simulation_read_write and enable_market_rpc,
+        "READONLY_PERSISTENT_MARKET_RPC": read_write and enable_market_rpc,
+        "READONLY_PERSISTENT_LIVE_READ_WRITE": persistent_live_read_write,
     })
     execution = EXECUTION_BUILDER.build_source(account_id=account_id, name=execution_name,
-        native_stock_gateway=persistent_simulation_read_write)
+        native_stock_gateway=read_write, environment=environment,
+        persistent_live_read_write=persistent_live_read_write,
+        max_seconds=0 if persistent_live_read_write else None,
+        max_requests=0 if persistent_live_read_write else None)
     execution = _configure_source(execution, {
-        "SHM_RPC_BIND_ACCOUNT_CALLBACKS": False, "SHM_RPC_ALLOW_ORDER_METHODS": persistent_simulation_read_write,
+        "SHM_RPC_BIND_ACCOUNT_CALLBACKS": False, "SHM_RPC_ALLOW_ORDER_METHODS": read_write,
         "SHM_RPC_ORDER_GATEWAY": None,
         "SHM_RPC_MAX_SECONDS": max_seconds, "SHM_RPC_MAX_REQUESTS": max_requests,
         "SHM_RPC_PERSISTENT_READONLY": persistent_readonly,
         "SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE": persistent_simulation_read_write,
-        "SHM_RPC_ACCOUNT_ALREADY_BOUND": persistent_simulation_read_write,
+        "SHM_RPC_PERSISTENT_LIVE_READ_WRITE": persistent_live_read_write,
+        "SHM_RPC_ACCOUNT_ALREADY_BOUND": read_write,
     })
     sources = {"read": read, "execution": execution}
     for key, source in sources.items():
         ast.parse(source, filename=key, feature_version=(3, 6))
     payloads = {key: base64.b64encode(source.encode("utf-8")).decode("ascii") for key, source in sources.items()}
-    settings = dict(account_id=account_id, native_pid=native_pid, windows_session=windows_session,
+    settings = dict(account_id=account_id, environment=environment, native_pid=native_pid, windows_session=windows_session,
         hard_deadline_unix=None if persistent else float(hard_deadline_unix), max_seconds=max_seconds,
         max_requests_per_source=max_requests, market_rpc_enabled=enable_market_rpc,
-        persistent_readonly=persistent_readonly, persistent_simulation_read_write=persistent_simulation_read_write)
+        persistent_readonly=persistent_readonly, persistent_simulation_read_write=persistent_simulation_read_write,
+        persistent_live_read_write=persistent_live_read_write)
     output = TEMPLATE.replace("__DUAL_SETTINGS__", repr(settings)).replace("__DUAL_PAYLOADS__", repr(payloads))
     output = output.encode("ascii", "backslashreplace").decode("ascii")
     ast.parse(output, feature_version=(3, 6))
@@ -106,7 +123,7 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
 
 
 TEMPLATE = '''#coding:gbk
-"""Fixed simulation account, one native binding and two private SHM sources."""
+"""Fixed account/environment, one native binding and two private SHM sources."""
 import base64
 import ctypes
 import json
@@ -146,10 +163,19 @@ def init(ContextInfo):
         _verify_identity()
         _STARTED_AT = time.monotonic()
         _STARTED_AT_UNIX = time.time()
-        read_write = DUAL_SHM_SETTINGS["persistent_simulation_read_write"]
+        live_write = DUAL_SHM_SETTINGS["persistent_live_read_write"]
+        read_write = DUAL_SHM_SETTINGS["persistent_simulation_read_write"] or live_write
+        environment = DUAL_SHM_SETTINGS["environment"]
+        account = DUAL_SHM_SETTINGS["account_id"]
+        if (environment not in ("SIM", "LIVE") or type(live_write) is not bool
+                or sum((DUAL_SHM_SETTINGS["persistent_readonly"], DUAL_SHM_SETTINGS["persistent_simulation_read_write"], live_write)) > 1
+                or environment == "LIVE" and (not live_write or not isinstance(account, str) or not account
+                    or len(account) > 64 or account == "55013746" or not all("0" <= char <= "9" for char in account))
+                or environment == "SIM" and (live_write or account != "55013746")):
+            raise RuntimeError("fixed account/environment policy changed")
         persistent = DUAL_SHM_SETTINGS["persistent_readonly"] or read_write
         if persistent:
-            if (DUAL_SHM_SETTINGS["account_id"] != "55013746" or DUAL_SHM_SETTINGS["hard_deadline_unix"] is not None
+            if (DUAL_SHM_SETTINGS["hard_deadline_unix"] is not None
                     or DUAL_SHM_SETTINGS["max_seconds"] != 0 or DUAL_SHM_SETTINGS["max_requests_per_source"] != 0
                     or DUAL_SHM_SETTINGS["persistent_readonly"] and DUAL_SHM_SETTINGS["market_rpc_enabled"] is not False):
                 raise RuntimeError("persistent runtime policy changed")
@@ -168,13 +194,20 @@ def init(ContextInfo):
         if (execution["SHM_RPC_ALLOW_ORDER_METHODS"] is not read_write or execution["SHM_RPC_BIND_ACCOUNT_CALLBACKS"] is not False
                 or execution["SHM_RPC_ORDER_GATEWAY"] is not None or execution["SHM_RPC_ORDER_GATEWAY_FACTORY"] is not expected_factory):
             raise RuntimeError("readonly execution source gate changed")
-        if execution["SHM_RPC_ACCOUNT_ALREADY_BOUND"] is not read_write or execution["SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE"] is not read_write or execution["SHM_RPC_PERSISTENT_READONLY"] is not DUAL_SHM_SETTINGS["persistent_readonly"]:
+        if (execution["SHM_RPC_ACCOUNT_ALREADY_BOUND"] is not read_write
+                or execution["SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE"] is not DUAL_SHM_SETTINGS["persistent_simulation_read_write"]
+                or execution["SHM_RPC_PERSISTENT_LIVE_READ_WRITE"] is not live_write
+                or execution["BIGQMT_ENVIRONMENT"] != environment or execution["BIGQMT_ACCOUNT_ID"] != account
+                or execution["SHM_RPC_PERSISTENT_READONLY"] is not DUAL_SHM_SETTINGS["persistent_readonly"]):
             raise RuntimeError("execution source runtime policy changed")
         read = _RUNTIMES["read"]
-        if read["READONLY_PERSISTENT_READONLY"] is not persistent or read["READONLY_ENABLE_MARKET_RPC"] is not DUAL_SHM_SETTINGS["market_rpc_enabled"] or read["READONLY_PERSISTENT_MARKET_RPC"] is not (read_write and DUAL_SHM_SETTINGS["market_rpc_enabled"]):
+        if (read["READONLY_PERSISTENT_READONLY"] is not persistent or read["READONLY_ENABLE_MARKET_RPC"] is not DUAL_SHM_SETTINGS["market_rpc_enabled"]
+                or read["READONLY_PERSISTENT_MARKET_RPC"] is not (read_write and DUAL_SHM_SETTINGS["market_rpc_enabled"])
+                or read["READONLY_PERSISTENT_LIVE_READ_WRITE"] is not live_write
+                or read["BIGQMT_ENVIRONMENT"] != environment or read["BIGQMT_ACCOUNT_ID"] != account):
             raise RuntimeError("readonly source runtime policy changed")
         if read_write and (not callable(globals().get("passorder")) or not callable(globals().get("cancel"))):
-            raise RuntimeError("explicit native simulation order/cancel functions required")
+            raise RuntimeError("explicit native %s order/cancel functions required" % ("LIVE" if live_write else "simulation"))
         ContextInfo.set_account(DUAL_SHM_SETTINGS["account_id"])
         _RUNTIMES["read"]["READONLY_MAX_SECONDS"] = remaining
         execution["SHM_RPC_MAX_SECONDS"] = remaining
@@ -201,12 +234,12 @@ def init(ContextInfo):
         rpc_transport = execution["_load_embedded"]("bigqmt_signal_trader.transports.shm_rpc")
         execution_capabilities = sorted(rpc_transport.READ_METHODS | (rpc_transport.WRITE_METHODS if read_write else frozenset()))
         print("AQP_DUAL_SHM_READY " + json.dumps(dict(
-            account_id=DUAL_SHM_SETTINGS["account_id"], native_pid=DUAL_SHM_SETTINGS["native_pid"],
+            account_id=DUAL_SHM_SETTINGS["account_id"], environment=environment, native_pid=DUAL_SHM_SETTINGS["native_pid"],
             windows_session=DUAL_SHM_SETTINGS["windows_session"],
             read_name=_RUNTIMES["read"]["READONLY_SHM_NAME"], execution_name=execution["SHM_RPC_NAME"],
             read_session_id=read_server.mailbox.session_id, execution_session_id=execution_server.bridge.mailbox.session_id,
             allow_order_methods=read_write, source_deadline_unix=_SOURCE_DEADLINE,
-            runtime_policy="PERSISTENT_SIMULATION_READ_WRITE" if read_write else "PERSISTENT_READONLY" if persistent else "BOUNDED_READONLY",
+            runtime_policy="PERSISTENT_LIVE_READ_WRITE" if live_write else "PERSISTENT_SIMULATION_READ_WRITE" if read_write else "PERSISTENT_READONLY" if persistent else "BOUNDED_READONLY",
             started_at_unix=_STARTED_AT_UNIX, account_bound_once=True,
             account_callback_route="outer_to_execution", execution_bind_account_callbacks=False,
             max_seconds=DUAL_SHM_SETTINGS["max_seconds"], max_requests_per_source=DUAL_SHM_SETTINGS["max_requests_per_source"],
@@ -221,7 +254,7 @@ def init(ContextInfo):
 def _within_budget(ContextInfo):
     if _CLOSED or _STARTED_AT is None:
         return False
-    if not (DUAL_SHM_SETTINGS["persistent_readonly"] or DUAL_SHM_SETTINGS["persistent_simulation_read_write"]) and (time.time() >= _SOURCE_DEADLINE or time.monotonic() - _STARTED_AT >= DUAL_SHM_SETTINGS["max_seconds"]):
+    if not (DUAL_SHM_SETTINGS["persistent_readonly"] or DUAL_SHM_SETTINGS["persistent_simulation_read_write"] or DUAL_SHM_SETTINGS["persistent_live_read_write"]) and (time.time() >= _SOURCE_DEADLINE or time.monotonic() - _STARTED_AT >= DUAL_SHM_SETTINGS["max_seconds"]):
         stop(ContextInfo)
         return False
     if any(runtime["_SERVER"] is not None and runtime["_SERVER"].closed for runtime in _RUNTIMES.values()):
@@ -283,7 +316,8 @@ def stop(ContextInfo):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--account-id", choices=(ACCOUNT,), default=ACCOUNT)
+    parser.add_argument("--account-id", default=ACCOUNT)
+    parser.add_argument("--environment", choices=("SIM", "LIVE"), default="SIM")
     parser.add_argument("--native-pid", type=int, required=True)
     parser.add_argument("--windows-session", type=int, required=True)
     parser.add_argument("--hard-deadline-unix", type=float)
@@ -295,13 +329,15 @@ def main():
     parser.add_argument("--enable-market-rpc", action="store_true", help="复用已有市场读能力；默认关闭")
     parser.add_argument("--persistent-readonly", action="store_true", help="仅55013746禁写驻留，必须显式max-seconds=0/max-requests=0且无deadline")
     parser.add_argument("--persistent-simulation-read-write", action="store_true", help="显式55013746模拟读写驻留；读源禁写，执行源启用普通股票限价gateway；必须零预算无deadline")
+    parser.add_argument("--persistent-live-read-write", action="store_true", help="显式实盘常驻读写候选；仅构建不启动，必须零预算无deadline")
     args = parser.parse_args()
     source = build_source(account_id=args.account_id, native_pid=args.native_pid,
         windows_session=args.windows_session, hard_deadline_unix=args.hard_deadline_unix,
         read_name=args.read_name, execution_name=args.execution_name, symbols=args.symbols.split(","),
         max_seconds=args.max_seconds, max_requests=args.max_requests, enable_market_rpc=args.enable_market_rpc,
         persistent_readonly=args.persistent_readonly,
-        persistent_simulation_read_write=args.persistent_simulation_read_write)
+        persistent_simulation_read_write=args.persistent_simulation_read_write,
+        environment=args.environment, persistent_live_read_write=args.persistent_live_read_write)
     descriptor = os.open(str(args.output), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
         stream.write(source)

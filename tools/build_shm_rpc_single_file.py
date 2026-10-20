@@ -43,14 +43,25 @@ def extract_rpc_handlers():
 
 
 def build_source(account_id=None, name=None, max_seconds=None, max_requests=None, native_stock_gateway=False,
-                 bind_account_callbacks=False):
+                 bind_account_callbacks=False, environment="SIM", persistent_live_read_write=False):
     if account_id is not None and (not isinstance(account_id, str) or not account_id or len(account_id) > 64):
         raise ValueError("explicit fixed account required")
     if name is not None and (not isinstance(name, str) or not re.fullmatch(r"Local\\AQP_SHM_TRADE_[A-Za-z0-9_-]{1,58}", name)):
         raise ValueError("explicit independent trade mailbox required")
-    if max_seconds is not None and (type(max_seconds) is not int or not 1 <= max_seconds <= 1800):
+    if environment not in ("SIM", "LIVE") or type(persistent_live_read_write) is not bool:
+        raise ValueError("explicit SIM/LIVE environment and boolean LIVE policy required")
+    if environment == "LIVE":
+        if (not persistent_live_read_write or not account_id or account_id == "55013746" or name is None
+                or not all("0" <= char <= "9" for char in account_id)
+                or native_stock_gateway is not True or bind_account_callbacks is not False
+                or type(max_seconds) is not int or max_seconds != 0
+                or type(max_requests) is not int or max_requests != 0):
+            raise ValueError("LIVE build requires explicit persistent LIVE policy, live numeric account, native gateway and zero budgets")
+    elif persistent_live_read_write:
+        raise ValueError("persistent LIVE policy requires LIVE environment")
+    if not persistent_live_read_write and max_seconds is not None and (type(max_seconds) is not int or not 1 <= max_seconds <= 1800):
         raise ValueError("runtime seconds must be within [1,1800]")
-    if max_requests is not None and (type(max_requests) is not int or not 1 <= max_requests <= 1000):
+    if not persistent_live_read_write and max_requests is not None and (type(max_requests) is not int or not 1 <= max_requests <= 1000):
         raise ValueError("request budget must be within [1,1000]")
     if type(native_stock_gateway) is not bool:
         raise ValueError("native stock gateway selection must be explicit boolean")
@@ -62,9 +73,11 @@ def build_source(account_id=None, name=None, max_seconds=None, max_requests=None
         ast.parse(module_source, filename=module_name, feature_version=(3, 6))
     embedded = {name: base64.b64encode(source.encode("utf-8")).decode("ascii") for name, source in sources.items()}
     entry = (ROOT / "src/BIGQMT_SHM_RPC.py").read_text(encoding="utf-8")
-    settings = {"BIGQMT_ACCOUNT_ID": account_id, "SHM_RPC_NAME": name,
+    settings = {"BIGQMT_ACCOUNT_ID": account_id, "BIGQMT_ENVIRONMENT": environment, "SHM_RPC_NAME": name,
                 "SHM_RPC_MAX_SECONDS": max_seconds, "SHM_RPC_MAX_REQUESTS": max_requests,
                 "SHM_RPC_BIND_ACCOUNT_CALLBACKS": True if bind_account_callbacks else None}
+    if persistent_live_read_write:
+        settings.update(SHM_RPC_PERSISTENT_LIVE_READ_WRITE=True, SHM_RPC_ALLOW_ORDER_METHODS=True)
     lines = entry.splitlines(keepends=True)
     for node in ast.parse(entry).body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -92,10 +105,13 @@ def main():
     parser.add_argument("--max-requests", type=int)
     parser.add_argument("--native-stock-gateway", action="store_true", help="选择原生股票factory；保持默认禁写")
     parser.add_argument("--bind-account-callbacks", action="store_true", help="显式绑定账户回报；保持默认禁写")
+    parser.add_argument("--environment", choices=("SIM", "LIVE"), default="SIM")
+    parser.add_argument("--persistent-live-read-write", action="store_true", help="显式实盘常驻候选；仅构建不启动")
     args = parser.parse_args()
     output = build_source(account_id=args.account_id, name=args.name, max_seconds=args.max_seconds,
                           max_requests=args.max_requests, native_stock_gateway=args.native_stock_gateway,
-                          bind_account_callbacks=args.bind_account_callbacks)
+                          bind_account_callbacks=args.bind_account_callbacks, environment=args.environment,
+                          persistent_live_read_write=args.persistent_live_read_write)
     with args.output.open("x", encoding="utf-8", newline="\n") as stream:
         stream.write(output)
     print("built SHM RPC single file: %s (%s bytes)" % (args.output, len(output.encode("ascii"))))

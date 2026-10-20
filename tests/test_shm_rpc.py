@@ -343,3 +343,49 @@ def test_real_explicit_contract_remains_known_in_each_callback(event_type, field
     assert event["order_sys_id"] == "SYS-REAL-42" and event["identity_status"] == "KNOWN"
     assert event["native_order_id"] == 123
     h.close()
+
+
+@pytest.mark.parametrize("changes", [
+    {"persistent_live_read_write": False}, {"persistent_live_read_write": 1},
+    {"account_id": "55013746"}, {"account_id": "LIVE_TEST"}, {"account_id": "１２３４"},
+    {"allow_order_methods": False}, {"environment": "SIM"},
+])
+def test_live_transport_requires_explicit_live_policy_before_opening_mailbox(changes):
+    values = dict(name=NAME, account_id="8765432100", environment="LIVE",
+                  persistent_live_read_write=True, allow_order_methods=True)
+    values.update(changes)
+    with pytest.raises(ValueError):
+        ShmRpcClient(**values)
+
+
+def test_live_transport_handshake_requires_live_policy_and_response_environment():
+    class Client:
+        def __init__(self, name, account):
+            self.mailbox = SimpleNamespace(session_id="fixture-live-sid", server_pid=777)
+            self.requests = []
+            self.response_environment = "LIVE"
+
+        def send_request(self, request, timeout_seconds):
+            self.requests.append(request)
+            result = dict(ok=True, data=dict(account_id="8765432100", environment="LIVE",
+                session_id="fixture-live-sid", native_pid=777, transport="shm_rpc",
+                allow_order_methods=True, runtime_policy="PERSISTENT_LIVE_READ_WRITE"))
+            if self.response_environment is not None:
+                result["environment"] = self.response_environment
+            return result
+
+        def close(self):
+            pass
+
+    client = ShmRpcClient(name=NAME, account_id="8765432100", environment="LIVE",
+        persistent_live_read_write=True, allow_order_methods=True, client_factory=Client)
+    result = client.verify_identity(expected_session_id="fixture-live-sid", expected_native_pid=777)
+    assert result["environment"] == "LIVE" and client._client.requests[0]["environment"] == "LIVE"
+    client._client.response_environment = None
+    with pytest.raises(ShmProtocolError, match="response environment mismatch"):
+        client.call("submit_order", ORDER)
+    assert len(client._client.requests) == 2
+    with pytest.raises(ShmProtocolError, match="unconfirmed client"):
+        client.call("submit_order", ORDER)
+    assert len(client._client.requests) == 2
+    client.close()
