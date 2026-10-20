@@ -4,6 +4,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -46,12 +47,20 @@ def gateway_modules(monkeypatch):
 
 
 class Harness:
-    def __init__(self, monkeypatch, gateway, *, allow_writes=True, unknown_submit=False):
+    def __init__(self, monkeypatch, gateway, *, allow_writes=True, unknown_submit=False,
+                 live=False, start_write_blocked=None, live_write_authorized=False):
         self.allow_writes, self.unknown_submit = allow_writes, unknown_submit
+        self.account = "8882152350" if live else ACCOUNT
+        self.environment = "LIVE" if live else "SIM"
+        self.profile_id = "live-stock" if live else "sim-stock"
+        self.policy = ("PERSISTENT_LIVE_READ_WRITE" if live else
+                       "PERSISTENT_SIMULATION_READ_WRITE" if allow_writes else "PERSISTENT_READONLY")
+        initial_block = live if start_write_blocked is None else start_write_blocked
         self.source = DUAL.Fixture(
             monkeypatch, hard_deadline_unix=None, max_seconds=0, max_requests=0,
-            persistent_readonly=not allow_writes,
-            persistent_simulation_read_write=allow_writes,
+            account_id=self.account, environment=self.environment,
+            persistent_readonly=not allow_writes, persistent_live_read_write=live,
+            persistent_simulation_read_write=allow_writes and not live,
             enable_market_rpc=allow_writes,
         )
         self.gateway, self.redis = gateway, MemoryRedis()
@@ -75,31 +84,33 @@ class Harness:
         self.source.start()
         self.source.namespace["account_callback"](
             self.source.context,
-            SimpleNamespace(m_strAccountID=ACCOUNT, m_strStatus="登录成功"),
+            SimpleNamespace(m_strAccountID=self.account, m_strStatus="登录成功"),
         )
         self.proxy = RedisShmReadOnlyProxy(
-            RedisTransport(self.redis, account_id=ACCOUNT),
+            RedisTransport(self.redis, account_id=self.account),
             self.source.clients["read"], self.source.clients["execution"],
+            account_id=self.account, environment=self.environment,
+            start_write_blocked=initial_block, live_write_authorized=live_write_authorized,
             expected_readonly_session_id=self.source.clients["read"].mailbox.session_id,
             expected_execution_session_id=self.source.clients["execution"].mailbox.session_id,
             expected_native_pid=os.getpid(), expected_windows_session_id=1,
             timeout_seconds=1.0, max_requests=0, deadline_unix=None,
             allow_order_methods=allow_writes,
-            runtime_policy="PERSISTENT_SIMULATION_READ_WRITE" if allow_writes else "PERSISTENT_READONLY",
+            runtime_policy=self.policy,
         )
         self.pool = ThreadPoolExecutor(1)
         self.stop = threading.Event()
         self.pump = None
         self.profile = gateway.config.GatewayAccountProfile(
-            profile_id="sim-stock", label="local external simulation", environment="SIM",
-            account_id=ACCOUNT, userdata_mini_path="fixture-not-accessed", order_submit_mode="SYNC",
+            profile_id=self.profile_id, label="local external fixture", environment=self.environment,
+            account_id=self.account, userdata_mini_path="fixture-not-accessed", order_submit_mode="SYNC",
             bigqmt_rpc=gateway.config.BigQmtRpcConfig(
                 transport="redis_shm", timeout_seconds=1.0, allow_order_methods=allow_writes,
                 expected_rpc_revision="external-redis-dual-shm-v1",
                 expected_session_id=self.source.clients["execution"].mailbox.session_id,
                 expected_read_session_id=self.source.clients["read"].mailbox.session_id,
                 expected_native_pid=os.getpid(), expected_windows_session_id=1,
-                expected_source_policy="PERSISTENT_SIMULATION_READ_WRITE" if allow_writes else "PERSISTENT_READONLY",
+                expected_source_policy=self.policy,
             ),
         )
         self.source_binding = {
@@ -108,13 +119,15 @@ class Harness:
             "native_pid": os.getpid(), "windows_session_id": 1,
         }
         self.multi = gateway.multi.MultiAccountMiniQmtAdapter(gateway.config.WindowsGatewayLocalConfig(
-            gateway_id="qmt-local-test", default_profile_id="sim-stock", profiles=[self.profile],
+            gateway_id="qmt-local-test", default_profile_id=self.profile_id, profiles=[self.profile],
         ))
 
         def client_factory(**kwargs):
             return gateway.client.RedisShmRpcClient(
-                account_id=ACCOUNT, redis_config={}, timeout_seconds=1.0,
-                transport=RedisTransport(self.redis, account_id=ACCOUNT),
+                account_id=self.account, environment=self.environment,
+                expected_source_policy=self.policy, allow_order_methods=allow_writes,
+                redis_config={}, timeout_seconds=1.0,
+                transport=RedisTransport(self.redis, account_id=self.account),
                 expected_source_binding=self.source_binding,
             )
 
@@ -123,15 +136,15 @@ class Harness:
             "qmt-local-test", self.profile, trader_factory=client_factory,
             shared_events=self.multi._shared_events,
         )
-        self.multi._bigqmt_read_adapters["sim-stock"] = self.read
-        self.multi._bigqmt_order_adapters["sim-stock"] = self.order
+        self.multi._bigqmt_read_adapters[self.profile_id] = self.read
+        self.multi._bigqmt_order_adapters[self.profile_id] = self.order
 
     def submit(self, *args):
         self.submit_calls.append(args)
         if self.unknown_submit:
             raise RuntimeError("fixture native submission outcome is unknown")
         row = SimpleNamespace(
-            m_strAccountID=ACCOUNT, m_strOrderSysID="7620", m_strInstrumentID="000001",
+            m_strAccountID=self.account, m_strOrderSysID="7620", m_strInstrumentID="000001",
             m_strExchangeID="SZ", m_strRemark=REMARK, m_strStrategyName="",
             m_nOffsetFlag=48, m_nOpType=23, m_nOrderStatus=50,
             m_nVolumeTotalOriginal=100, m_nVolumeTraded=0, m_dLimitPrice=11.42,
@@ -307,6 +320,97 @@ def test_unknown_native_write_stops_new_writes_but_keeps_formal_account_queries(
                     dict(order, client_order_id="native-second"), profile_id="sim-stock",
                 ))
             assert len(h.submit_calls) == 1
+        finally:
+            await h.close()
+
+    asyncio.run(run())
+
+
+def test_live_default_delivery_reads_actual_dual_source_but_never_writes(monkeypatch, gateway_modules):
+    h = Harness(monkeypatch, gateway_modules, live=True)
+
+    async def run():
+        try:
+            await h.start()
+            asset = await h.operation(h.read.query_asset())
+            positions = await h.operation(h.read.query_positions_with_evidence())
+            assert asset["source_evidence"]["environment"] == "LIVE"
+            assert positions["source_evidence"]["environment"] == "LIVE"
+            proof = h.proxy.identity_snapshot()
+            assert proof["environment"] == "LIVE" and proof["writes_blocked"] is True
+            assert proof["live_write_authorized"] is False and proof["write_ready"] is False
+            await h.operation(h.order.connect_execution_events())
+            with pytest.raises(Exception, match="(?i)blocked|disabled|write|写|ready"):
+                await h.operation(h.order.submit_order({
+                    "profile_id": h.profile_id, "account_id": h.account, "symbol": CODE,
+                    "side": "BUY", "quantity": 100, "price_type": 11, "price": 11.42,
+                    "client_order_id": REMARK,
+                }, profile_id=h.profile_id))
+            assert not h.submit_calls and not h.cancel_calls
+            assert not h.redis.hashes.get("aqp:redis_shm:write_ledger:%s:v1" % h.account)
+            assert "aqp:redis_shm:write_ledger:55013746:v1" not in h.redis.hashes
+        finally:
+            await h.close()
+
+    asyncio.run(run())
+
+
+def test_live_explicit_future_activation_confirms_order_and_deduplicates_same_rid_across_real_wire(monkeypatch, gateway_modules):
+    h = Harness(monkeypatch, gateway_modules, live=True,
+                live_write_authorized=True, start_write_blocked=False)
+
+    async def run():
+        try:
+            await h.start()
+            await h.operation(h.order.connect_execution_events())
+            result = await h.operation(h.order.submit_order({
+                "profile_id": h.profile_id, "account_id": h.account, "symbol": CODE,
+                "side": "BUY", "quantity": 100, "price_type": 11, "price": 11.42,
+                "client_order_id": REMARK,
+            }, profile_id=h.profile_id))
+            assert result.status == "ACCEPTED" and result.broker_order_id == "7620"
+            assert len(h.submit_calls) == 1 and h.submit_calls[0][2] == h.account
+            ledger = h.redis.hashes["aqp:redis_shm:write_ledger:%s:v1" % h.account]
+            assert len(ledger) == 1
+            record = json.loads(next(iter(ledger.values())))
+            assert record["state"] == "CONFIRMED" and record["binding"]["environment"] == "LIVE"
+            schema, account, method, params = json.loads(record["fingerprint"])
+            assert schema == 1 and account == h.account and method == "submit_order"
+            # 直接经正式客户端、原编码、同一代理和原生双源重读精确RID；不制造第二个订单。
+            replay = await h.operation(asyncio.to_thread(h.order._get_shm_rpc_client().call,
+                method, params, request_id=record["request_id"]))
+            assert replay["status"] == "CONFIRMED" and replay["order_sys_id"] == "7620"
+            assert len(h.submit_calls) == 1 and len(ledger) == 1
+            assert h.proxy.identity_snapshot()["write_ready"] is True
+            assert "aqp:redis_shm:write_ledger:55013746:v1" not in h.redis.hashes
+            snapshot = await h.operation(h.read.query_execution_snapshot())
+            assert snapshot["orders_source_evidence"]["environment"] == "LIVE"
+            assert len(snapshot["orders"]) == 1
+        finally:
+            await h.close()
+
+    asyncio.run(run())
+
+
+def test_live_unknown_native_submission_blocks_second_order_and_keeps_account_reads(monkeypatch, gateway_modules):
+    h = Harness(monkeypatch, gateway_modules, live=True, unknown_submit=True,
+                live_write_authorized=True, start_write_blocked=False)
+
+    async def run():
+        order = dict(profile_id=h.profile_id, account_id=h.account, symbol=CODE,
+                     side="BUY", quantity=100, price_type=11, price=11.42, client_order_id=REMARK)
+        try:
+            await h.start()
+            result = await h.operation(h.order.submit_order(order, profile_id=h.profile_id))
+            assert result.status == "UNKNOWN" and len(h.submit_calls) == 1
+            assert h.proxy.identity_snapshot()["writes_blocked"] is True
+            record = json.loads(next(iter(h.redis.hashes["aqp:redis_shm:write_ledger:%s:v1" % h.account].values())))
+            assert record["state"] == "UNKNOWN" and record["binding"]["environment"] == "LIVE"
+            asset = await h.operation(h.read.query_asset())
+            assert asset["source_evidence"]["environment"] == "LIVE"
+            with pytest.raises(Exception, match="UNKNOWN|blocked|disabled|stopped"):
+                await h.operation(h.order.submit_order(dict(order, client_order_id="native-second"), profile_id=h.profile_id))
+            assert len(h.submit_calls) == 1 and not h.cancel_calls
         finally:
             await h.close()
 
