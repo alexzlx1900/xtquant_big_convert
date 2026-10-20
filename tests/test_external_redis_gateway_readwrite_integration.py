@@ -467,6 +467,10 @@ def test_proxy_quote_limit_rejects_live_129_and_sim_65_before_native_io(monkeypa
     async def run():
         try:
             await h.start()
+            before = len(h.redis.values)
+            with pytest.raises(Exception, match="1-%s" % limit):
+                await h.operation(h.read.query_quotes(symbols))
+            assert len(h.redis.values) == before and not native_calls
             # 绕过页面层数量校验，仍走正式Gateway客户端和真实Redis wire，
             # 证明拒绝来自代理本身，而不是只验证原生白名单或前端限制。
             with pytest.raises(Exception):
