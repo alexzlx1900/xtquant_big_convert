@@ -1413,6 +1413,7 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         before = copy.deepcopy(snapshot)
         proxy = object.__new__(RedisShmReadOnlyProxy)
         proxy.account_id = ACCOUNT
+        proxy.environment = "SIM"
         proof = proxy._validate_reconciliation_snapshot("submit_order", params, "1258", identity,
                                                         snapshot, claimed_at, started_at, observed_at, binding)
         self.assertEqual(proof["business_terminal_status"], "54")

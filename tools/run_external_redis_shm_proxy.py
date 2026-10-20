@@ -29,12 +29,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 os.environ.setdefault("BIGQMT_LOG_ENABLED", "0")
 
-from bigqmt_signal_trader.redis_shm_proxy import RUNTIME_POLICIES, RedisShmReadOnlyProxy
+from bigqmt_signal_trader.redis_shm_proxy import RUNTIME_POLICIES, WRITE_POLICIES, RedisShmReadOnlyProxy, validate_account_policy
 from bigqmt_signal_trader.transports.readonly_shm import ShmReadOnlyClient, validate_name
 from bigqmt_signal_trader.transports.redis_transport import RedisTransport
-
-
-ACCOUNT = "55013746"
 
 
 def _integer(value, name, minimum, maximum):
@@ -51,18 +48,23 @@ def _finite(value, name, minimum, maximum=None):
 
 def validate_config(value, now_unix=None):
     """检查当次来源及本地 Redis 目标，不读取客户端或运行状态。"""
-    if not isinstance(value, dict) or value.get("account_id") != ACCOUNT:
-        raise ValueError("simulation account 55013746 is required")
+    if not isinstance(value, dict):
+        raise ValueError("explicit account configuration required")
     policy = value.get("runtime_policy", "BOUNDED")
     if policy not in RUNTIME_POLICIES:
         raise ValueError("explicit supported runtime_policy required")
-    if type(value.get("allow_order_methods")) is not bool or value["allow_order_methods"] is not (policy == "PERSISTENT_SIMULATION_READ_WRITE"):
-        raise ValueError("allow_order_methods must explicitly match simulation runtime policy")
+    environment = value.get("environment", "SIM")
+    validate_account_policy(value.get("account_id"), environment, policy)
+    if type(value.get("allow_order_methods")) is not bool or value["allow_order_methods"] is not (policy in WRITE_POLICIES):
+        raise ValueError("allow_order_methods must explicitly match account runtime policy")
     result = dict(value)
+    result["environment"] = environment
     result["runtime_policy"] = policy
-    result["start_write_blocked"] = value.get("start_write_blocked", policy == "PERSISTENT_SIMULATION_READ_WRITE")
+    result["start_write_blocked"] = value.get("start_write_blocked", policy in WRITE_POLICIES)
     if type(result["start_write_blocked"]) is not bool:
         raise ValueError("start_write_blocked must be an explicit boolean")
+    if environment == "LIVE" and value.get("start_write_blocked") is not True:
+        raise ValueError("LIVE must explicitly start_write_blocked=true")
     result["native_pid"] = _integer(value.get("native_pid"), "native_pid", 1, 0xFFFFFFFF)
     result["windows_session"] = _integer(value.get("windows_session"), "windows_session", 0, 0xFFFFFFFF)
     for field, prefix in (("read_name", "Local\\AQP_SHM_READONLY_"), ("execution_name", "Local\\AQP_SHM_TRADE_")):
@@ -150,7 +152,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         parent_deadline = min(config["source_deadline_unix"], time.time() + config["max_seconds"])
     redis_client, proxy, clients = None, None, []
     errors = []
-    result = dict(status="FAILED", account_id=ACCOUNT, automatic_retry=False,
+    result = dict(status="FAILED", account_id=config["account_id"], environment=config["environment"], automatic_retry=False,
                   allow_order_methods=config["allow_order_methods"], runtime_policy=config["runtime_policy"],
                   start_write_blocked=config["start_write_blocked"],
                   writes_blocked=config["start_write_blocked"], write_ready=False,
@@ -160,16 +162,17 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
     phase = "REDIS_CLIENT_CREATE"
     try:
         redis_client = (redis_factory or create_redis_client)(config["redis"])
-        transport = RedisTransport(redis_client, account_id=ACCOUNT)
+        transport = RedisTransport(redis_client, account_id=config["account_id"])
         factory = shm_factory or ShmReadOnlyClient
         phase = "SHM_READ_CLIENT_CREATE"
-        clients.append(factory(config["read_name"], ACCOUNT))
+        clients.append(factory(config["read_name"], config["account_id"]))
         phase = "SHM_EXECUTION_CLIENT_CREATE"
-        clients.append(factory(config["execution_name"], ACCOUNT))
+        clients.append(factory(config["execution_name"], config["account_id"]))
         phase = "PROXY_CREATE"
         proxy = RedisShmReadOnlyProxy(
             redis_transport=transport, readonly_client=clients[0], execution_client=clients[1],
-            account_id=ACCOUNT, expected_readonly_session_id=config["read_session_id"],
+            account_id=config["account_id"], environment=config["environment"],
+            start_write_blocked=config["start_write_blocked"], expected_readonly_session_id=config["read_session_id"],
             expected_execution_session_id=config["execution_session_id"],
             expected_native_pid=config["native_pid"], timeout_seconds=config["timeout_seconds"],
             max_requests=config["max_requests"], deadline_unix=parent_deadline,
@@ -302,23 +305,24 @@ def run_reconciliation(value, plan, *, apply=False, redis_factory=None, shm_fact
     """一次有界只读核对及可选单记录 CAS；不启动接收循环或发单。"""
     config = validate_config(value)
     plan = validate_reconciliation_plan(plan, apply=apply)
-    if config["runtime_policy"] != "PERSISTENT_SIMULATION_READ_WRITE":
-        raise ValueError("reconciliation requires the existing persistent simulation read/write sources")
+    if config["runtime_policy"] not in WRITE_POLICIES:
+        raise ValueError("reconciliation requires the existing persistent account read/write sources")
     if windows_session_id(os.getpid()) != config["windows_session"] or windows_session_id(config["native_pid"]) != config["windows_session"]:
         raise RuntimeError("consumer and native source must share the explicit Windows session")
     old_proxy_pid = _integer(plan.get("stopped_proxy_pid"), "stopped_proxy_pid", 1, 0xFFFFFFFF)
     if old_proxy_pid in (os.getpid(), config["native_pid"]) or not confirmed_proxy_stopped(old_proxy_pid):
         raise RuntimeError("the independently identified unique old proxy must be stopped before mailbox inspection")
     redis_client, proxy, clients, errors = None, None, [], []
-    result = dict(status="FAILED", account_id=ACCOUNT, request_id=plan["request_id"],
+    result = dict(status="FAILED", account_id=config["account_id"], environment=config["environment"], request_id=plan["request_id"],
                   automatic_retry=False, native_write_calls=0, ledger_records_written=0)
     try:
         redis_client = (redis_factory or create_redis_client)(config["redis"])
-        transport = RedisTransport(redis_client, account_id=ACCOUNT)
+        transport = RedisTransport(redis_client, account_id=config["account_id"])
         factory = shm_factory or ShmReadOnlyClient
-        clients.append(factory(config["read_name"], ACCOUNT))
-        clients.append(factory(config["execution_name"], ACCOUNT))
+        clients.append(factory(config["read_name"], config["account_id"]))
+        clients.append(factory(config["execution_name"], config["account_id"]))
         proxy = RedisShmReadOnlyProxy(transport, clients[0], clients[1],
+            account_id=config["account_id"], environment=config["environment"], start_write_blocked=config["start_write_blocked"],
             expected_readonly_session_id=config["read_session_id"],
             expected_execution_session_id=config["execution_session_id"],
             expected_native_pid=config["native_pid"], timeout_seconds=config["timeout_seconds"],
@@ -380,7 +384,7 @@ def main(argv=None):
         elif args.run:
             result = run_candidate(config)
         else:
-            result = dict(status="DRY_RUN", account_id=ACCOUNT, allow_order_methods=config["allow_order_methods"],
+            result = dict(status="DRY_RUN", account_id=config["account_id"], environment=config["environment"], allow_order_methods=config["allow_order_methods"],
                           runtime_policy=config["runtime_policy"],
                           start_write_blocked=config["start_write_blocked"],
                           native_pid=config["native_pid"], windows_session=config["windows_session"],

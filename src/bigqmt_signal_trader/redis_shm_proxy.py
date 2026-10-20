@@ -1,5 +1,5 @@
 # coding: utf-8
-"""QMT 外的显式模拟 Redis → 双共享内存兼容代理。
+"""QMT 外的显式账户 Redis → 双共享内存兼容代理。
 
 注入的两个 SHM 客户端由代理接管并关闭；Redis 连接池仍归调用方。
 本模块不创建后台线程，不连接 QMT Socket，也不重开或重发未知请求。
@@ -9,6 +9,7 @@ import copy
 import datetime
 import json
 import math
+import re
 import threading
 import time
 import uuid
@@ -26,8 +27,8 @@ EXECUTION_METHODS = frozenset((
     "query_execution_snapshot", "get_trade_login_state", "poll_execution_events",
 ))
 QUOTE_METHODS = frozenset(("get_ticks", "get_full_tick"))
-RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMULATION_READ_WRITE"))
-_WRITE_LEDGER_KEY = "aqp:redis_shm:write_ledger:55013746:v1"
+RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
+WRITE_POLICIES = frozenset(("PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 # 柜台订单秒精度时钟与代理本机时钟不同；1258真实样本偏差为-3.049735秒。
 _BROKER_PROXY_CLOCK_TOLERANCE_SECONDS = 5.0
 _CLAIM_WRITE = """
@@ -49,8 +50,18 @@ _REPLY_TEMPLATES = {
 }
 
 
+def validate_account_policy(account_id, environment, runtime_policy):
+    """显式实盘合同不能由账户或环境单一字段推断。"""
+    if environment == "LIVE":
+        if (not isinstance(account_id, str) or not re.fullmatch(r"[0-9]{1,32}", account_id)
+                or account_id == "55013746" or runtime_policy != "PERSISTENT_LIVE_READ_WRITE"):
+            raise ValueError("LIVE requires a precise numeric non-simulation account and PERSISTENT_LIVE_READ_WRITE")
+    elif environment != "SIM" or account_id != "55013746" or runtime_policy == "PERSISTENT_LIVE_READ_WRITE":
+        raise ValueError("simulation account 55013746 and matching SIM policy are required")
+
+
 class RedisShmReadOnlyProxy:
-    """兼容原只读类名；写入须显式模拟政策且持久留痕，不自动恢复或重发。"""
+    """兼容原类名；写入须显式账户政策且持久留痕，不自动恢复或重发。"""
 
     def __init__(self, redis_transport, readonly_client, execution_client, *,
                  account_id="55013746", expected_readonly_session_id,
@@ -58,17 +69,17 @@ class RedisShmReadOnlyProxy:
                  timeout_seconds=5.0, max_requests=1000, deadline_unix=None,
                  runtime_policy="BOUNDED", allow_order_methods=False,
                  read_cache_capacity=1000, write_ledger_capacity=1000,
-                 expected_windows_session_id=None):
-        if (account_id != "55013746"
-                or redis_transport.account_id != account_id):
-            raise ValueError("this candidate only accepts simulation account 55013746")
+                 expected_windows_session_id=None, environment="SIM", start_write_blocked=None):
+        validate_account_policy(account_id, environment, runtime_policy)
+        if redis_transport.account_id != account_id:
+            raise ValueError("transport account must match the explicit account")
         if redis_transport.listen_redis is not redis_transport.redis:
             # 原 transport 对两池中的单方写失败内部容错，本候选要求任一
             # fanout 阶段失败可见，避免未确认的部分发布被包装成成功。
             raise ValueError("one injected Redis client must own receive and response fanout")
-        if (redis_transport.request_queue != "bigqmt:rpc:queue:55013746"
-                or redis_transport.request_channel != "bigqmt:rpc:req:55013746"):
-            raise ValueError("candidate requires the standard simulation request queue and channel")
+        if (redis_transport.request_queue != "bigqmt:rpc:queue:%s" % account_id
+                or redis_transport.request_channel != "bigqmt:rpc:req:%s" % account_id):
+            raise ValueError("candidate requires the standard simulation request queue and channel or exact LIVE account queue and channel")
         if (not isinstance(expected_readonly_session_id, str) or not expected_readonly_session_id
                 or not isinstance(expected_execution_session_id, str) or not expected_execution_session_id
                 or expected_readonly_session_id == expected_execution_session_id
@@ -78,8 +89,12 @@ class RedisShmReadOnlyProxy:
             raise ValueError("timeout must be within (0, 60] seconds")
         if runtime_policy not in RUNTIME_POLICIES:
             raise ValueError("explicit supported runtime policy required")
-        if type(allow_order_methods) is not bool or allow_order_methods is not (runtime_policy == "PERSISTENT_SIMULATION_READ_WRITE"):
-            raise ValueError("write permission must explicitly match the simulation read/write policy")
+        if type(allow_order_methods) is not bool or allow_order_methods is not (runtime_policy in WRITE_POLICIES):
+            raise ValueError("write permission must explicitly match the account read/write policy")
+        if start_write_blocked is not None and type(start_write_blocked) is not bool:
+            raise ValueError("start_write_blocked must be a boolean")
+        if environment == "LIVE" and start_write_blocked is not True:
+            raise ValueError("LIVE must explicitly start_write_blocked=true")
         if runtime_policy == "BOUNDED":
             if type(max_requests) is not int or not 1 <= max_requests <= 1000:
                 raise ValueError("max_requests must be within [1, 1000]")
@@ -96,6 +111,8 @@ class RedisShmReadOnlyProxy:
             raise ValueError("distinct SHM clients with the fixed account are required")
         self.transport = redis_transport
         self.account_id = account_id
+        self.environment = environment
+        self._write_ledger_key = "aqp:redis_shm:write_ledger:%s:v1" % account_id
         self.timeout_seconds = float(timeout_seconds)
         self.max_requests = max_requests
         self.deadline_unix = deadline_unix
@@ -106,6 +123,8 @@ class RedisShmReadOnlyProxy:
         if expected_windows_session_id is not None and (
                 type(expected_windows_session_id) is not int or expected_windows_session_id < 0):
             raise ValueError("Windows session must be an explicit nonnegative integer")
+        if environment == "LIVE" and expected_windows_session_id is None:
+            raise ValueError("LIVE requires an explicit expected Windows session")
         self.expected_windows_session_id = expected_windows_session_id
         self._clients = {"readonly": readonly_client, "execution": execution_client}
         self._sessions = {"readonly": expected_readonly_session_id, "execution": expected_execution_session_id}
@@ -125,6 +144,8 @@ class RedisShmReadOnlyProxy:
         self._writes_blocked = False
         self._write_block_reason = ""
         self._operator_write_blocked = False
+        if start_write_blocked:
+            self._block_writes("OPERATOR_WRITE_DISABLED")
         self._write_record_count = 0
         self._operation_phase = "INITIALIZED"
         self._request_context = {}
@@ -173,7 +194,7 @@ class RedisShmReadOnlyProxy:
         if not self._verified:
             raise ShmProtocolError("explicit identity handshake required")
         result = dict(pong=True, transport="redis_shm", rpc_revision="external-redis-dual-shm-v1",
-                    account_id=self.account_id, session_id=self._sessions["execution"],
+                    account_id=self.account_id, environment=self.environment, session_id=self._sessions["execution"],
                     native_pid=self.expected_native_pid, allow_order_methods=self.allow_order_methods,
                     runtime_policy=self.runtime_policy, capabilities=sorted(self._capabilities),
                     writes_blocked=self._writes_blocked, write_block_reason=self._write_block_reason,
@@ -223,7 +244,7 @@ class RedisShmReadOnlyProxy:
     def _inspect_write_ledger(self):
         if not self.allow_order_methods:
             return
-        records = self.transport.redis.hgetall(_WRITE_LEDGER_KEY)
+        records = self.transport.redis.hgetall(self._write_ledger_key)
         if not isinstance(records, dict) or len(records) > 1000:
             raise ShmProtocolError("persistent write ledger is malformed or over its fixed bound")
         self._write_record_count = len(records)
@@ -235,6 +256,8 @@ class RedisShmReadOnlyProxy:
                     or not isinstance(record.get("fingerprint"), str)
                     or not isinstance(record.get("binding"), dict)
                     or record["binding"].get("account_id") != self.account_id
+                    or (self.environment == "LIVE" and (record["binding"].get("environment") != "LIVE"
+                        or record["binding"].get("runtime_policy") != self.runtime_policy))
                     or record.get("state") not in ("CLAIMED", "CONFIRMED", "UNKNOWN", "PUBLISH_PENDING", "PUBLISH_UNCONFIRMED", "RECONCILED")):
                 raise ShmProtocolError("persistent write ledger identity is malformed")
             if record["state"] == "RECONCILED":
@@ -243,6 +266,7 @@ class RedisShmReadOnlyProxy:
                 self._block_writes("PERSISTED_WRITE_UNCONFIRMED")
 
     def _validate_identity_data(self, route, data):
+        self._validate_environment(data, "native source")
         required = QUOTE_METHODS if route == "readonly" else EXECUTION_METHODS
         allowed_write = self.allow_order_methods if route == "execution" else False
         if (not isinstance(data, dict) or data.get("pong") is not True
@@ -288,8 +312,23 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("SHM client closed, unconfirmed, or identity changed")
         return client
 
-    @staticmethod
-    def _check_response(request, response, session_id):
+    def _validate_environment(self, value, context):
+        if (not isinstance(value, dict) or
+                (self.environment == "LIVE" and value.get("environment") != "LIVE") or
+                ("environment" in value and value["environment"] != self.environment)):
+            raise ShmProtocolError("%s environment mismatch or missing LIVE environment" % context)
+
+    def _check_source_environments(self, data):
+        if not isinstance(data, dict):
+            return
+        for key in ("source_evidence", "orders_source_evidence", "trades_source_evidence"):
+            if key in data:
+                self._validate_environment(data[key], key)
+
+    def _check_response(self, request, response, session_id):
+        self._validate_environment(response, "SHM response")
+        self._check_source_environments(response)
+        self._check_source_environments(response.get("data"))
         if (not isinstance(response, dict) or type(response.get("schema_version")) is not int
                 or response["schema_version"] != 1 or type(response.get("ok")) is not bool
                 or type(response.get("sequence")) is not int or response["sequence"] <= 0
@@ -329,6 +368,8 @@ class RedisShmReadOnlyProxy:
                     request = dict(schema_version=1, request_id=uuid.uuid4().hex,
                                    account_id=self.account_id, method="ping", params={},
                                    read_expires_at_unix=deadline)
+                    if self.environment == "LIVE":
+                        request["environment"] = self.environment
                     response = client.send_request(request, timeout_seconds=remaining)
                     self._ensure_open()
                     self._check_response(request, response, self._sessions[route])
@@ -383,6 +424,7 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("schema_version must be integer 1")
         if request.get("account_id") != self.account_id:
             raise ShmProtocolError("request account_id mismatch")
+        self._validate_environment(request, "Redis request")
         self._validate_source_binding(request)
         method, params = request.get("method"), request.get("params")
         if method not in self._capabilities:
@@ -406,11 +448,14 @@ class RedisShmReadOnlyProxy:
                           sort_keys=True, allow_nan=False, separators=(",", ":"))
 
     def _write_binding(self):
-        return dict(account_id=self.account_id, native_pid=self.expected_native_pid,
+        binding = dict(account_id=self.account_id, native_pid=self.expected_native_pid,
                     read_session_id=self._sessions["readonly"],
                     execution_session_id=self._sessions["execution"],
                     windows_session_id=self._source_binding()["windows_session_id"],
                     runtime_policy=self.runtime_policy, allow_order_methods=self.allow_order_methods)
+        if self.environment == "LIVE":
+            binding["environment"] = self.environment
+        return binding
 
     def _claim_write(self, request, fingerprint):
         """原生调用前原子占用永不过期 RID；失败或已占用均不会再次原生写入。"""
@@ -419,7 +464,7 @@ class RedisShmReadOnlyProxy:
                       claimed_at_unix=time.time(), automatic_retry=False)
         encoded = json.dumps(record, sort_keys=True, allow_nan=False, separators=(",", ":"))
         try:
-            claimed = self.transport.redis.eval(_CLAIM_WRITE, 1, _WRITE_LEDGER_KEY,
+            claimed = self.transport.redis.eval(_CLAIM_WRITE, 1, self._write_ledger_key,
                 request["request_id"], self.write_ledger_capacity, encoded)
             if (not isinstance(claimed, (list, tuple)) or len(claimed) != 2
                     or type(claimed[0]) is not int or claimed[0] not in (-1, 0, 1)):
@@ -457,7 +502,7 @@ class RedisShmReadOnlyProxy:
         record.update(state=state or ("UNKNOWN" if response.get("status") == "UNKNOWN" else "CONFIRMED"),
                       response=copy.deepcopy(response), settled_at_unix=time.time())
         encoded = json.dumps(record, sort_keys=True, allow_nan=False, separators=(",", ":"))
-        if self.transport.redis.eval(_SETTLE_WRITE, 1, _WRITE_LEDGER_KEY,
+        if self.transport.redis.eval(_SETTLE_WRITE, 1, self._write_ledger_key,
                                      request["request_id"], reservation, encoded) != 1:
             raise ShmProtocolError("write settlement identity changed; do not resend")
         return encoded
@@ -465,7 +510,7 @@ class RedisShmReadOnlyProxy:
     def _reconciliation_record(self, request_id, expected_record=None):
         """只读取精确 RID；旧请求、来源、原 UNKNOWN 必须完整保留。"""
         self._request_id({"request_id": request_id})
-        encoded = self.transport.redis.hget(_WRITE_LEDGER_KEY, request_id)
+        encoded = self.transport.redis.hget(self._write_ledger_key, request_id)
         if encoded is None:
             raise ShmProtocolError("the exact write record does not exist")
         encoded = decode_text(encoded)
@@ -529,6 +574,7 @@ class RedisShmReadOnlyProxy:
 
     def _validate_reconciliation_snapshot(self, method, params, order_sys_id, order_identity,
                                           data, claimed_at, query_started_at, observed_at, source_binding):
+        self._check_source_environments(data)
         identity = self._validate_reconciliation_target(method, params, order_sys_id, order_identity)
         if (not isinstance(source_binding, dict) or set(source_binding) != {
                 "read_session_id", "execution_session_id", "native_pid", "windows_session_id"}
@@ -670,6 +716,8 @@ class RedisShmReadOnlyProxy:
                      method="query_execution_snapshot", params=dict(account_id=self.account_id,
                          order_strategy_name="", trade_strategy_name=""),
                      read_expires_at_unix=now + self.timeout_seconds)
+        if self.environment == "LIVE":
+            query["environment"] = self.environment
         response = self._clients["execution"].send_request(query, timeout_seconds=self.timeout_seconds)
         for route in self._clients:
             self._check_client(route)
@@ -689,7 +737,8 @@ class RedisShmReadOnlyProxy:
                 or proof.get("terminal_verified") is not True or not isinstance(original, dict)
                 or record.get("automatic_retry") is not False
                 or not isinstance(record.get("token"), str) or not record["token"]
-                or record["binding"].get("runtime_policy") != "PERSISTENT_SIMULATION_READ_WRITE"
+                or record["binding"].get("runtime_policy") not in WRITE_POLICIES
+                or (self.environment == "LIVE" and record["binding"].get("environment") != "LIVE")
                 or record["binding"].get("allow_order_methods") is not True
                 or proof.get("original_result") != original or original.get("status") != "UNKNOWN"
                 or original.get("automatic_retry") is not False
@@ -743,14 +792,14 @@ class RedisShmReadOnlyProxy:
         try:
             self._ensure_open()
             if not self._verified or not self.allow_order_methods:
-                raise ShmProtocolError("verified simulation read/write sources are required")
+                raise ShmProtocolError("verified account read/write sources are required")
             if type(apply) is not bool or (apply and (not isinstance(expected_record, str) or not expected_record
                     or not isinstance(operator, str) or not operator.strip() or len(operator) > 128)):
                 raise ShmProtocolError("apply requires exact previewed record and explicit operator")
             encoded, record, method, params = self._reconciliation_record(request_id, expected_record)
             proof = self._terminal_reconciliation_proof(method, params, order_sys_id, order_identity,
                                                         record.get("claimed_at_unix"))
-            if decode_text(self.transport.redis.hget(_WRITE_LEDGER_KEY, request_id)) != encoded:
+            if decode_text(self.transport.redis.hget(self._write_ledger_key, request_id)) != encoded:
                 raise ShmProtocolError("write record changed during native evidence collection")
             preview = dict(status="RECONCILIATION_PREVIEW", request_id=request_id, account_id=self.account_id,
                            expected_record=encoded, proof=proof, ledger_records_written=0,
@@ -773,7 +822,7 @@ class RedisShmReadOnlyProxy:
             reconciled["reconciled_response"] = replay
             replacement = json.dumps(reconciled, sort_keys=True, allow_nan=False, separators=(",", ":"))
             try:
-                committed = self.transport.redis.eval(_SETTLE_WRITE, 1, _WRITE_LEDGER_KEY, request_id, encoded, replacement)
+                committed = self.transport.redis.eval(_SETTLE_WRITE, 1, self._write_ledger_key, request_id, encoded, replacement)
             except Exception as exc:
                 self._block_writes("RECONCILIATION_COMMIT_UNCONFIRMED")
                 preview.update(status="UNKNOWN", ledger_records_written=None, automatic_retry=False,
@@ -789,7 +838,7 @@ class RedisShmReadOnlyProxy:
             if self._operator_write_blocked:
                 self._block_writes("OPERATOR_WRITE_DISABLED")
             try:
-                if decode_text(self.transport.redis.hget(_WRITE_LEDGER_KEY, request_id)) != replacement:
+                if decode_text(self.transport.redis.hget(self._write_ledger_key, request_id)) != replacement:
                     raise ShmProtocolError("reconciliation exact readback changed")
                 self._inspect_write_ledger()
             except Exception as exc:
@@ -806,7 +855,7 @@ class RedisShmReadOnlyProxy:
 
     def _response(self, request, error, code, *, unknown=False):
         response = dict(schema_version=1, request_id=request.get("request_id"), account_id=self.account_id,
-                    method=request.get("method"), ok=False, data=None, error=str(error), server_error=code,
+                    environment=self.environment, method=request.get("method"), ok=False, data=None, error=str(error), server_error=code,
                     handled_at=datetime.datetime.utcnow().isoformat(),
                     status="UNKNOWN" if unknown else "REJECTED", automatic_retry=False)
         binding = self._source_binding()
@@ -863,7 +912,7 @@ class RedisShmReadOnlyProxy:
                     is_write = request["method"] in WRITE_METHODS
                     self._operation_phase = "WRITE_GATE_CHECK" if is_write else "REQUEST_VALIDATE"
                     if (is_write and self._writes_blocked
-                            and self.transport.redis.hget(_WRITE_LEDGER_KEY, rid) is None):
+                            and self.transport.redis.hget(self._write_ledger_key, rid) is None):
                         raise ShmProtocolError("new writes are blocked: %s; inspect existing results" % self._write_block_reason)
                     if self.runtime_policy == "BOUNDED" and self._processed_count >= self.max_requests:
                         self._seal("SESSION_CAPACITY_EXHAUSTED")
@@ -887,6 +936,8 @@ class RedisShmReadOnlyProxy:
                     forwarded = dict(schema_version=1, request_id=rid, account_id=self.account_id,
                                      method=request["method"], params=dict(request["params"]),
                                      read_expires_at_unix=deadline)
+                    if self.environment == "LIVE":
+                        forwarded["environment"] = self.environment
                     try:
                         # 两路是一次固定身份合同；任何一路换 SID 都不能让旧
                         # 代理继续沿另一通道运行。
@@ -972,6 +1023,8 @@ class RedisShmReadOnlyProxy:
             binding = self._source_binding()
             if binding is not None:
                 response["source_binding"] = binding
+            if self.environment == "LIVE":
+                response["environment"] = self.environment
             try:
                 self._operation_phase = "REDIS_RESPONSE_PUBLISH"
                 self.transport.send_response(reply, response)
