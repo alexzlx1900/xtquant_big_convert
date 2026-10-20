@@ -26,6 +26,7 @@ The split matters. Per the official docs and the ContextInfo IDE stub
 This module does not make trading decisions.
 """
 
+import datetime as _dt
 import importlib
 
 from ..code_utils import (
@@ -656,6 +657,45 @@ class BigQmtMarketDataProvider:
                 fill_data=fill_data,
             )
         )
+
+    def get_intraday_bars(self, stock_code, trade_date, period="1m", count=500):
+        """单股当日动态分钟；使用显式订阅并在返回前核对释放结果。"""
+        code = normalize_stock_code(stock_code)
+        if (not isinstance(stock_code, str) or code != stock_code
+                or len(code) != 9 or not code[:6].isdigit() or code[6:] not in (".SH", ".SZ", ".BJ")
+                or trade_date != _dt.datetime.now().strftime("%Y%m%d")
+                or period not in ("1m", "5m", "15m", "30m", "60m")
+                or isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 2000):
+            raise ValueError("intraday bars require one symbol, today, a minute period and bounded count")
+        context = self.context_info
+        snapshot = getattr(context, "get_all_subscription", None)
+        if not callable(snapshot) or not callable(getattr(context, "subscribe_quote", None)) or not callable(getattr(context, "unsubscribe_quote", None)):
+            raise NotImplementedError("managed native minute subscription is unavailable")
+        before = snapshot()
+        if not isinstance(before, dict):
+            raise ValueError("native subscription table is unavailable before acquisition")
+        before = dict(before)
+        handle = context.subscribe_quote(code, period=period, dividend_type="none", result_type="dict", callback=None)
+        if isinstance(handle, bool) or not isinstance(handle, int) or handle <= 0 or handle in before or str(handle) in before:
+            raise RuntimeError("LIVE_MINUTE_SUBSCRIPTION_UNCONFIRMED")
+        try:
+            data = self.get_market_data_ex(
+                field_list=["time", "open", "high", "low", "close", "volume", "amount"],
+                stock_list=[code], period=period, start_time=trade_date + "093000",
+                end_time=_dt.datetime.now().strftime("%Y%m%d%H%M%S"), count=count,
+                dividend_type="none", fill_data=False, subscribe=False,
+            )
+        finally:
+            cancel_result = context.unsubscribe_quote(handle)
+            # 普通读取的隐式订阅不在 subMap 内；始终关闭隐式订阅，
+            # 仅取消本次显式取得的句柄，不猜测其它新增订阅的归属。
+            final = snapshot()
+            if (cancel_result is False or (type(cancel_result) is int and cancel_result < 0)
+                    or not isinstance(final, dict) or final != before):
+                raise RuntimeError("LIVE_MINUTE_CLEANUP_UNCONFIRMED")
+        return {"data": data, "symbol": code, "trade_date": trade_date, "period": period,
+                "cleanup_status": "CANCELLED", "subscriptions_before": len(before),
+                "subscriptions_after": len(final)}
 
     def get_market_data_ex(self, **kwargs):
         raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)

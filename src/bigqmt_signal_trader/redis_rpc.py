@@ -141,6 +141,7 @@ EXPIRABLE_READ_METHODS = frozenset({
     "ping", "get_asset", "get_positions", "get_position_statistics",
     "query_orders", "query_trades", "query_execution_snapshot",
     "get_ticks", "get_market_data", "get_market_data_ex", "get_local_data",
+    "get_intraday_bars",
 })
 
 READ_METHODS = {
@@ -300,6 +301,7 @@ SAFE_B64_PREFIX = "b64s:"
 SAFE_B64_DIGIT_ENCODE = str.maketrans("0123456789", "!#$%&()*~?")
 SAFE_B64_DIGIT_DECODE = str.maketrans("!#$%&()*~?", "0123456789")
 MARKET_DATA_METHODS = {
+    "get_intraday_bars",
     "get_instrument_type",
     "get_market_data",
     "get_market_data_ex",
