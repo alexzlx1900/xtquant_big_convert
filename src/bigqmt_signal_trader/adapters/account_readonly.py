@@ -142,7 +142,9 @@ def _convert_trade(row, account_id, strategy_name):
     unknown = []
     trade_date = _attr(row, ("m_strTradeDate", "trade_date", "m_strDealDate"))
     traded_at = _text(row, ("m_strTradeTime", "trade_time", "traded_at"))
-    when = _timestamp(trade_date, traded_at)
+    # 原生 DEAL 上午可返回 HMMSS；只补小时前导零，保留原值和严格日期校验。
+    parsed_at = "0" + traded_at if re.fullmatch(r"[0-9]{5}", traded_at) else traded_at
+    when = _timestamp(trade_date, parsed_at)
     if not when:
         unknown.append("traded_time")
     native_strategy = _text(row, ("m_strStrategyName", "strategy_name"))
