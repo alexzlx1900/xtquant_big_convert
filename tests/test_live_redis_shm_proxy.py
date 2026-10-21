@@ -340,7 +340,7 @@ def test_live_cli_dry_run_has_no_connections_and_does_not_print_credentials(tmp_
 
 
 def test_live_runner_propagates_exact_account_and_initial_block_to_injected_resources(monkeypatch):
-    value = config()
+    value = config(receive_policy="QUEUE_ONLY")
     provider = FIXTURE.FakeRedis()
     provider.connection_pool = SimpleNamespace(disconnect=mock.Mock())
     clients, seen = [], []
@@ -363,6 +363,7 @@ def test_live_runner_propagates_exact_account_and_initial_block_to_injected_reso
                                   stop_event=stop, ready_observer=observe)
     assert result["status"] == "STOP_REQUESTED" and result["account_id"] == ACCOUNT
     assert result["environment"] == "LIVE" and result["writes_blocked"] is True
+    assert result["receive_policy"] == seen[0]["receive_policy"] == "QUEUE_ONLY"
     assert seen[0]["write_ready"] is False and seen[0]["writes_blocked"] is True
     assert result["processed_requests"] == 0
     assert all(client.closed and len(client.calls) == 1 for client in clients)

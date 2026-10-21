@@ -29,6 +29,7 @@ EXECUTION_METHODS = frozenset((
 QUOTE_METHODS = frozenset(("get_ticks", "get_full_tick"))
 RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 WRITE_POLICIES = frozenset(("PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
+RECEIVE_POLICIES = frozenset(("QUEUE_AND_PUBSUB", "QUEUE_ONLY"))
 # 柜台订单秒精度时钟与代理本机时钟不同；1258真实样本偏差为-3.049735秒。
 _BROKER_PROXY_CLOCK_TOLERANCE_SECONDS = 5.0
 _CLAIM_WRITE = """
@@ -70,8 +71,10 @@ class RedisShmReadOnlyProxy:
                  runtime_policy="BOUNDED", allow_order_methods=False,
                  read_cache_capacity=1000, write_ledger_capacity=1000,
                  expected_windows_session_id=None, environment="SIM", start_write_blocked=None,
-                 live_write_authorized=False):
+                 live_write_authorized=False, receive_policy="QUEUE_AND_PUBSUB"):
         validate_account_policy(account_id, environment, runtime_policy)
+        if not isinstance(receive_policy, str) or receive_policy not in RECEIVE_POLICIES:
+            raise ValueError("explicit supported receive_policy required")
         if redis_transport.account_id != account_id:
             raise ValueError("transport account must match the explicit account")
         if redis_transport.listen_redis is not redis_transport.redis:
@@ -119,6 +122,7 @@ class RedisShmReadOnlyProxy:
         self.account_id = account_id
         self.environment = environment
         self.live_write_authorized = live_write_authorized
+        self.receive_policy = receive_policy
         self._write_ledger_key = "aqp:redis_shm:write_ledger:%s:v1" % account_id
         self.timeout_seconds = float(timeout_seconds)
         self.max_requests = max_requests
@@ -204,6 +208,7 @@ class RedisShmReadOnlyProxy:
                     account_id=self.account_id, environment=self.environment, session_id=self._sessions["execution"],
                     native_pid=self.expected_native_pid, allow_order_methods=self.allow_order_methods,
                     runtime_policy=self.runtime_policy, capabilities=sorted(self._capabilities),
+                    receive_policy=self.receive_policy,
                     writes_blocked=self._writes_blocked, write_block_reason=self._write_block_reason,
                     write_ready=self.allow_order_methods and not self._writes_blocked,
                     read_source=copy.deepcopy(self._source_identity["readonly"]),
@@ -1075,15 +1080,16 @@ class RedisShmReadOnlyProxy:
                 return None
             try:
                 self._request_context = {}
-                if self._pubsub is None:
-                    self._operation_phase = "REDIS_PUBSUB_CREATE"
-                    self._pubsub = self.transport.listen_redis.pubsub(ignore_subscribe_messages=True)
-                    self._operation_phase = "REDIS_SUBSCRIBE"
-                    self._pubsub.subscribe(self.transport.request_channel)
-                self._operation_phase = "REDIS_PUBSUB_RECEIVE"
-                message = self._pubsub.get_message(timeout=0)
-                if message and message.get("type") == "message":
-                    return self.process_raw(message.get("data"), source="pubsub")
+                if self.receive_policy == "QUEUE_AND_PUBSUB":
+                    if self._pubsub is None:
+                        self._operation_phase = "REDIS_PUBSUB_CREATE"
+                        self._pubsub = self.transport.listen_redis.pubsub(ignore_subscribe_messages=True)
+                        self._operation_phase = "REDIS_SUBSCRIBE"
+                        self._pubsub.subscribe(self.transport.request_channel)
+                    self._operation_phase = "REDIS_PUBSUB_RECEIVE"
+                    message = self._pubsub.get_message(timeout=0)
+                    if message and message.get("type") == "message":
+                        return self.process_raw(message.get("data"), source="pubsub")
                 # 到此尚未取得PubSub业务，也没有发出破坏性LPOP。空闲
                 # TCP检查超时可以丢弃该只读结果，下轮重新检查而不重发业务。
                 self._operation_phase = "REDIS_QUEUE_INSPECT"

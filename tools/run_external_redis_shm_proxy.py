@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 os.environ.setdefault("BIGQMT_LOG_ENABLED", "0")
 
-from bigqmt_signal_trader.redis_shm_proxy import RUNTIME_POLICIES, WRITE_POLICIES, RedisShmReadOnlyProxy, validate_account_policy
+from bigqmt_signal_trader.redis_shm_proxy import RECEIVE_POLICIES, RUNTIME_POLICIES, WRITE_POLICIES, RedisShmReadOnlyProxy, validate_account_policy
 from bigqmt_signal_trader.transports.readonly_shm import ShmReadOnlyClient, validate_name
 from bigqmt_signal_trader.transports.redis_transport import RedisTransport
 
@@ -60,6 +60,9 @@ def validate_config(value, now_unix=None):
     result = dict(value)
     result["environment"] = environment
     result["runtime_policy"] = policy
+    result["receive_policy"] = value.get("receive_policy", "QUEUE_AND_PUBSUB")
+    if not isinstance(result["receive_policy"], str) or result["receive_policy"] not in RECEIVE_POLICIES:
+        raise ValueError("explicit supported receive_policy required")
     result["live_write_authorized"] = value.get("live_write_authorized", False)
     if type(result["live_write_authorized"]) is not bool or (environment != "LIVE" and result["live_write_authorized"]):
         raise ValueError("live_write_authorized must be an explicit LIVE-only boolean")
@@ -158,6 +161,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
     result = dict(status="FAILED", account_id=config["account_id"], environment=config["environment"], automatic_retry=False,
                   allow_order_methods=config["allow_order_methods"], runtime_policy=config["runtime_policy"],
                   start_write_blocked=config["start_write_blocked"],
+                  receive_policy=config["receive_policy"],
                   live_write_authorized=config["live_write_authorized"],
                   writes_blocked=config["start_write_blocked"], write_ready=False,
                   write_block_reason="OPERATOR_WRITE_DISABLED" if config["start_write_blocked"] else "",
@@ -177,6 +181,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
             redis_transport=transport, readonly_client=clients[0], execution_client=clients[1],
             account_id=config["account_id"], environment=config["environment"],
             live_write_authorized=config["live_write_authorized"],
+            receive_policy=config["receive_policy"],
             start_write_blocked=config["start_write_blocked"], expected_readonly_session_id=config["read_session_id"],
             expected_execution_session_id=config["execution_session_id"],
             expected_native_pid=config["native_pid"], timeout_seconds=config["timeout_seconds"],
@@ -329,6 +334,7 @@ def run_reconciliation(value, plan, *, apply=False, redis_factory=None, shm_fact
         proxy = RedisShmReadOnlyProxy(transport, clients[0], clients[1],
             account_id=config["account_id"], environment=config["environment"], start_write_blocked=config["start_write_blocked"],
             live_write_authorized=config["live_write_authorized"],
+            receive_policy=config["receive_policy"],
             expected_readonly_session_id=config["read_session_id"],
             expected_execution_session_id=config["execution_session_id"],
             expected_native_pid=config["native_pid"], timeout_seconds=config["timeout_seconds"],
@@ -393,6 +399,7 @@ def main(argv=None):
             result = dict(status="DRY_RUN", account_id=config["account_id"], environment=config["environment"], allow_order_methods=config["allow_order_methods"],
                           runtime_policy=config["runtime_policy"],
                           start_write_blocked=config["start_write_blocked"],
+                          receive_policy=config["receive_policy"],
                           live_write_authorized=config["live_write_authorized"],
                           native_pid=config["native_pid"], windows_session=config["windows_session"],
                           max_seconds=config["max_seconds"], max_requests=config["max_requests"],
