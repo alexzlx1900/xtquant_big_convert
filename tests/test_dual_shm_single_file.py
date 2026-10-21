@@ -143,8 +143,11 @@ class Fixture:
             return [types.SimpleNamespace(m_strInstrumentID="000001", m_strExchangeID="SZ", m_nVolume=100,
                 m_nCanUseVolume=100, m_dOpenPrice=10.0, m_dMarketValue=1147.0, m_dLastPrice=11.47)]
         if kind == "ACCOUNT":
-            return [types.SimpleNamespace(m_strAccountID=self.account, m_strStatus="登录成功", m_dAvailable=1000.0, m_dBalance=2147.0,
-                m_dFrozenCash=0.0, m_dInstrumentValue=1147.0)]
+            row = types.SimpleNamespace(m_strAccountID=self.account, m_strStatus="登录成功", m_dAvailable=1000.0, m_dBalance=2147.0,
+                m_dFrozenCash=0.0, m_dInstrumentValue=1147.0)
+            if self.settings.get("environment") == "LIVE":
+                row.m_nBrokerType, row.m_strAccountKey = 2, "LIVE-STOCK-FIXTURE-ONLY"
+            return [row]
         return []
 
     def start(self):
@@ -502,7 +505,10 @@ def _enable_fixture_simulation_orders(h, fail_submit=False):
 
 def _fixture_native_login(h):
     # 只注入原生回调输入，执行实际生成的登录解析与写门禁；非真实QMT登录证明。
-    h.namespace["account_callback"](h.context, dict(m_strAccountID=h.account, m_strStatus="登录成功", m_nStatus=0))
+    row = dict(m_strAccountID=h.account, m_strStatus="登录成功", m_nStatus=0)
+    if h.settings.get("environment") == "LIVE":
+        row.update(m_nBrokerType=2, m_strAccountKey="LIVE-STOCK-FIXTURE-ONLY")
+    h.namespace["account_callback"](h.context, row)
 
 
 def test_generated_persistent_simulation_read_write_has_real_separate_handshakes_and_single_binding(monkeypatch, capsys):

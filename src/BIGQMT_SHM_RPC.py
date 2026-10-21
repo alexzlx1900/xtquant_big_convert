@@ -277,18 +277,51 @@ def create_native_stock_order_gateway(context, account_id, query, passorder_func
 
 class NativeTradeLoginState:
     """会话内原生状态事件与本次账户采样分开计时，不把状态变化当心跳。"""
-    def __init__(self, account_id, query):
+    def __init__(self, account_id, query, environment="SIM"):
+        if environment not in ("SIM", "LIVE"):
+            raise ValueError("explicit SIM/LIVE login environment required")
         self.account_id, self.query = account_id, query
+        self.strict_stock_instance = environment == "LIVE"
         self.identity, self.event = None, None
+        self.account_key, self.instance_diagnostics = None, []
 
     def bind_identity(self, session_id, native_pid):
         self.identity, self.event = (session_id, native_pid), None
+        self.account_key, self.instance_diagnostics = None, []
+
+    @staticmethod
+    def _instance_fields(account_info):
+        field = lambda name: account_info.get(name) if isinstance(account_info, dict) else getattr(account_info, name, None)
+        return dict(raw_broker_type=field("m_nBrokerType"), raw_account_key=field("m_strAccountKey"),
+                    raw_object_type=type(account_info).__module__ + "." + type(account_info).__name__)
+
+    @staticmethod
+    def _valid_account_key(key):
+        return isinstance(key, str) and 0 < len(key) <= 256 and bool(key.strip())
 
     def record_account_callback(self, account_info):
         field = lambda name: account_info.get(name) if isinstance(account_info, dict) else getattr(account_info, name, None)
-        self.event = dict(raw_account_id=field("m_strAccountID"), raw_status=field("m_strStatus"),
-                          raw_numeric_status=field("m_nStatus"), identity=self.identity,
-                          observed_monotonic=time.monotonic(), observed_at_utc=_dt.datetime.utcnow().isoformat() + "Z")
+        event = dict(raw_account_id=field("m_strAccountID"), raw_status=field("m_strStatus"),
+                     raw_numeric_status=field("m_nStatus"), identity=self.identity,
+                     observed_monotonic=time.monotonic(), observed_at_utc=_dt.datetime.utcnow().isoformat() + "Z")
+        if self.strict_stock_instance:
+            event.update(self._instance_fields(account_info))
+            broker_type = event["raw_broker_type"]
+            foreign_type = (event["raw_account_id"] == self.account_id
+                            and type(broker_type) is int and broker_type in (1, 3, 5, 6, 7, 11))
+            reason = "NON_STOCK_CALLBACK_IGNORED" if foreign_type else "STOCK_CALLBACK_OBSERVED"
+            if not foreign_type and (type(broker_type) is not int or broker_type != 2
+                                     or not self._valid_account_key(event["raw_account_key"])):
+                reason = "CALLBACK_INSTANCE_IDENTITY_MISSING"
+            elif not foreign_type and self.account_key is not None and event["raw_account_key"] != self.account_key:
+                reason = "CALLBACK_INSTANCE_KEY_CONFLICT"
+            diagnostic = {key: value for key, value in event.items() if key not in ("identity", "observed_monotonic")}
+            sid, pid = self.identity or (None, None)
+            diagnostic.update(reason=reason, session_id=sid, native_pid=pid)
+            self.instance_diagnostics = (self.instance_diagnostics + [diagnostic])[-3:]
+            if foreign_type:
+                return
+        self.event = event
 
     def readback(self):
         session_id, pid = self.identity or (None, None)
@@ -305,13 +338,29 @@ class NativeTradeLoginState:
             field = lambda name: row.get(name) if isinstance(row, dict) else getattr(row, name, None)
             diagnostic.update(raw_account_id=field("m_strAccountID"), raw_status=field("m_strStatus"),
                               raw_numeric_status=field("m_nStatus"))
+            if self.strict_stock_instance:
+                diagnostic.update(self._instance_fields(row))
             if diagnostic["raw_account_id"] != self.account_id:
                 raise ValueError("TRADE_LOGIN_ACCOUNT_SAMPLE_IDENTITY_MISMATCH")
+            if self.strict_stock_instance:
+                if type(diagnostic["raw_broker_type"]) is not int or diagnostic["raw_broker_type"] != 2:
+                    raise ValueError("TRADE_LOGIN_ACCOUNT_SAMPLE_TYPE_MISSING_OR_MISMATCH")
+                if not self._valid_account_key(diagnostic["raw_account_key"]):
+                    raise ValueError("TRADE_LOGIN_ACCOUNT_SAMPLE_KEY_MISSING")
+                if (not isinstance(session_id, str) or not session_id or type(pid) is not int or pid <= 0
+                        or self.identity != (session_id, pid)):
+                    raise ValueError("TRADE_LOGIN_SESSION_CHANGED")
+                # 样本只固定本SID内的账户实例，不构成登录正向证据；新SID才能重置。
+                if self.account_key is None:
+                    self.account_key = diagnostic["raw_account_key"]
+                elif self.account_key != diagnostic["raw_account_key"]:
+                    raise ValueError("TRADE_LOGIN_ACCOUNT_SAMPLE_KEY_CHANGED")
             if not isinstance(diagnostic["raw_status"], str) or not diagnostic["raw_status"]:
                 raise ValueError("TRADE_LOGIN_ACCOUNT_SAMPLE_STATUS_UNKNOWN")
         except Exception as exc:
             known = ("TRADE_LOGIN_ACCOUNT_SAMPLE_NOT_UNIQUE", "TRADE_LOGIN_ACCOUNT_SAMPLE_IDENTITY_MISMATCH",
-                     "TRADE_LOGIN_ACCOUNT_SAMPLE_STATUS_UNKNOWN")
+                     "TRADE_LOGIN_ACCOUNT_SAMPLE_STATUS_UNKNOWN", "TRADE_LOGIN_ACCOUNT_SAMPLE_TYPE_MISSING_OR_MISMATCH",
+                     "TRADE_LOGIN_ACCOUNT_SAMPLE_KEY_MISSING", "TRADE_LOGIN_ACCOUNT_SAMPLE_KEY_CHANGED", "TRADE_LOGIN_SESSION_CHANGED")
             sample_error = str(exc) if isinstance(exc, ValueError) and str(exc) in known else "TRADE_LOGIN_ACCOUNT_SAMPLE_FAILED"
             diagnostic.update(error=sample_error, exception_type=type(exc).__name__)
         sample_age = time.monotonic() - sample_started
@@ -325,20 +374,37 @@ class NativeTradeLoginState:
                      positive_contract_verified=False, reason="TRADE_LOGIN_CALLBACK_NOT_OBSERVED",
                      query_diagnostic=diagnostic,
                      contract_source="https://dict.thinktrader.net/innerApi/data_structure.html")
+        if self.strict_stock_instance:
+            value.update(account_instance_contract="LIVE_STOCK_ACCOUNT_KEY_V1", expected_broker_type=2,
+                         bound_account_key=self.account_key,
+                         account_instance_diagnostics=[dict(item) for item in self.instance_diagnostics])
         if self.event is not None:
             event = self.event
             age = time.monotonic() - event["observed_monotonic"]
             value.update(raw_status=event["raw_status"], raw_numeric_status=event["raw_numeric_status"],
                          raw_account_id=event["raw_account_id"], event_observed_at_utc=event["observed_at_utc"],
                          age_seconds=age, state_event_age_seconds=age)
+            if self.strict_stock_instance:
+                value.update({key: event.get(key) for key in ("raw_broker_type", "raw_account_key", "raw_object_type")})
             if self.identity != (session_id, pid) or event["identity"] != (session_id, pid):
                 value["reason"] = "TRADE_LOGIN_SESSION_CHANGED"
             elif event["raw_account_id"] != self.account_id:
                 value["reason"] = "TRADE_LOGIN_CALLBACK_ACCOUNT_MISSING_OR_MISMATCH"
+            elif self.strict_stock_instance and (type(event.get("raw_broker_type")) is not int
+                                                or event["raw_broker_type"] != 2):
+                value["reason"] = "TRADE_LOGIN_CALLBACK_TYPE_MISSING_OR_MISMATCH"
+            elif self.strict_stock_instance and not self._valid_account_key(event.get("raw_account_key")):
+                value["reason"] = "TRADE_LOGIN_CALLBACK_KEY_MISSING"
+            elif self.strict_stock_instance and sample_error:
+                value["reason"] = sample_error
+            elif self.strict_stock_instance and event["raw_account_key"] != self.account_key:
+                value["reason"] = "TRADE_LOGIN_CALLBACK_ACCOUNT_KEY_MISMATCH"
             elif not math.isfinite(age) or age < 0:
                 value["reason"] = "TRADE_LOGIN_EVENT_TIME_INVALID"
             elif event["raw_status"] == "\u51c6\u5907\u767b\u5f55":
                 value.update(status="NOT_LOGGED_IN", reason="TRADE_LOGIN_PREPARING_LOGIN")
+            elif self.strict_stock_instance and event["raw_status"] == "\u5c1a\u672a\u767b\u5f55":
+                value.update(status="NOT_LOGGED_IN", reason="TRADE_LOGIN_NOT_LOGGED_IN")
             elif event["raw_status"] == "\u767b\u5f55\u6210\u529f":
                 if sample_error:
                     value["reason"] = sample_error
@@ -346,6 +412,8 @@ class NativeTradeLoginState:
                     value["reason"] = "TRADE_LOGIN_ACCOUNT_SAMPLE_STALE"
                 elif diagnostic["raw_status"] == "\u51c6\u5907\u767b\u5f55":
                     value.update(status="NOT_LOGGED_IN", reason="TRADE_LOGIN_ACCOUNT_SAMPLE_PREPARING_LOGIN")
+                elif self.strict_stock_instance and diagnostic["raw_status"] == "\u5c1a\u672a\u767b\u5f55":
+                    value.update(status="NOT_LOGGED_IN", reason="TRADE_LOGIN_ACCOUNT_SAMPLE_NOT_LOGGED_IN")
                 elif diagnostic["raw_status"] != "\u767b\u5f55\u6210\u529f":
                     value["reason"] = "TRADE_LOGIN_ACCOUNT_SAMPLE_STATUS_UNVERIFIED"
                 else:
@@ -424,7 +492,7 @@ class NativeShmRpcRuntime:
         self.runtime_policy = ("PERSISTENT_LIVE_READ_WRITE" if self.persistent_live_read_write
                                else "PERSISTENT_SIMULATION_READ_WRITE" if self.persistent_simulation_read_write
                                else "PERSISTENT_READONLY" if self.persistent_readonly else "BOUNDED")
-        self.trade_login = NativeTradeLoginState(BIGQMT_ACCOUNT_ID, query)
+        self.trade_login = NativeTradeLoginState(BIGQMT_ACCOUNT_ID, query, environment=BIGQMT_ENVIRONMENT)
         provider = NativeReadOnlyProvider(query, BIGQMT_ACCOUNT_ID)
         rpc = _load_embedded("bigqmt_signal_trader.redis_rpc")
         transport = _load_embedded("bigqmt_signal_trader.transports.shm_rpc")

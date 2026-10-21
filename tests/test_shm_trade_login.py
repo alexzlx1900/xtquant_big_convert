@@ -16,6 +16,9 @@ SPEC.loader.exec_module(PROTOCOL)
 NATIVE_SPEC = importlib.util.spec_from_file_location("trade_login_native_fixture", ROOT / "test_shm_rpc_single_file.py")
 NATIVE = importlib.util.module_from_spec(NATIVE_SPEC)
 NATIVE_SPEC.loader.exec_module(NATIVE)
+DUAL_SPEC = importlib.util.spec_from_file_location("trade_login_dual_fixture", ROOT / "test_dual_shm_single_file.py")
+DUAL = importlib.util.module_from_spec(DUAL_SPEC)
+DUAL_SPEC.loader.exec_module(DUAL)
 
 # 已保存实机字段的本地重放；不读取VM、不制造新登录事件，不视为当前登录。
 # source: ~/.codex/tmp/aqp-qmt-core-20261015-2118/runtime/core-observation-result.json
@@ -23,6 +26,36 @@ NATIVE_SPEC.loader.exec_module(NATIVE)
 REAL_NATIVE_LOGIN = dict(raw_account_id="55013746", raw_status="登录成功", raw_numeric_status=None,
     source="native_account_callback", event_observed_at_utc="2026-10-15T13:44:43.989912Z",
     age_seconds=28.10899999999674, session_id="6018c77267c706812b271cffdf69afb9", native_pid=12692)
+
+
+@pytest.fixture
+def live_native(monkeypatch):
+    # 真实生成物+本地Win32/QMT替身；人工fixture key不代表任何实盘身份。
+    h = DUAL.Fixture(monkeypatch, **DUAL.live_settings())
+    _, submit, cancel = DUAL._enable_fixture_simulation_orders(h)
+    h.start()
+    try:
+        yield h, submit, cancel
+    finally:
+        h.close()
+
+
+def _live_account_row(h, **changes):
+    return dict(dict(m_strAccountID=h.account, m_strStatus="登录成功", m_nBrokerType=2,
+                     m_strAccountKey="LIVE-STOCK-FIXTURE-ONLY"), **changes)
+
+
+def _live_login_state(h):
+    return h.call("execution", "get_trade_login_state")["data"]
+
+
+def _assert_live_login_blocks_both_writes(h, submit, cancel):
+    for method, params in (("submit_order", PROTOCOL.ORDER), ("cancel_order", {"order_sys_id": "FIXTURE-SYSID"})):
+        result = h.call("execution", method, params)["data"]
+        assert result["status"] == "BLOCKED" and result["native_write_executed"] is False
+        assert result["automatic_retry"] is False
+    submit.assert_not_called()
+    cancel.assert_not_called()
 
 
 def test_missing_login_blocks_both_writes_and_keeps_reads_available():
@@ -342,3 +375,158 @@ def test_final_native_function_boundary_rechecks_login_even_after_positive_gate(
         assert h.namespace["passorder"].call_count == 0 and h.namespace["cancel"].call_count == 0
     finally:
         h.close()
+
+
+def test_live_stock_identity_success_and_same_fund_credit_callback_does_not_overwrite(live_native):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h))
+    before = _live_login_state(h)
+    assert before["status"] == "LOGGED_IN" and before["positive_contract_verified"] is True
+    assert before["raw_broker_type"] == before["query_diagnostic"]["raw_broker_type"] == 2
+    assert before["raw_account_key"] == before["bound_account_key"] == before["query_diagnostic"]["raw_account_key"]
+    assert before["raw_object_type"] == "builtins.dict"
+    assert before["query_diagnostic"]["raw_object_type"] == "types.SimpleNamespace"
+    h.namespace["account_callback"](h.context, _live_account_row(h, m_nBrokerType=3,
+        m_strAccountKey="LIVE-CREDIT-FIXTURE-ONLY", m_strStatus="尚未登录"))
+    after = _live_login_state(h)
+    assert after["status"] == "LOGGED_IN" and after["event_observed_at_utc"] == before["event_observed_at_utc"]
+    ignored = after["account_instance_diagnostics"][-1]
+    assert ignored["reason"] == "NON_STOCK_CALLBACK_IGNORED" and ignored["raw_broker_type"] == 3
+    assert ignored["raw_status"] == "尚未登录" and ignored["raw_account_key"] == "LIVE-CREDIT-FIXTURE-ONLY"
+    assert ignored["session_id"] == after["session_id"] and ignored["native_pid"] == after["native_pid"]
+    submit.assert_not_called()
+    cancel.assert_not_called()
+
+
+def test_live_cache_and_only_foreign_callback_never_prove_target_login(live_native):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h, m_nBrokerType=3,
+        m_strAccountKey="LIVE-CREDIT-FIXTURE-ONLY", m_strStatus="尚未登录"))
+    state = _live_login_state(h)
+    assert state["status"] == "UNKNOWN" and state["reason"] == "TRADE_LOGIN_CALLBACK_NOT_OBSERVED"
+    assert state["query_diagnostic"]["raw_status"] == "登录成功"
+    assert state["query_diagnostic"]["proves_login"] is False
+    assert state["bound_account_key"] == "LIVE-STOCK-FIXTURE-ONLY"
+    _assert_live_login_blocks_both_writes(h, submit, cancel)
+
+
+def test_live_same_type_different_instance_key_stays_unknown(live_native):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h))
+    assert _live_login_state(h)["status"] == "LOGGED_IN"
+    h.namespace["account_callback"](h.context, _live_account_row(h, m_strAccountKey="DIFFERENT-STOCK-INSTANCE"))
+    state = _live_login_state(h)
+    assert state["status"] == "UNKNOWN" and state["reason"] == "TRADE_LOGIN_CALLBACK_ACCOUNT_KEY_MISMATCH"
+    assert state["raw_account_key"] != state["bound_account_key"]
+    assert state["account_instance_diagnostics"][-1]["reason"] == "CALLBACK_INSTANCE_KEY_CONFLICT"
+    _assert_live_login_blocks_both_writes(h, submit, cancel)
+
+
+@pytest.mark.parametrize("changes", [dict(m_nBrokerType=None), dict(m_nBrokerType=True),
+    dict(m_nBrokerType=0), dict(m_nBrokerType=999), dict(m_nBrokerType="2"),
+    dict(m_strAccountKey=None), dict(m_strAccountKey=""), dict(m_strAccountKey=" "),
+    dict(m_strAccountKey=2), dict(m_strAccountKey="x" * 257)])
+def test_live_missing_or_unverified_callback_identity_cannot_keep_old_success(live_native, changes):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h))
+    assert _live_login_state(h)["status"] == "LOGGED_IN"
+    h.namespace["account_callback"](h.context, _live_account_row(h, **changes))
+    state = _live_login_state(h)
+    assert state["status"] == "UNKNOWN" and state["positive_contract_verified"] is False
+    assert state["account_instance_diagnostics"][-1]["reason"] == "CALLBACK_INSTANCE_IDENTITY_MISSING"
+    _assert_live_login_blocks_both_writes(h, submit, cancel)
+
+
+@pytest.mark.parametrize("status,reason", [("尚未登录", "TRADE_LOGIN_NOT_LOGGED_IN"),
+                                         ("准备登录", "TRADE_LOGIN_PREPARING_LOGIN")])
+def test_live_true_target_negative_overrides_success_despite_positive_query(live_native, status, reason):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h))
+    assert _live_login_state(h)["status"] == "LOGGED_IN"
+    h.namespace["account_callback"](h.context, _live_account_row(h, m_strStatus=status))
+    state = _live_login_state(h)
+    assert state["status"] == "NOT_LOGGED_IN" and state["reason"] == reason
+    assert state["query_diagnostic"]["raw_status"] == "登录成功"
+    assert state["positive_contract_verified"] is False
+    _assert_live_login_blocks_both_writes(h, submit, cancel)
+
+
+@pytest.mark.parametrize("changes", [dict(m_nBrokerType=None), dict(m_nBrokerType=3),
+    dict(m_strAccountKey=None), dict(m_strAccountKey="DIFFERENT-STOCK-INSTANCE"), dict(m_strAccountID="OTHER")])
+def test_live_current_account_sample_identity_vetoes_success(live_native, changes):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h))
+    assert _live_login_state(h)["status"] == "LOGGED_IN"
+    h.namespace["_RUNTIMES"]["execution"]["_SERVER"].trade_login.query = mock.Mock(
+        return_value=[_live_account_row(h, **changes)])
+    state = _live_login_state(h)
+    assert state["status"] == "UNKNOWN" and state["positive_contract_verified"] is False
+    assert state["query_diagnostic"]["error"] and state["query_diagnostic"]["proves_login"] is False
+    _assert_live_login_blocks_both_writes(h, submit, cancel)
+
+
+def test_live_same_type_new_instance_cannot_rebind_inside_one_sid(live_native):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h))
+    first = _live_login_state(h)
+    native = h.namespace["_RUNTIMES"]["execution"]["_SERVER"].trade_login
+    native.query = mock.Mock(return_value=[_live_account_row(h, m_strAccountKey="NEW-STOCK-INSTANCE")])
+    h.namespace["account_callback"](h.context, _live_account_row(h, m_strAccountKey="NEW-STOCK-INSTANCE"))
+    state = _live_login_state(h)
+    assert state["status"] == "UNKNOWN" and state["reason"] == "TRADE_LOGIN_ACCOUNT_SAMPLE_KEY_CHANGED"
+    assert state["bound_account_key"] == first["bound_account_key"]
+    _assert_live_login_blocks_both_writes(h, submit, cancel)
+
+
+def test_live_current_sample_negative_vetoes_positive_callback(live_native):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h))
+    native = h.namespace["_RUNTIMES"]["execution"]["_SERVER"].trade_login
+    native.query = mock.Mock(return_value=[_live_account_row(h, m_strStatus="尚未登录")])
+    state = _live_login_state(h)
+    assert state["status"] == "NOT_LOGGED_IN" and state["reason"] == "TRADE_LOGIN_ACCOUNT_SAMPLE_NOT_LOGGED_IN"
+    _assert_live_login_blocks_both_writes(h, submit, cancel)
+
+
+def test_live_instance_diagnostics_bounded_and_new_identity_clears_everything(live_native):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h))
+    assert _live_login_state(h)["status"] == "LOGGED_IN"
+    for number in range(5):
+        h.namespace["account_callback"](h.context, _live_account_row(h, m_nBrokerType=3,
+            m_strAccountKey="CREDIT-FIXTURE-%d" % number, m_strStatus="尚未登录"))
+    state = _live_login_state(h)
+    assert len(state["account_instance_diagnostics"]) == 3 and state["status"] == "LOGGED_IN"
+    assert [row["raw_account_key"] for row in state["account_instance_diagnostics"]] == [
+        "CREDIT-FIXTURE-2", "CREDIT-FIXTURE-3", "CREDIT-FIXTURE-4"]
+    native = h.namespace["_RUNTIMES"]["execution"]["_SERVER"].trade_login
+    native.bind_identity("new-fixture-sid", 888)
+    assert native.event is None and native.account_key is None and native.instance_diagnostics == []
+    assert native.readback()["status"] == "UNKNOWN"
+    submit.assert_not_called()
+    cancel.assert_not_called()
+
+
+def test_sim_account_login_contract_is_unchanged_by_live_identity_fields():
+    h = NATIVE.Fixture(native_gateway=True, verified_login_fixture=False)
+    try:
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="登录成功"))
+        state = h.call("get_trade_login_state")["data"]
+        assert state["status"] == "LOGGED_IN" and "account_instance_contract" not in state
+        h.namespace["account_callback"](h.context, dict(m_strAccountID=NATIVE.ACCOUNT, m_strStatus="尚未登录"))
+        state = h.call("get_trade_login_state")["data"]
+        assert state["status"] == "UNKNOWN" and state["reason"] == "TRADE_LOGIN_POSITIVE_STATUS_CONTRACT_UNVERIFIED"
+    finally:
+        h.close()
+
+
+def test_live_stopped_identity_cannot_reacquire_instance_anchor_from_query(live_native):
+    h, submit, cancel = live_native
+    h.namespace["account_callback"](h.context, _live_account_row(h))
+    assert _live_login_state(h)["status"] == "LOGGED_IN"
+    native = h.namespace["_RUNTIMES"]["execution"]["_SERVER"].trade_login
+    native.bind_identity(None, None)
+    assert native.readback()["status"] == "UNKNOWN"
+    assert native.event is None and native.account_key is None and native.instance_diagnostics == []
+    submit.assert_not_called()
+    cancel.assert_not_called()
