@@ -28,6 +28,36 @@ REAL_NATIVE_LOGIN = dict(raw_account_id="55013746", raw_status="登录成功", r
     age_seconds=28.10899999999674, session_id="6018c77267c706812b271cffdf69afb9", native_pid=12692)
 
 
+class OpaqueAccountMeta(type):
+    def __getattribute__(cls, name):
+        if name == "__module__":
+            raise AttributeError("native type has no module metadata")
+        return super().__getattribute__(name)
+
+
+class OpaqueAccount(metaclass=OpaqueAccountMeta):
+    def __init__(self, values):
+        self.__dict__.update(values)
+
+
+class OpaqueTypeInfoMeta(type):
+    def __getattribute__(cls, name):
+        if name in ("__module__", "__name__"):
+            raise RuntimeError("native type metadata unavailable")
+        return super().__getattribute__(name)
+
+
+class OpaqueTypeInfoAccount(metaclass=OpaqueTypeInfoMeta):
+    def __init__(self, values):
+        self.__dict__.update(values)
+
+
+class UnreadableIdentityAccount(OpaqueAccount):
+    @property
+    def m_strAccountKey(self):
+        raise RuntimeError("native account key unavailable")
+
+
 @pytest.fixture
 def live_native(monkeypatch):
     # 真实生成物+本地Win32/QMT替身；人工fixture key不代表任何实盘身份。
@@ -530,3 +560,57 @@ def test_live_stopped_identity_cannot_reacquire_instance_anchor_from_query(live_
     assert native.event is None and native.account_key is None and native.instance_diagnostics == []
     submit.assert_not_called()
     cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("factory,expected_type", [(OpaqueAccount, "OpaqueAccount"),
+                                                  (OpaqueTypeInfoAccount, "UNAVAILABLE")],
+                         ids=["missing-module", "unavailable-module-and-name"])
+def test_live_opaque_type_metadata_cannot_destroy_valid_instance_evidence(live_native, factory, expected_type):
+    h, submit, cancel = live_native
+    native = h.namespace["_RUNTIMES"]["execution"]["_SERVER"].trade_login
+    native.query = mock.Mock(return_value=[factory(_live_account_row(h))])
+    before = _live_login_state(h)
+    assert before["status"] == "UNKNOWN" and before["reason"] == "TRADE_LOGIN_CALLBACK_NOT_OBSERVED"
+    assert "error" not in before["query_diagnostic"]
+    assert before["query_diagnostic"]["raw_broker_type"] == 2
+    assert before["query_diagnostic"]["raw_account_key"] == "LIVE-STOCK-FIXTURE-ONLY"
+    assert before["query_diagnostic"]["raw_object_type"] == expected_type
+    _assert_live_login_blocks_both_writes(h, submit, cancel)
+    h.namespace["account_callback"](h.context, factory(_live_account_row(h)))
+    after = _live_login_state(h)
+    assert after["status"] == "LOGGED_IN" and after["positive_contract_verified"] is True
+    assert after["raw_object_type"] == expected_type
+    assert after["raw_broker_type"] == after["query_diagnostic"]["raw_broker_type"] == 2
+    assert after["raw_account_key"] == after["query_diagnostic"]["raw_account_key"]
+    submit.assert_not_called()
+    cancel.assert_not_called()
+
+
+def test_live_opaque_type_with_missing_identity_stays_unknown(live_native):
+    h, submit, cancel = live_native
+    native = h.namespace["_RUNTIMES"]["execution"]["_SERVER"].trade_login
+    missing = _live_account_row(h)
+    missing.pop("m_strAccountKey")
+    native.query = mock.Mock(return_value=[OpaqueAccount(missing)])
+    h.namespace["account_callback"](h.context, OpaqueAccount(missing))
+    state = _live_login_state(h)
+    assert state["status"] == "UNKNOWN" and state["positive_contract_verified"] is False
+    assert state["query_diagnostic"]["raw_broker_type"] == 2
+    assert state["query_diagnostic"]["raw_account_key"] is None
+    assert state["query_diagnostic"]["error"] == "TRADE_LOGIN_ACCOUNT_SAMPLE_KEY_MISSING"
+    _assert_live_login_blocks_both_writes(h, submit, cancel)
+
+
+def test_live_opaque_identity_accessor_failure_is_missing_identity_not_query_failure(live_native):
+    h, submit, cancel = live_native
+    native = h.namespace["_RUNTIMES"]["execution"]["_SERVER"].trade_login
+    row = UnreadableIdentityAccount(_live_account_row(h))
+    native.query = mock.Mock(return_value=[row])
+    h.namespace["account_callback"](h.context, row)
+    state = _live_login_state(h)
+    assert state["status"] == "UNKNOWN" and state["positive_contract_verified"] is False
+    assert state["query_diagnostic"]["raw_broker_type"] == 2
+    assert state["query_diagnostic"]["raw_account_key"] is None
+    assert state["query_diagnostic"]["error"] == "TRADE_LOGIN_ACCOUNT_SAMPLE_KEY_MISSING"
+    assert state["reason"] == "TRADE_LOGIN_CALLBACK_KEY_MISSING"
+    _assert_live_login_blocks_both_writes(h, submit, cancel)

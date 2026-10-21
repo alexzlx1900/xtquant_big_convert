@@ -291,9 +291,16 @@ class NativeTradeLoginState:
 
     @staticmethod
     def _instance_fields(account_info):
-        field = lambda name: account_info.get(name) if isinstance(account_info, dict) else getattr(account_info, name, None)
-        return dict(raw_broker_type=field("m_nBrokerType"), raw_account_key=field("m_strAccountKey"),
-                    raw_object_type=type(account_info).__module__ + "." + type(account_info).__name__)
+        def field(obj, name):
+            try:
+                return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+            except Exception:
+                return None  # C扩展字段不可读按身份缺失处理，不让诊断异常掩盖已有样本。
+        object_type = type(account_info)
+        parts = (field(object_type, "__module__"), field(object_type, "__name__"))
+        return dict(raw_broker_type=field(account_info, "m_nBrokerType"),
+                    raw_account_key=field(account_info, "m_strAccountKey"),
+                    raw_object_type=".".join(part for part in parts if isinstance(part, str) and part) or "UNAVAILABLE")
 
     @staticmethod
     def _valid_account_key(key):
