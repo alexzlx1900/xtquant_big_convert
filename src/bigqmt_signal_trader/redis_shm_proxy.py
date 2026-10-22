@@ -875,6 +875,9 @@ class RedisShmReadOnlyProxy:
         binding = self._source_binding()
         if binding is not None:
             response["source_binding"] = binding
+            if request.get("method") in self._capabilities:
+                route = "readonly" if request["method"] in QUOTE_METHODS | MARKET_RPC_METHODS else "execution"
+                response["session_id"] = self._sessions[route]
         return response
 
     def process_raw(self, raw_payload, source="queue"):

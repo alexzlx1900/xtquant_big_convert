@@ -902,6 +902,23 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         self.assertFalse(disabled.process_request(request("subscribe_quote", params={"code": "000001.SZ"}))["ok"])
         self.assertEqual(len(disabled_read.calls), 1)
 
+    def test_rejected_history_parameters_keep_verified_read_route_without_forwarding(self):
+        proxy, redis, readonly, execution = self.make_proxy(policy="PERSISTENT_READONLY", market=True)
+        result = proxy.process_request(request("get_local_data", rid="bad-local-date", params={
+            "code": "000001.SZ", "period": "1d", "start_time": "20261021",
+            "end_time": "20261021", "count": 1,
+        }))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["server_error"], "PROXY_REQUEST_REJECTED")
+        self.assertEqual(result["session_id"], "readonly-sid")
+        self.assertEqual(result["source_binding"], proxy.identity_snapshot()["source_binding"])
+        self.assertEqual(len(readonly.calls), 1)
+        self.assertEqual(len(execution.calls), 1)
+        self.assertFalse(proxy.stopped)
+        self.assertFalse(any(redis.hashes.values()))
+        valid = proxy.process_request(request("get_ticks", rid="after-rejected-read", params={"codes": ["000001.SZ"]}))
+        self.assertTrue(valid["ok"])
+
     def test_persistent_expired_confirmed_reads_reclaim_bounded_cache_after_1100_requests(self):
         clock = [1000.0]
         with mock.patch("bigqmt_signal_trader.redis_shm_proxy.time.time", side_effect=lambda: clock[0]):
