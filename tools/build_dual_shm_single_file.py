@@ -43,9 +43,12 @@ def _configure_source(source, settings):
 def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
                  execution_name, symbols, account_id=ACCOUNT, max_seconds=900,
                  max_requests=1000, enable_market_rpc=False, persistent_readonly=False,
-                 persistent_simulation_read_write=False, environment="SIM", persistent_live_read_write=False):
+                 persistent_simulation_read_write=False, environment="SIM", persistent_live_read_write=False,
+                 live_account_query_login=False):
     if environment not in ("SIM", "LIVE"):
         raise ValueError("explicit SIM/LIVE environment required")
+    if type(live_account_query_login) is not bool or (live_account_query_login and environment != "LIVE"):
+        raise ValueError("ACCOUNT query login authority requires explicit LIVE selection")
     if environment == "LIVE":
         if (persistent_live_read_write is not True or not isinstance(account_id, str) or not account_id
                 or len(account_id) > 64 or account_id == ACCOUNT
@@ -107,6 +110,7 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         "SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE": persistent_simulation_read_write,
         "SHM_RPC_PERSISTENT_LIVE_READ_WRITE": persistent_live_read_write,
         "SHM_RPC_ACCOUNT_ALREADY_BOUND": read_write,
+        "SHM_RPC_LIVE_ACCOUNT_QUERY_LOGIN": live_account_query_login,
     })
     sources = {"read": read, "execution": execution}
     for key, source in sources.items():
@@ -116,7 +120,7 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         hard_deadline_unix=None if persistent else float(hard_deadline_unix), max_seconds=max_seconds,
         max_requests_per_source=max_requests, market_rpc_enabled=enable_market_rpc,
         persistent_readonly=persistent_readonly, persistent_simulation_read_write=persistent_simulation_read_write,
-        persistent_live_read_write=persistent_live_read_write)
+        persistent_live_read_write=persistent_live_read_write, live_account_query_login=live_account_query_login)
     output = TEMPLATE.replace("__DUAL_SETTINGS__", repr(settings)).replace("__DUAL_PAYLOADS__", repr(payloads))
     output = output.encode("ascii", "backslashreplace").decode("ascii")
     ast.parse(output, feature_version=(3, 6))

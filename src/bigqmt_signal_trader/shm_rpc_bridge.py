@@ -159,6 +159,35 @@ class ShmRpcBridge:
             error = "CANCEL_CONFIRMATION_DEADLINE; outcome=UNKNOWN"
         return self._write_result("cancel_order", result, error)
 
+    def _trade_login_query_valid(self, value):
+        diagnostic = value.get("query_diagnostic")
+        age, stamp = value.get("sample_age_seconds"), value.get("sample_observed_at_utc")
+        key = value.get("raw_account_key")
+        if not (self.environment == "LIVE" and type(value.get("login_evidence_version")) is int
+                and value["login_evidence_version"] == 3 and value.get("source") == "native_account_query"
+                and value.get("freshness_basis") == "current_native_account_query"
+                and value.get("account_instance_contract") == "LIVE_STOCK_ACCOUNT_QUERY_V1"
+                and value.get("fresh") is True and value.get("positive_contract_verified") is True
+                and type(age) in (int, float) and math.isfinite(age) and 0 <= age <= 15
+                and value.get("raw_account_id") == self.account_id and value.get("raw_status") == "\u767b\u5f55\u6210\u529f"
+                and type(value.get("raw_broker_type")) is int and value["raw_broker_type"] == 2
+                and isinstance(key, str) and 0 < len(key) <= 256 and key.strip()
+                and value.get("bound_account_key") == key and isinstance(diagnostic, dict)
+                and diagnostic.get("source") == "native_get_trade_detail_data_ACCOUNT"
+                and diagnostic.get("proves_login") is True and not diagnostic.get("error")
+                and diagnostic.get("query_observed_at_utc") == stamp
+                and all(diagnostic.get(field) == value.get(field) for field in
+                        ("raw_account_id", "raw_status", "raw_broker_type", "raw_account_key"))
+                and isinstance(stamp, str) and stamp.endswith("Z")):
+            return False
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                wall_age = (datetime.datetime.utcnow() - datetime.datetime.strptime(stamp, fmt)).total_seconds()
+                return -1 <= wall_age <= 15 and abs(wall_age - age) <= 1
+            except ValueError:
+                pass
+        return False
+
     def _trade_login(self):
         unknown = dict(status="UNKNOWN", account_id=self.account_id, session_id=self.mailbox.session_id,
                        native_pid=self.mailbox.server_pid, source="NONE", raw_status=None,
@@ -178,7 +207,9 @@ class ShmRpcBridge:
                      and type(value.get("age_seconds")) in (int, float) and math.isfinite(value["age_seconds"])
                      and value["age_seconds"] >= 0 and value.get("event_observed_at_utc")
                      and value.get("source") == "native_account_callback")
-            if "login_evidence_version" in value:
+            if type(value.get("login_evidence_version")) is int and value["login_evidence_version"] == 3:
+                valid = self._trade_login_query_valid(value)
+            elif "login_evidence_version" in value:
                 diagnostic = value.get("query_diagnostic")
                 valid = (valid and type(value["login_evidence_version"]) is int and value["login_evidence_version"] == 2
                     and value.get("freshness_basis") == "native_callback_state_with_current_account_sample"

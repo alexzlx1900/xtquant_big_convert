@@ -986,7 +986,7 @@ class RedisShmReadOnlyProxy:
                         login_state_unknown = (
                             request["method"] == "get_trade_login_state" and response["ok"]
                             and isinstance(data, dict) and data.get("status") == "UNKNOWN"
-                            and data.get("source") == "native_account_callback"
+                            and data.get("source") in ("native_account_callback", "native_account_query")
                             and data.get("account_id") == self.account_id
                             and data.get("session_id") == self._sessions[route]
                             and type(data.get("native_pid")) is int

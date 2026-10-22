@@ -24,6 +24,7 @@ SHM_RPC_PERSISTENT_READONLY = False  # 显式55013746驻留禁写；默认仍有
 SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE = False  # 显式模拟读写驻留；不启用策略tick。
 SHM_RPC_PERSISTENT_LIVE_READ_WRITE = False  # 仅显式实盘账户常驻；不启用策略tick。
 SHM_RPC_ACCOUNT_ALREADY_BOUND = False  # 仅显式双源外壳已完成唯一账户绑定时使用。
+SHM_RPC_LIVE_ACCOUNT_QUERY_LOGIN = False  # 仅显式LIVE候选使用当前ACCOUNT登录状态。
 SHM_RPC_ORDER_GATEWAY = None  # 禁写默认不绑定；另行授权后才可显式注入既有gateway。
 SHM_RPC_ORDER_GATEWAY_FACTORY = None  # 显式候选可注入factory；禁写时不会构造。
 _EMBEDDED_SOURCES = {}  # BUILD_SHM_RPC_EMBEDDED
@@ -277,11 +278,14 @@ def create_native_stock_order_gateway(context, account_id, query, passorder_func
 
 class NativeTradeLoginState:
     """会话内原生状态事件与本次账户采样分开计时，不把状态变化当心跳。"""
-    def __init__(self, account_id, query, environment="SIM"):
+    def __init__(self, account_id, query, environment="SIM", query_login_authority=False):
         if environment not in ("SIM", "LIVE"):
             raise ValueError("explicit SIM/LIVE login environment required")
+        if type(query_login_authority) is not bool or (query_login_authority and environment != "LIVE"):
+            raise ValueError("current ACCOUNT login authority requires explicit LIVE selection")
         self.account_id, self.query = account_id, query
         self.strict_stock_instance = environment == "LIVE"
+        self.query_login_authority = query_login_authority
         self.identity, self.event = None, None
         self.account_key, self.instance_diagnostics = None, []
 
@@ -329,6 +333,41 @@ class NativeTradeLoginState:
             if foreign_type:
                 return
         self.event = event
+
+    def _account_query_readback(self, value, diagnostic, sample_error):
+        """显式LIVE v3：查询状态为依据，原资金回调只保留事实与身份核验。"""
+        event = self.event
+        callback = {key: item for key, item in (event or {}).items()
+                    if key not in ("identity", "observed_monotonic")}
+        value.update(login_evidence_version=3, source="native_account_query",
+                     freshness_basis="current_native_account_query",
+                     account_instance_contract="LIVE_STOCK_ACCOUNT_QUERY_V1",
+                     callback_diagnostic=callback,
+                     callback_status_conflict=bool(event and event["raw_status"] != diagnostic["raw_status"]),
+                     contract_source="https://dict.thinktrader.net/innerApi/trading_function.html",
+                     reason=sample_error or "TRADE_LOGIN_ACCOUNT_SAMPLE_STATUS_UNVERIFIED")
+        diagnostic.update(source="native_get_trade_detail_data_ACCOUNT", proves_login=True,
+                          used_as_consistency_veto=False)
+        for key in ("raw_account_id", "raw_status", "raw_numeric_status", "raw_broker_type", "raw_account_key", "raw_object_type"):
+            value[key] = diagnostic.get(key)
+        if event:
+            age = time.monotonic() - event["observed_monotonic"]
+            value.update(event_observed_at_utc=event["observed_at_utc"], age_seconds=age,
+                         state_event_age_seconds=age)
+            if (event["identity"] != self.identity or event["raw_account_id"] != self.account_id
+                    or type(event.get("raw_broker_type")) is not int or event["raw_broker_type"] != 2
+                    or event.get("raw_account_key") != self.account_key):
+                value.update(fresh=False, reason="TRADE_LOGIN_CALLBACK_INSTANCE_CONFLICT")
+                return value
+        if sample_error:
+            return value
+        if not value["fresh"]:
+            value["reason"] = "TRADE_LOGIN_ACCOUNT_SAMPLE_STALE"
+        elif diagnostic["raw_status"] == "\u767b\u5f55\u6210\u529f":
+            value.update(status="LOGGED_IN", positive_contract_verified=True, reason="")
+        elif diagnostic["raw_status"] in ("\u51c6\u5907\u767b\u5f55", "\u5c1a\u672a\u767b\u5f55", "\u767b\u5f55\u5931\u8d25", "\u5df2\u65ad\u5f00"):
+            value.update(status="NOT_LOGGED_IN", reason="TRADE_LOGIN_ACCOUNT_SAMPLE_NOT_LOGGED_IN")
+        return value
 
     def readback(self):
         session_id, pid = self.identity or (None, None)
@@ -385,6 +424,8 @@ class NativeTradeLoginState:
             value.update(account_instance_contract="LIVE_STOCK_ACCOUNT_KEY_V1", expected_broker_type=2,
                          bound_account_key=self.account_key,
                          account_instance_diagnostics=[dict(item) for item in self.instance_diagnostics])
+        if self.query_login_authority:
+            return self._account_query_readback(value, diagnostic, sample_error)
         if self.event is not None:
             event = self.event
             age = time.monotonic() - event["observed_monotonic"]
@@ -499,7 +540,8 @@ class NativeShmRpcRuntime:
         self.runtime_policy = ("PERSISTENT_LIVE_READ_WRITE" if self.persistent_live_read_write
                                else "PERSISTENT_SIMULATION_READ_WRITE" if self.persistent_simulation_read_write
                                else "PERSISTENT_READONLY" if self.persistent_readonly else "BOUNDED")
-        self.trade_login = NativeTradeLoginState(BIGQMT_ACCOUNT_ID, query, environment=BIGQMT_ENVIRONMENT)
+        self.trade_login = NativeTradeLoginState(BIGQMT_ACCOUNT_ID, query, environment=BIGQMT_ENVIRONMENT,
+            query_login_authority=SHM_RPC_LIVE_ACCOUNT_QUERY_LOGIN)
         provider = NativeReadOnlyProvider(query, BIGQMT_ACCOUNT_ID)
         rpc = _load_embedded("bigqmt_signal_trader.redis_rpc")
         transport = _load_embedded("bigqmt_signal_trader.transports.shm_rpc")
