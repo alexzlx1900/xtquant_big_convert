@@ -226,3 +226,52 @@ def test_unsafe_client_params_do_not_open_mailbox(overrides):
     with pytest.raises(ShmProtocolError):
         client.call("get_market_data_ex", params(**overrides))
     factory.assert_not_called()
+
+
+class ManagedHistorySubscriptionTests(FIXTURE.BridgeFixture):
+    def setUp(self):
+        super().setUp()
+        self.bridge.market_enabled = True
+        self.table = {9: {"code": "600000.SH", "period": "tick"}}
+        self.before = dict(self.table)
+        self.context.get_market_data_ex = mock.Mock()
+        self.context.get_all_subscription = mock.Mock(side_effect=lambda: dict(self.table))
+        self.context.subscribe_quote = mock.Mock(side_effect=self.acquire)
+        self.context.unsubscribe_quote = mock.Mock(side_effect=self.release)
+
+    def acquire(self, code, **kwargs):
+        self.assertIsNone(kwargs["callback"])
+        self.table[27] = {"code": code, "period": kwargs["period"]}
+        return 27
+
+    def release(self, handle):
+        self.table.pop(handle)
+        return True
+
+    def test_managed_minute_and_daily_release_only_their_native_handle(self):
+        for period in ("1m", "1d"):
+            result = self.process("subscribe_quote", params={"code":"000001.SZ", "period":period})
+            self.assertTrue(result["ok"], result)
+            identifier = result["data"]["subscription_id"]
+            result = self.process("unsubscribe_quote", params={"subscription_id":identifier})
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["data"]["subscriptions_before"], 1)
+            self.assertEqual(result["data"]["subscriptions_after"], 1)
+            self.assertEqual(self.table, self.before)
+        self.assertEqual(self.context.unsubscribe_quote.call_args_list, [mock.call(27), mock.call(27)])
+        self.assertIn("1d", self.process("ping")["data"]["managed_history_periods"])
+
+    def test_missing_snapshot_and_unsupported_period_publish_nothing(self):
+        self.context.get_all_subscription = None
+        self.assertEqual(self.process("ping")["data"]["managed_history_periods"], [])
+        result = self.process("subscribe_quote", params={"code":"000001.SZ", "period":"1m"})
+        self.assertFalse(result["ok"])
+        self.context.subscribe_quote.assert_not_called()
+        for period in ("follow", "l2quote"):
+            with pytest.raises(ShmProtocolError):
+                ShmReadOnlyRpcClient._market_params("subscribe_quote", {"code":"000001.SZ", "period":period})
+
+    def test_managed_wire_accepts_explicit_bar_periods_only(self):
+        for period in ("1m", "5m", "1d"):
+            result = ShmReadOnlyRpcClient._market_params("subscribe_quote", {"code":"000001.SZ", "period":period})
+            self.assertEqual(result["period"], period)

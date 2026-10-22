@@ -233,6 +233,9 @@ class ShmReadOnlyBridge:
                         "max_seconds": READONLY_MAX_SECONDS, "max_requests": READONLY_MAX_REQUESTS,
                         "windows_session_id": self.windows_session_id,
                         "background_threads": False, "callback_thread_id": self.callback_thread_id,
+                        "managed_history_periods": ["1m", "5m", "15m", "30m", "60m", "1d"] if self.market_enabled and all(
+                            callable(getattr(self.context, name, None)) for name in
+                            ("get_all_subscription", "subscribe_quote", "unsubscribe_quote", "get_market_data_ex")) else [],
                         "session_id": self.mailbox.session_id, "native_pid": self.mailbox.server_pid, "capabilities": list(allowed_methods)}
             elif method in ("get_local_data", "get_market_data_ex", "download_history_data", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"):
                 data = self.market_request(method, params)
@@ -512,17 +515,28 @@ class ShmReadOnlyBridge:
         if method == "subscribe_quote":
             if (set(params) - {"account_id", "code", "period", "result_type", "dividend_type"}
                     or params.get("code") not in self.quote_symbols
-                    or params.get("period", "tick") != "tick" or params.get("result_type", "dict") != "dict"
+                    or params.get("period", "tick") not in ("tick", "1m", "5m", "15m", "30m", "60m", "1d")
+                    or params.get("result_type", "dict") != "dict"
                     or params.get("dividend_type", "none") != "none"):
-                raise ReadOnlyRequestError("INVALID_PARAMS", "subscription requires allowlisted symbol and tick/dict/none")
+                raise ReadOnlyRequestError("INVALID_PARAMS", "subscription requires allowlisted symbol, supported period and dict/none")
             if self.subscription is not None:
                 raise ReadOnlyRequestError("SUBSCRIPTION_ACTIVE", "only one subscription is permitted")
             if not callable(getattr(self.context, "subscribe_quote", None)) or not callable(getattr(self.context, "unsubscribe_quote", None)):
                 raise ReadOnlyRequestError("SUBSCRIPTION_UNAVAILABLE", "native subscription and cancellation are required")
+            period = params.get("period", "tick")
+            subscriptions_before = None
+            if period != "tick":
+                snapshot = getattr(self.context, "get_all_subscription", None)
+                if not callable(snapshot):
+                    raise ReadOnlyRequestError("SUBSCRIPTION_UNAVAILABLE", "managed history requires a native subscription snapshot")
+                subscriptions_before = snapshot()
+                if not isinstance(subscriptions_before, dict):
+                    raise ReadOnlyRequestError("SUBSCRIPTION_UNAVAILABLE", "native subscription snapshot is not a mapping")
+                subscriptions_before = dict(subscriptions_before)
             self.subscription_generation += 1
             subscription = {"subscription_id": "%s-%s" % (self.mailbox.session_id, self.subscription_generation),
                             "account_id": self.account_id, "session_id": self.mailbox.session_id,
-                            "code": params["code"], "active": True, "native_handle": None}
+                            "code": params["code"], "period": period, "active": True, "native_handle": None}
             with self.event_lock:
                 subscription["initial_sequence"] = self.event_sequence
                 self.subscription = subscription
@@ -563,10 +577,16 @@ class ShmReadOnlyBridge:
                     except Exception as exc:
                         self.callback_error = "%s: %s" % (type(exc).__name__, exc)
             try:
-                handle = self.context.subscribe_quote(subscription["code"], period="tick", dividend_type="none", result_type="dict", callback=callback)
+                handle = self.context.subscribe_quote(subscription["code"], period=period, dividend_type="none", result_type="dict",
+                                                      callback=callback if period == "tick" else None)
                 if type(handle) is not int or handle < 0:
                     raise ReadOnlyRequestError("SUBSCRIPTION_UNAVAILABLE", "native subscription returned invalid handle")
+                if subscriptions_before is not None and (handle in subscriptions_before or str(handle) in subscriptions_before):
+                    raise ReadOnlyRequestError("SUBSCRIPTION_UNCONFIRMED", "returned native handle already existed; never cancel another owner")
                 subscription["native_handle"] = handle
+                if subscriptions_before is not None:
+                    subscription["subscriptions_before_count"] = len(subscriptions_before)
+                    self.managed_subscriptions_before = subscriptions_before
             except Exception:
                 with self.event_lock:
                     subscription["active"] = False
@@ -600,10 +620,17 @@ class ShmReadOnlyBridge:
         try:
             if self.context.unsubscribe_quote(subscription["native_handle"]) is not True:
                 raise RuntimeError("native unsubscribe did not confirm success")
+            if subscription.get("period", "tick") != "tick":
+                after = self.context.get_all_subscription()
+                if not isinstance(after, dict) or after != self.managed_subscriptions_before:
+                    raise RuntimeError("native subscription table did not return to its original state")
         except Exception as exc:
             raise ReadOnlyRequestError("CLEANUP_FAILED", "%s: %s" % (type(exc).__name__, exc))
         self.subscription = None
-        return {"cancelled": True, "cleanup_status": "CANCELLED", "subscription_id": subscription["subscription_id"]}
+        result = {"cancelled": True, "cleanup_status": "CANCELLED", "subscription_id": subscription["subscription_id"]}
+        if "subscriptions_before_count" in subscription:
+            result.update(subscriptions_before=subscription["subscriptions_before_count"], subscriptions_after=len(after))
+        return result
 
     def drain(self):
         if self.closed:

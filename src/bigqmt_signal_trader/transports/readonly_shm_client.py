@@ -122,9 +122,10 @@ class ShmReadOnlyRpcClient:
             except ValueError:
                 raise ShmProtocolError("download trading day is invalid")
         elif method == "subscribe_quote":
-            if (values.get("period", "tick") != "tick" or values.get("dividend_type", "none") != "none"
+            if (values.get("period", "tick") not in ("tick", "1m", "5m", "15m", "30m", "60m", "1d")
+                    or values.get("dividend_type", "none") != "none"
                     or values.get("result_type", "dict") != "dict"):
-                raise ShmProtocolError("subscription requires tick/dict/none")
+                raise ShmProtocolError("subscription requires a supported period and dict/none")
         elif method == "poll_quote_events":
             after = values.get("after_sequence")
             if type(after) is not int or after < 0:
