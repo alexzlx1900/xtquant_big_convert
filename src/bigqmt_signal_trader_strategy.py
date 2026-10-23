@@ -464,6 +464,14 @@ def _build_rpc_service(context_info, app, config):
         quote_subscription_manager=quote_manager,
     )
     handlers.download_job_redis_client = response_redis_client or redis_client
+    # The order-identity store, which is how a query gets a strategy name back
+    # (QMT does not put one on its rows -- issue #133). It must not depend on
+    # the transport: only a redis transport builds the clients above, so a zmq
+    # deployment never remembered an order and could never attribute one.
+    # Built here from the redis config if there is one; absent config it stays
+    # None and attribution is simply skipped.
+    handlers.order_identity_redis_client = (
+        handlers.download_job_redis_client or _exec_event_redis(config))
     handlers.download_job_chunk_size = int((config.get("download_jobs") or {}).get("chunk_size") or 10)
     handlers.download_job_ttl_seconds = int((config.get("download_jobs") or {}).get("job_ttl_seconds") or 3600)
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)

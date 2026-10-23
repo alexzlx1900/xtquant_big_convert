@@ -37,6 +37,64 @@ PRICE_TYPE_ALIASES = {
 # why they passed while the mapping was wrong.
 _XC = _xtconstant
 
+def _account_type_codes():
+    """Name -> xtconstant account-type code.
+
+    Read off xtconstant rather than written out (PR #88 is the standing
+    reminder about literals), but NOT off ACCOUNT_TYPE_DICT: the xtquant that
+    wins inside Big QMT is the terminal's own bundled copy at
+    bin.x64/Lib/site-packages/xtquant, not this repo's shim, and it carries 91
+    names where the shim has 538. ACCOUNT_TYPE_DICT is one of the 447 it does
+    not have -- reading it at import time took the whole order gateway down
+    with "module 'xtquant.xtconstant' has no attribute ACCOUNT_TYPE_DICT",
+    which surfaces to clients as "order_gateway is not configured".
+
+    So: the dict when it exists, and the individual *_ACCOUNT constants
+    otherwise. Those 8 are in both copies.
+    """
+    codes = {}
+    table = getattr(_xtconstant, "ACCOUNT_TYPE_DICT", None)
+    if isinstance(table, dict):
+        for code, name in table.items():
+            try:
+                codes[str(name).strip().upper()] = int(code)
+            except (TypeError, ValueError):
+                continue
+    for attribute in dir(_xtconstant):
+        if not attribute.endswith("_ACCOUNT"):
+            continue
+        value = getattr(_xtconstant, attribute)
+        if isinstance(value, int) and not isinstance(value, bool):
+            codes.setdefault(attribute[:-len("_ACCOUNT")], value)
+    # ACCOUNT_TYPE_DICT names SECURITY_ACCOUNT "STOCK"; the attribute scan
+    # yields "SECURITY". Both spellings reach callers, so keep both.
+    security = getattr(_xtconstant, "SECURITY_ACCOUNT", 2)
+    codes.setdefault("STOCK", security)
+    codes.setdefault("SECURITY", security)
+    return codes
+
+
+ACCOUNT_TYPE_CODES = _account_type_codes()
+
+
+def _first_nonzero(row, names, default=0.0):
+    """First candidate attribute with a non-zero numeric value."""
+    for name in names:
+        value = getattr(row, name, None)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number:
+            return number
+    return default
+
+
+
+
+
 CREDIT_OPTYPE_BY_ORDER_TYPE = {
     _XC.CREDIT_FIN_BUY: 27,                    # 融资买入
     _XC.CREDIT_SLO_SELL: 28,                   # 融券卖出
@@ -266,6 +324,50 @@ class BigQmtOrderGateway:
             raise RuntimeError("cancel is not available in Big QMT runtime")
         return self.cancel_func
 
+    def _account_type_code(self):
+        """The account type as MiniQMT reports it: an xtconstant int.
+
+        xttype.XtOrder/XtTrade both carry account_type, and real MiniQMT fills
+        it with SECURITY_ACCOUNT unconditionally. This deployment knows better
+        -- it is configured with the type it actually trades as -- and #92
+        showed what silence costs: a credit account read as STOCK returns an
+        all-zero asset row with no error. So report the configured type and
+        fall back to SECURITY_ACCOUNT only when there is nothing to report.
+        """
+        text = str(self.account_type or "").strip().upper()
+        if text in ACCOUNT_TYPE_CODES:
+            return ACCOUNT_TYPE_CODES[text]
+        try:
+            # Already a code -- some configs set the number directly.
+            return int(text)
+        except (TypeError, ValueError):
+            return getattr(_xtconstant, "SECURITY_ACCOUNT", 2)
+
+    def _instrument_name(self, row, stock_code, cache):
+        """证券名称 —— from the row if QMT put it there, else ContextInfo.
+
+        Position rows carry m_strInstrumentName (position_bigqmt reads it), so
+        order/deal rows plausibly do too; whether they actually do is a
+        question about the terminal, not about us, hence the fallback. The
+        cache is per query call: get_stock_name is an in-process ContextInfo
+        call, but a day of orders can repeat the same code many times.
+        """
+        name = str(_attr(row, ("m_strInstrumentName", "instrument_name",
+                               "stock_name"), "") or "")
+        if name:
+            return name
+        if stock_code in cache:
+            return cache[stock_code]
+        resolved = ""
+        getter = getattr(self.context_info, "get_stock_name", None)
+        if getter is not None:
+            try:
+                resolved = str(getter(stock_code) or "")
+            except Exception:
+                resolved = ""
+        cache[stock_code] = resolved
+        return resolved
+
     def _require_query_func(self):
         if self.get_trade_detail_data is None:
             raise RuntimeError("get_trade_detail_data is not available in Big QMT runtime")
@@ -331,6 +433,8 @@ class BigQmtOrderGateway:
         query = self._require_query_func()
         rows = query(account_id, self.account_type, "ORDER", strategy_name) or []
         result = []
+        account_type_code = self._account_type_code()
+        name_cache = {}
         for row in rows:
             try:
                 stock_code = _full_code(
@@ -352,7 +456,8 @@ class BigQmtOrderGateway:
                     traded_volume=int(_attr(row, ("m_nVolumeTraded", "traded_volume"), 0) or 0),
                     status=str(_attr(row, ("m_nOrderStatus", "status"), "") or ""),
                     price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
-                    strategy_name=str(_attr(row, ("m_strStrategyName", "strategy_name"), "") or ""),
+                    strategy_name=str(_attr(row, ("m_strStrategyName", "strategy_name"), "")
+                                      or strategy_name or ""),
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
                     order_time=_order_time_seconds(row),
                     status_msg=_status_message(row),
@@ -362,6 +467,19 @@ class BigQmtOrderGateway:
                     ),
                     op_type=op_type,
                     order_type=_query_order_type(self.account_type, op_type, action),
+                    # MiniQMT XtOrder carries these and this bridge never sent
+                    # them, so every client saw AttributeError (issue #133).
+                    account_type=account_type_code,
+                    instrument_name=self._instrument_name(row, stock_code, name_cache),
+                    # 股东代码. MiniQMT's XtOrder has it; the ORDER rows this
+                    # terminal returns do not -- none of their 120 attributes
+                    # is a shareholder id. Kept so the field exists (a caller
+                    # reading it gets "" rather than AttributeError) and so a
+                    # broker whose QMT does supply it is picked up.
+                    secu_account=str(_attr(row, ("m_strShareholderID", "m_strSecuAccount",
+                                                 "secu_account"), "") or ""),
+                    offset_flag=_attr(row, ("m_nOffsetFlag", "offset_flag")),
+                    direction=_attr(row, ("m_nDirection", "direction")),
                 )
             )
         return result
@@ -389,6 +507,8 @@ class BigQmtOrderGateway:
         if not rows and last_error is not None:
             raise last_error
         result = []
+        account_type_code = self._account_type_code()
+        name_cache = {}
         for row in rows:
             traded_at_raw = _attr(row, ("m_strTradeTime", "trade_time", "traded_at"), "")
             try:
@@ -410,16 +530,40 @@ class BigQmtOrderGateway:
                     traded_at=str(traded_at_raw or ""),
                     user_order_id=str(_attr(row, ("m_strRemark", "user_order_id", "remark"), "") or ""),
                     # 官方 Deal 字段: m_dTradeAmount 成交额; m_strTradeDate+
-                    # m_strTradeTime 合成 Unix 秒; 策略名来自查询过滤参数。
+                    # m_strTradeTime 合成 Unix 秒。
                     amount=float(_attr(row, ("m_dTradeAmount", "amount"), 0.0) or 0.0),
-                    strategy_name=str(strategy_name or ""),
+                    # The row's own strategy name first -- though on this
+                    # terminal there is none: neither ORDER nor DEAL rows carry
+                    # m_strStrategyName. QMT filters by strategy without ever
+                    # reporting it, which is why the field read "" for
+                    # everything (issue #133). The filter is the fallback: when
+                    # one IS given every row belongs to it by construction. For
+                    # orders this bridge submitted, the RPC layer puts the real
+                    # name back from the identity store.
+                    strategy_name=str(
+                        _attr(row, ("m_strStrategyName", "strategy_name"), "")
+                        or strategy_name or ""
+                    ),
                     traded_time=date_time_seconds(
                         _attr(row, ("m_strTradeDate", "trade_date", "m_strDealDate")),
                         traded_at_raw,
                     ),
+                    account_type=account_type_code,
+                    instrument_name=self._instrument_name(row, stock_code, name_cache),
+                    secu_account=str(_attr(row, ("m_strShareholderID", "m_strSecuAccount",
+                                                 "secu_account"), "") or ""),
+                    # XtTrade.commission 手续费. A live DEAL row carries BOTH
+                    # m_dComssion (QMT's own misspelling) and m_dCommission, so
+                    # first-non-None would stop at whichever comes first even
+                    # when it is the 0.0 one. Take the first non-zero instead.
+                    commission=_first_nonzero(
+                        row, ("m_dComssion", "m_dCommission", "commission")),
+                    offset_flag=_attr(row, ("m_nOffsetFlag", "offset_flag")),
+                    direction=_attr(row, ("m_nDirection", "direction")),
                 )
             )
         return result
+
 
     def query_submission_identities_strict(self, account_id, strategy_name):
         orders = self.query_orders_strict(account_id, strategy_name)

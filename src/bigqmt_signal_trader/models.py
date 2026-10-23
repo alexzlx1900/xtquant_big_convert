@@ -373,6 +373,11 @@ class OrderSnapshot:
         price_type=None,
         op_type=None,
         order_type=None,
+        account_type=0,
+        instrument_name="",
+        secu_account="",
+        offset_flag=None,
+        direction=None,
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -398,12 +403,23 @@ class OrderSnapshot:
         # 23/24，但专项两融使用不同编号；两者必须分别保留。
         self.op_type = op_type
         self.order_type = order_type
+        # 下面这五个是 MiniQMT XtOrder 契约里有、本桥一直没发的字段
+        # (issue #133)。xttype.XtOrder 的构造参数就列着 secu_account /
+        # instrument_name，并在 __init__ 里置 account_type。
+        # account_type 是 xtconstant 的数字码（0 = 未知，由客户端兜底）。
+        self.account_type = account_type
+        self.instrument_name = instrument_name
+        self.secu_account = secu_account
+        self.offset_flag = offset_flag
+        self.direction = direction
 
 
 class TradeSnapshot:
     def __init__(self, trade_id, order_sys_id, stock_code, action, volume, price,
                  traded_at="", user_order_id="", amount=0.0, strategy_name="",
-                 traded_time=0):
+                 traded_time=0, account_type=0, instrument_name="",
+                 secu_account="", commission=0.0, offset_flag=None,
+                 direction=None):
         self.trade_id = trade_id
         self.order_sys_id = order_sys_id
         self.stock_code = stock_code
@@ -415,10 +431,19 @@ class TradeSnapshot:
         # 官方 Deal 字段 m_dTradeAmount(成交额) / m_strTradeDate+m_strTradeTime。
         # 追加在末尾并给默认值, 保持既有位置参数调用不受影响 (同 OrderSnapshot.order_time)。
         self.amount = amount
-        # strategy_name 是查询过滤参数 (仅委托/成交有效): 按策略过滤时返回集
-        # 必属该策略, 因此直接回填; 空策略名查全部时保持 ""。
+        # strategy_name 优先取 DEAL 行自己的 m_strStrategyName；取不到才回填查询
+        # 过滤参数（按策略过滤时返回集必属该策略）。以前只有后一半，
+        # 所以不过滤查全部时这个字段恒为空字符串 (issue #133)。
         self.strategy_name = strategy_name
         self.traded_time = traded_time
+        # 同 OrderSnapshot：MiniQMT XtTrade 契约里有而本桥没发的字段。
+        # commission 是 XtTrade 独有的（手续费）。
+        self.account_type = account_type
+        self.instrument_name = instrument_name
+        self.secu_account = secu_account
+        self.commission = commission
+        self.offset_flag = offset_flag
+        self.direction = direction
 
 
 class OrderRef:

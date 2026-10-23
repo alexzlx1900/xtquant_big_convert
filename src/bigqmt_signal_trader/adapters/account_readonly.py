@@ -88,6 +88,18 @@ def _optional_number(row, names, field, unknown, integer=False):
         return None
 
 
+def _commission(row):
+    # 两种原生拼写可同时出现；优先非零有效值，缺失或无效仍为未知。
+    result = None
+    for name in ("m_dComssion", "m_dCommission", "commission"):
+        value = _optional_number(row, (name,), "commission", [])
+        if value:
+            return value
+        if value == 0:
+            result = value
+    return result
+
+
 def _convert_order(row, account_id, strategy_name):
     _account_matches(row, account_id)
     unknown = []
@@ -133,6 +145,11 @@ def _convert_order(row, account_id, strategy_name):
         traded_price=_optional_number(row, ("m_dTradedPrice", "traded_price", "avg_traded_price"), "traded_price", unknown),
         price_type=_optional_number(row, ("m_nOrderPriceType", "price_type"), "price_type", unknown, integer=True),
         op_type=op_type, order_type=order_type,
+        account_type=2,  # 本转换器的实际查询固定为 STOCK；不依赖原生 xtquant。
+        instrument_name=_text(row, ("m_strInstrumentName", "instrument_name")),
+        secu_account=_text(row, ("m_strShareholderID", "m_strSecuAccount", "secu_account")),
+        offset_flag=_optional_number(row, ("m_nOffsetFlag", "offset_flag"), "offset_flag", [], integer=True),
+        direction=_optional_number(row, ("m_nDirection", "direction"), "direction", [], integer=True),
     )
     return result, (result.stock_code, result.order_sys_id), unknown
 
@@ -159,6 +176,12 @@ def _convert_trade(row, account_id, strategy_name):
         traded_at=traded_at, user_order_id=_text(row, ("m_strRemark", "user_order_id", "remark")),
         amount=_optional_number(row, ("m_dTradeAmount", "amount"), "amount", unknown),
         strategy_name=native_strategy or strategy_name, traded_time=when,
+        account_type=2,
+        instrument_name=_text(row, ("m_strInstrumentName", "instrument_name")),
+        secu_account=_text(row, ("m_strShareholderID", "m_strSecuAccount", "secu_account")),
+        commission=_commission(row),
+        offset_flag=_optional_number(row, ("m_nOffsetFlag", "offset_flag"), "offset_flag", [], integer=True),
+        direction=_optional_number(row, ("m_nDirection", "direction"), "direction", [], integer=True),
     )
     return result, (result.stock_code, result.trade_id, str(trade_date or "")), unknown
 

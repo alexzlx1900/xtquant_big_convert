@@ -67,14 +67,14 @@ class Harness:
             symbols=[CODE] if symbols is None else symbols,
         )
         self.gateway, self.redis = gateway, MemoryRedis()
-        self.orders, self.submit_calls, self.cancel_calls = [], [], []
+        self.orders, self.trades, self.submit_calls, self.cancel_calls = [], [], [], []
         original_query = self.source.query
 
         def query(account, kind, detail, strategy_name=""):
             if detail == "ORDER":
                 return self.orders
             if detail == "DEAL":
-                return []
+                return self.trades
             return original_query(account, kind, detail, strategy_name)
 
         self.source.namespace.update(
@@ -202,6 +202,51 @@ class Harness:
         self.proxy.close()
         self.source.close()
         self.pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_new_fields_cross_generated_source_proxy_and_gateway_without_writes(monkeypatch, gateway_modules, live):
+    h = Harness(monkeypatch, gateway_modules, live=live)
+    common = dict(m_strAccountID=h.account, m_strOrderSysID="7620",
+                  m_strInstrumentID="000001", m_strExchangeID="SZ",
+                  m_strRemark=REMARK, m_strStrategyName="native-strategy",
+                  m_strInstrumentName="fixture-stock", m_strShareholderID="fixture-shareholder",
+                  m_nOffsetFlag=48, m_nDirection=48)
+    h.orders.append(SimpleNamespace(
+        **common, m_nOpType=23, m_nOrderStatus=50, m_nVolumeTotalOriginal=100,
+        m_nVolumeTraded=20, m_dLimitPrice=11.42, m_dTradedPrice=11.4,
+        m_nOrderPriceType=50, m_strInsertDate="20261016", m_strInsertTime="100000"))
+    h.trades.append(SimpleNamespace(
+        **common, m_strTradeID="fixture-trade", m_nVolume=20, m_dPrice=11.4,
+        m_dTradeAmount=228.0, m_strTradeDate="20261016", m_strTradeTime="100001",
+        m_dComssion=0.0, m_dCommission=1.36))
+
+    async def run():
+        try:
+            await h.start()
+            await h.operation(h.order.connect_execution_events())
+            client = h.order._get_shm_rpc_client()
+            orders = await h.operation(asyncio.to_thread(client.call, "query_orders", {}))
+            trades = await h.operation(asyncio.to_thread(client.call, "query_trades", {}))
+            for item in (orders[0], trades[0]):
+                assert item["account_type"] == 2
+                assert item["instrument_name"] == "fixture-stock"
+                assert item["secu_account"] == "fixture-shareholder"
+                assert item["strategy_name"] == "native-strategy"
+                assert item["offset_flag"] == 48 and item["direction"] == 48
+            assert orders[0]["op_type"] == 23 and orders[0]["order_type"] == 23
+            assert trades[0]["commission"] == 1.36 and trades[0]["amount"] == 228.0
+            asset = await h.operation(h.read.query_asset())
+            positions = await h.operation(h.read.query_positions_with_evidence())
+            assert asset["cash"] == 1000 and asset["source_evidence"]["complete"] is True
+            assert positions["positions"][0]["symbol"] == CODE
+            assert positions["source_evidence"]["complete"] is True
+            assert not h.submit_calls and not h.cancel_calls
+            assert not h.redis.hashes.get("aqp:redis_shm:write_ledger:%s:v1" % h.account)
+        finally:
+            await h.close()
+
+    asyncio.run(run())
 
 
 def test_formal_gateway_reads_native_evidence_then_submits_cancels_and_consumes_reports(monkeypatch, gateway_modules):

@@ -19,6 +19,7 @@ import uuid
 
 from .adapters.redis_common import decode_text
 from .code_utils import normalize_stock_code
+from .exec_events import order_identity_map
 from .logging_setup import get_logger
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
@@ -637,8 +638,23 @@ class BigQmtRpcHandlers:
             "allow_order_methods": bool(self.allow_order_methods),
             "rpc_revision": RPC_REVISION,
             "version": _deployed_version(),
+            "account_type": self._reported_account_type(),
             "server_time": _dt.datetime.now(),
         }
+
+    def _reported_account_type(self):
+        """What this deployment will actually trade as.
+
+        The client's StockAccount(..., "CREDIT") never reaches the server --
+        the type comes from BIGQMT_ACCOUNT_TYPE in the QMT-side config -- so a
+        caller declaring CREDIT against a STOCK deployment has no way to see
+        the mismatch. It shows up as an all-zero credit asset row instead
+        (issue #92). Empty when there is no gateway to ask.
+        """
+        gateway = self.order_gateway
+        if gateway is None:
+            return ""
+        return str(getattr(gateway, "account_type", "") or "").strip().upper()
 
     def _handle_get_deployment_info(self, params):
         """Where this bridge is running from, and which build it is.
@@ -790,6 +806,21 @@ class BigQmtRpcHandlers:
         manager.keepalive(client_id, sub_id)
         return {}
 
+    def _identity_redis(self):
+        """Redis for the order-identity store, or None.
+
+        Deliberately its own attribute rather than reusing the download-job
+        client. Only a redis TRANSPORT builds that one, so on a zmq deployment
+        it is None -- which silently meant orders were never remembered at
+        submit time and so could never be attributed on query (issue #133).
+        The strategy wires this one from the redis config whatever the
+        transport, and falls back to the download-job client for deployments
+        that predate it. Everything here treats None as "no attribution",
+        never as an error: naming an order is a nicety, the order is not.
+        """
+        return (getattr(self, "order_identity_redis_client", None)
+                or getattr(self, "download_job_redis_client", None))
+
     def _download_job_redis(self):
         redis_client = getattr(self, "download_job_redis_client", None)
         if redis_client is None:
@@ -923,12 +954,13 @@ class BigQmtRpcHandlers:
             str(params.get("strategy_name") or ""),
         )
         if _bool_value(params.get("cancelable_only"), False):
-            return [
+            orders = [
                 order
                 for order in orders
                 if str(getattr(order, "status", "") or "") in CANCELABLE_ORDER_STATUSES
             ]
-        return orders
+        return self._attribute_to_strategies(
+            self._request_account_id(params), orders)
 
     def _handle_query_trades(self, params):
         if self.order_gateway is None:
@@ -938,10 +970,45 @@ class BigQmtRpcHandlers:
         strategy_name = params.get("strategy_name")
         if strategy_name is None:
             strategy_name = ""
-        return self.order_gateway.query_trades(
-            self._request_account_id(params),
-            str(strategy_name),
+        account_id = self._request_account_id(params)
+        return self._attribute_to_strategies(
+            account_id,
+            self.order_gateway.query_trades(account_id, str(strategy_name)),
         )
+
+    def _attribute_to_strategies(self, account_id, snapshots):
+        """Put the strategy name back on rows QMT could not name (issue #133).
+
+        Neither the ORDER nor the DEAL rows get_trade_detail_data returns carry
+        m_strStrategyName -- checked by listing every attribute on a live
+        terminal. QMT filters by strategy but does not report it, which is why
+        this field read as "" for everything.
+
+        Orders this bridge submitted are remembered at submit time, keyed by
+        the user_order_id that rides out as the order remark, so those can be
+        named. Orders placed by hand in the terminal have no remark and stay
+        unnamed; there is nothing to recover for them.
+        """
+        rows = list(snapshots or [])
+        unnamed = [row for row in rows
+                   if not str(getattr(row, "strategy_name", "") or "").strip()]
+        if not unnamed:
+            return rows
+        redis_client = self._identity_redis()
+        if redis_client is None:
+            return rows
+        try:
+            identities = order_identity_map(
+                redis_client, account_id,
+                [getattr(row, "user_order_id", "") for row in unnamed])
+        except Exception:
+            return rows
+        for row in unnamed:
+            identity = identities.get(
+                str(getattr(row, "user_order_id", "") or "").strip())
+            if identity and identity.get("strategy_name"):
+                row.strategy_name = str(identity.get("strategy_name") or "")
+        return rows
 
     def _handle_query_execution_snapshot(self, params):
         if self.order_gateway is None:
@@ -953,12 +1020,15 @@ class BigQmtRpcHandlers:
         trade_name = params.get("trade_strategy_name")
         if trade_name is None:
             trade_name = ""
+        orders = self.order_gateway.query_orders(account_id, str(order_name))
+        trades = self.order_gateway.query_trades(account_id, str(trade_name))
+        self._attribute_to_strategies(account_id, list(orders or []) + list(trades or []))
         return {
             "account_id": account_id,
             "server_time": _dt.datetime.now(),
             "rpc_revision": RPC_REVISION,
-            "orders": self.order_gateway.query_orders(account_id, str(order_name)),
-            "trades": self.order_gateway.query_trades(account_id, str(trade_name)),
+            "orders": orders,
+            "trades": trades,
         }
 
     def _handle_sync_positions(self, params):
@@ -1334,7 +1404,7 @@ class BigQmtRpcHandlers:
             from .exec_events import remember_order_identity
 
             remember_order_identity(
-                getattr(self, "download_job_redis_client", None),
+                self._identity_redis(),
                 request.account_id,
                 request.remark,
                 strategy_name=request.strategy_name,

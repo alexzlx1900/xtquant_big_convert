@@ -354,6 +354,69 @@ def _as_list(value):
     return [value]
 
 
+def _account_type_name(value):
+    """The NAME of an account type, whatever form it arrives in.
+
+    StockAccount stores the numeric code, not the string it was constructed
+    with: StockAccount(id, "CREDIT").account_type is 3. Comparing that against
+    the server's "CREDIT" would report a mismatch on every credit account.
+    """
+    text = str("" if value is None else value).strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        code = int(text)
+        table = getattr(_xtconstant, "ACCOUNT_TYPE_DICT", None)
+        if isinstance(table, dict) and code in table:
+            return str(table[code]).strip().upper()
+        for attribute in dir(_xtconstant):
+            if attribute.endswith("_ACCOUNT") and getattr(_xtconstant, attribute) == code:
+                name = attribute[:-len("_ACCOUNT")]
+                return "STOCK" if name == "SECURITY" else name
+        return ""
+    return text.upper()
+
+
+def _account_type_code(value):
+    """The xtconstant NUMBER for an account type, whatever form it arrives in.
+
+    The mirror of _account_type_name. XtOrder / XtTrade / XtPosition all carry
+    account_type as an int (xttype sets it to SECURITY_ACCOUNT), so a name has
+    to come back as a number before it reaches a caller. 0 means "nothing to
+    go on" -- the caller decides what to fall back to.
+    """
+    text = str("" if value is None else value).strip()
+    if not text:
+        return 0
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        pass
+    upper = text.upper()
+    # NOT ACCOUNT_TYPE_DICT alone: the xtquant that wins inside Big QMT is the
+    # terminal's own bundled copy, which has 91 of this shim's 538 names and
+    # does not include that dict. A client can land on it too -- appending the
+    # QMT python directory to sys.path is a documented way to reach the config
+    # modules. Fall back to the individual *_ACCOUNT constants, which both
+    # copies have.
+    table = getattr(_xtconstant, "ACCOUNT_TYPE_DICT", None)
+    if isinstance(table, dict):
+        for code, name in table.items():
+            if str(name).strip().upper() == upper:
+                try:
+                    return int(code)
+                except (TypeError, ValueError):
+                    break
+    for attribute in ("%s_ACCOUNT" % upper,
+                      "SECURITY_ACCOUNT" if upper == "STOCK" else ""):
+        if not attribute:
+            continue
+        code = getattr(_xtconstant, attribute, None)
+        if isinstance(code, int) and not isinstance(code, bool):
+            return int(code)
+    return 0
+
+
 def _restore_jsonable(value):
     if isinstance(value, dict):
         marker = value.get("__bigqmt_type__")
@@ -2418,6 +2481,12 @@ class BigQmtXtTrader:
         self._async_order_lock = threading.Lock()
         # int -> 合同编号 for ids handed out as OrderId (issue #113).
         self._order_sys_ids = _OrderedDict()
+        # on_account_status used to report a hardcoded "STOCK" even for a
+        # credit deployment (issue #103). The server is authoritative -- the
+        # client's StockAccount(..., "CREDIT") never travels -- so prefer what
+        # ping reports, fall back to what the caller declared.
+        self._server_account_type = ""
+        self._declared_account_type = ""
 
     def _cached_position_snapshot(self, account_id):
         key = "bigqmt:positions:%s" % str(account_id or self.client.account_id or "")
@@ -2465,7 +2534,9 @@ class BigQmtXtTrader:
 
     def connect(self):
         if self.client.account_id:
-            mismatch = warn_on_version_mismatch(self.client.call("ping"))
+            pong = self.client.call("ping")
+            self._note_server_account_type(pong)
+            mismatch = warn_on_version_mismatch(pong)
             if mismatch and auto_sync_enabled():
                 self.sync_deployment()
         self._fire_account_status()
@@ -2508,6 +2579,10 @@ class BigQmtXtTrader:
         return result
 
     def subscribe(self, account):
+        declared = _account_type_name(getattr(account, "account_type", None))
+        if declared:
+            self._declared_account_type = declared
+            self._warn_on_account_type_mismatch()
         if not self.client.account_id:
             self.client.account_id = _account_id(account)
         # (Re)start the listener now that the account is known; the loop resubscribes
@@ -2533,6 +2608,35 @@ class BigQmtXtTrader:
         )
         self._event_thread.start()
 
+    def _note_server_account_type(self, pong):
+        """Remember what the deployment says it trades as."""
+        try:
+            reported = str((pong or {}).get("account_type") or "").strip().upper()
+        except Exception:
+            return
+        if reported:
+            self._server_account_type = reported
+            self._warn_on_account_type_mismatch()
+
+    def _warn_on_account_type_mismatch(self):
+        """Say so when the caller and the deployment disagree.
+
+        A client asking for CREDIT against a STOCK deployment gets an all-zero
+        asset row and no error at all -- that was issue #92, and it cost the
+        reporter a long time because nothing anywhere said the two disagreed.
+        """
+        server = self._server_account_type
+        declared = self._declared_account_type
+        if not server or not declared or server == declared:
+            return
+        log.warning(
+            "account_type mismatch: this client asked for %s but the QMT "
+            "deployment is configured as %s. The client's StockAccount type "
+            "does NOT travel to the server -- set BIGQMT_ACCOUNT_TYPE = %r in "
+            "the QMT-side local config and restart the strategy. Until then "
+            "queries answer as %s (a credit account read as STOCK returns an "
+            "all-zero asset row).", declared, server, declared, server)
+
     def _fire_account_status(self):
         """Fire on_account_status after connect/subscribe (MiniQMT parity).
 
@@ -2547,7 +2651,8 @@ class BigQmtXtTrader:
             callback.on_account_status(
                 CompatObject(
                     account_id=str(self.client.account_id or ""),
-                    account_type="STOCK",
+                    account_type=(self._server_account_type
+                                  or self._declared_account_type or "STOCK"),
                     status=1,  # ACCOUNT_STATUS_ONLINE (MiniQMT XtAccountStatus)
                 )
             )
@@ -2780,7 +2885,9 @@ class BigQmtXtTrader:
         if market_value is None:
             market_value = price * volume
         return CompatObject(
-            account_type=2,
+            # 以前硬编码 2（SECURITY_ACCOUNT），信用账户上就是错的 —— 和 #103
+            # 报的 on_account_status 同一类。现在跟服务端说的走。
+            account_type=self._account_type_value(item),
             account_id=account_id,
             stock_code=stock_code,
             stock_name=stock_name,
@@ -3005,6 +3112,7 @@ class BigQmtXtTrader:
             account_id=account_id,
         ) or []
         return [self._trade_from_dict(account_id, item) for item in _as_list(data)]
+
 
     def query_execution_snapshot(
         self,
@@ -3825,6 +3933,26 @@ class BigQmtXtTrader:
         # 语义：seq 为 -1 表示委托失败）。
         return -1
 
+    def _account_type_value(self, item=None):
+        """account_type for an XtOrder / XtTrade / XtPosition, as an int.
+
+        Server first (it is the one that knows what this deployment trades
+        as -- #103), then what the caller declared, then SECURITY_ACCOUNT so
+        the field is never absent. Positions used to hardcode 2 and orders and
+        trades did not carry it at all (#133).
+        """
+        code = _account_type_code((item or {}).get("account_type"))
+        if code:
+            return code
+        code = _account_type_code(self._server_account_type
+                                 or self._declared_account_type)
+        if code:
+            return code
+        try:
+            return int(getattr(_xtconstant, "SECURITY_ACCOUNT", 2))
+        except Exception:
+            return 2
+
     def _order_from_dict(self, account_id, item):
         action = item.get("action")
         order_type = _safe_int(item.get("order_type"), 0) or _action_to_order_type(action)
@@ -3854,6 +3982,14 @@ class BigQmtXtTrader:
             # MiniQMT XtOrder.status_msg —— 废单时柜台给的原因 (issue #60)。
             status_msg=str(item.get("status_msg") or ""),
             price_type=item.get("price_type"),
+            # xttype.XtOrder 契约里有、以前没发的字段 (issue #133)。旧部署不发
+            # 这些键，所以每个都要能在缺失时给出 MiniQMT 语义的默认值，而不是
+            # 让调用方撞 AttributeError —— 那正是这个 issue 报的现象。
+            account_type=self._account_type_value(item),
+            instrument_name=str(item.get("instrument_name") or ""),
+            secu_account=str(item.get("secu_account") or ""),
+            offset_flag=item.get("offset_flag"),
+            direction=item.get("direction"),
         )
 
     def _trade_from_dict(self, account_id, item):
@@ -3894,6 +4030,13 @@ class BigQmtXtTrader:
             trade_time_source=("broker" if broker_time else "callback_received_at" if received_time else "unknown"),
             strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("user_order_id") or item.get("remark") or ""),
+            # 同 _order_from_dict：xttype.XtTrade 契约里有而以前没发的 (issue #133)。
+            account_type=self._account_type_value(item),
+            instrument_name=str(item.get("instrument_name") or ""),
+            secu_account=str(item.get("secu_account") or ""),
+            commission=_safe_float(item.get("commission"), 0.0),
+            offset_flag=item.get("offset_flag"),
+            direction=item.get("direction"),
         )
 
 

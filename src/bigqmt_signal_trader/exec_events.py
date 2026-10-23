@@ -423,6 +423,75 @@ def remember_order_identity(redis_client, account_id, user_order_id, strategy_na
     return payload
 
 
+def order_identity_map(redis_client, account_id, user_order_ids, limit=500):
+    """user_order_id -> remembered identity, for a whole result set at once.
+
+    QMT does not put the strategy name on the rows get_trade_detail_data
+    returns -- neither ORDER nor DEAL rows have m_strStrategyName (verified by
+    listing every attribute on a live terminal: 120 and 47 of them
+    respectively, and it is in neither). It filters BY strategy internally, but
+    it will not tell you what the name was.
+
+    For orders this bridge submitted, it is remembered here at submit time
+    (remember_order_identity), keyed by the user_order_id that goes out as the
+    order remark. So a query can put it back. Orders placed by hand in the
+    terminal have no remark and stay unattributed -- there is nothing to
+    recover.
+
+    One mget rather than N gets: this runs on the main strategy thread, where
+    every round trip is charged to the whole bridge.
+    """
+    wanted = []
+    seen = set()
+    for user_order_id in user_order_ids:
+        text = str(user_order_id or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            wanted.append(text)
+        if len(wanted) >= limit:
+            break
+    if not wanted or redis_client is None:
+        return {}
+
+    keys = [order_identity_key(account_id, text) for text in wanted]
+    raws = None
+    mget = getattr(redis_client, "mget", None)
+    if mget is not None:
+        try:
+            raws = mget(keys)
+        except Exception:
+            # 归属只是查询补充；批量读取失败不放大成逐条网络重试。
+            return {}
+        if not isinstance(raws, (list, tuple)) or len(raws) != len(keys):
+            return {}
+    else:
+        raws = []
+        for key in keys:
+            try:
+                raws.append(redis_client.get(key))
+            except Exception:
+                break
+
+    found = {}
+    for text, raw in zip(wanted, raws):
+        if not raw:
+            continue
+        try:
+            identity = json.loads(
+                raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
+        except Exception:
+            continue
+        if not isinstance(identity, dict):
+            continue
+        if (str(identity.get("account_id") or "") != str(account_id or "")
+                or str(identity.get("user_order_id") or "") != text):
+            continue
+        if not isinstance(identity.get("strategy_name"), str):
+            continue
+        found[text] = identity
+    return found
+
+
 def enrich_order_identity(redis_client, account_id, event):
     if redis_client is None or not isinstance(event, dict):
         return event
