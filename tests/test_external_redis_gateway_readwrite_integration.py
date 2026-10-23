@@ -87,7 +87,8 @@ class Harness:
         self.source.start()
         self.source.namespace["account_callback"](
             self.source.context,
-            SimpleNamespace(m_strAccountID=self.account, m_strStatus="登录成功"),
+            SimpleNamespace(m_strAccountID=self.account, m_strStatus="登录成功", m_nBrokerType=2,
+                            m_strAccountKey="LIVE-STOCK-FIXTURE-ONLY"),
         )
         self.proxy = RedisShmReadOnlyProxy(
             RedisTransport(self.redis, account_id=self.account),

@@ -382,6 +382,26 @@ def test_redis_factory_failure_has_phase_and_redacted_message(monkeypatch):
     assert result["status"] == "FAILED" and result["resources_closed"]
 
 
+def test_recoverable_response_error_is_logged_and_first_cause_is_redacted(monkeypatch, capsys):
+    value, provider, clients, factory = persistent_resources("PERSISTENT_READONLY")
+    value["receive_policy"] = "QUEUE_ONLY"
+    stop = threading.Event()
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    provider.queues["bigqmt:rpc:queue:55013746"] = [json.dumps(PROXY_FIXTURES.request())]
+    def lost_reply(*args):
+        stop.set()
+        raise RUNNER.redis.exceptions.TimeoutError("private-secret response lost")
+    provider.setex = lost_reply
+    result = RUNNER.run_candidate(value, lambda target: provider, factory,
+                                  stop_event=stop, ready_observer=lambda proof: None)
+    assert result["status"] == "STOP_REQUESTED" and result["resources_closed"]
+    assert result["diagnostics"]["read_publish_failures"] == 1
+    assert result["diagnostics"]["first_error"]["error_message"] == "<redacted> response lost"
+    logged = capsys.readouterr().out
+    assert '"event": "PROXY_TRANSPORT_ERROR"' in logged and "private-secret" not in logged
+    assert [len(client.calls) for client in clients] == [1, 2]
+
+
 def test_confirmed_runner_seal_also_preserves_native_timeout_phase(monkeypatch):
     value, provider, clients, factory = persistent_resources("PERSISTENT_READONLY")
     monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)

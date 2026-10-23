@@ -198,6 +198,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         phase = "READY_OBSERVER"
         (ready_observer or _emit_ready)(evidence)
         stop_requested = False
+        reported_error_at = None
         while not proxy.stopped:
             if stop_event is not None and stop_event.is_set():
                 stop_requested = True
@@ -211,6 +212,12 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                     break
             phase = "RECEIVE_LOOP"
             response = proxy.poll_once()
+            diagnostic = proxy.diagnostic_snapshot()
+            latest = diagnostic["last_error"]
+            if latest and latest["error_at_unix"] != reported_error_at:
+                reported_error_at = latest["error_at_unix"]
+                print(json.dumps({"event": "PROXY_TRANSPORT_ERROR", **latest,
+                    "error_message": _safe_message(latest["error_message"], config["redis"])}), flush=True)
             if response is None:
                 time.sleep(min(0.02, remaining) if bounded else 0.02)
             else:
@@ -234,8 +241,9 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
     finally:
         if proxy is not None:
             diagnostics = proxy.diagnostic_snapshot()
-            if diagnostics["last_error"]:
-                diagnostics["last_error"]["error_message"] = _safe_message(diagnostics["last_error"]["error_message"], config["redis"])
+            for name in ("first_error", "last_error"):
+                if diagnostics[name]:
+                    diagnostics[name]["error_message"] = _safe_message(diagnostics[name]["error_message"], config["redis"])
             result["diagnostics"] = diagnostics
             if proxy.verified:
                 snapshot = proxy.identity_snapshot()

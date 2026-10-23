@@ -14,6 +14,8 @@ import threading
 import time
 import uuid
 
+from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
+
 from .adapters.redis_common import decode_text
 from .redis_rpc import decode_rpc_request_payload
 from .transports.readonly_shm import ShmProtocolError
@@ -27,6 +29,7 @@ EXECUTION_METHODS = frozenset((
     "query_execution_snapshot", "get_trade_login_state", "poll_execution_events",
 ))
 QUOTE_METHODS = frozenset(("get_ticks", "get_full_tick"))
+PURE_READ_METHODS = EXECUTION_METHODS | QUOTE_METHODS | frozenset(("get_local_data", "get_market_data_ex"))
 RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 WRITE_POLICIES = frozenset(("PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 RECEIVE_POLICIES = frozenset(("QUEUE_AND_PUBSUB", "QUEUE_ONLY"))
@@ -161,6 +164,9 @@ class RedisShmReadOnlyProxy:
         self._operation_phase = "INITIALIZED"
         self._request_context = {}
         self._last_error = {}
+        self._first_error = {}
+        self._read_publish_failures = 0
+        self._redis_retry_at = 0.0
         self._idle_receive_timeouts = 0
         self._consecutive_idle_timeouts = 0
 
@@ -168,10 +174,13 @@ class RedisShmReadOnlyProxy:
         self._last_error = dict(error_phase=self._operation_phase,
             error_type=type(exc).__name__, error_message=str(exc)[:2048],
             error_at_unix=time.time(), **self._request_context)
+        if not self._first_error:
+            self._first_error = copy.deepcopy(self._last_error)
 
     def diagnostic_snapshot(self):
         """有界运行证据，不包含请求参数、Redis凭据或任何重发入口。"""
         return dict(operation_phase=self._operation_phase, last_error=copy.deepcopy(self._last_error),
+                    first_error=copy.deepcopy(self._first_error), read_publish_failures=self._read_publish_failures,
                     idle_receive_timeouts=self._idle_receive_timeouts,
                     consecutive_idle_timeouts=self._consecutive_idle_timeouts)
 
@@ -1052,6 +1061,14 @@ class RedisShmReadOnlyProxy:
                     write_settlement = self._settle_write(request, write_settlement, response, "CONFIRMED")
             except Exception as exc:
                 self._record_error(exc)
+                if (not self.stopped and self.receive_policy == "QUEUE_ONLY"
+                        and self.runtime_policy != "BOUNDED" and request["method"] in PURE_READ_METHODS
+                        and isinstance(exc, (RedisConnectionError, RedisTimeoutError))):
+                    # 原生结果已确认。仅保留此次响应与失败证据，不重发 fanout 或原生请求。
+                    # 调用方仍按原截止失败；后续独立读取可以继续，事件游标由调用方确认后推进。
+                    self._read_publish_failures += 1
+                    self._redis_retry_at = time.monotonic() + 1.0
+                    return response
                 # 一次 fanout 的部分写入也可能已对外可见，只封闭并留本地缓存。
                 self._seal("REDIS_RESPONSE_PUBLISH_FAILED")
                 if write_settlement is not None:
@@ -1071,13 +1088,15 @@ class RedisShmReadOnlyProxy:
         return None if prior is None else copy.deepcopy(prior[1])
 
     def poll_once(self):
-        """空队列只读检查；仅未消费业务的LLEN超时可有限重检，其余失败封闭。"""
+        """空队列检查可恢复；破坏性接收或原生结果未确认仍封闭。"""
         if not self._poll_lock.acquire(False):
             raise ShmProtocolError("proxy already has an in-flight poll")
         try:
             self._ensure_open()
             if not self._verified:
                 raise ShmProtocolError("explicit identity handshake required")
+            if time.monotonic() < self._redis_retry_at:
+                return None
             if self.runtime_policy == "BOUNDED" and self._processed_count >= self.max_requests:
                 self._seal("SESSION_CAPACITY_EXHAUSTED")
                 return None
@@ -1099,6 +1118,13 @@ class RedisShmReadOnlyProxy:
                 try:
                     length = self.transport.listen_redis.llen(self.transport.request_queue)
                 except Exception as exc:
+                    if (self.receive_policy == "QUEUE_ONLY" and self.runtime_policy != "BOUNDED"
+                            and isinstance(exc, (RedisConnectionError, RedisTimeoutError))):
+                        self._record_error(exc)
+                        self._idle_receive_timeouts += 1
+                        self._consecutive_idle_timeouts += 1
+                        self._redis_retry_at = time.monotonic() + 1.0
+                        return None
                     if not _is_redis_timeout(exc):
                         raise
                     self._record_error(exc)
