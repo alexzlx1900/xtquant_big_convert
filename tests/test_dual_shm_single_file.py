@@ -103,6 +103,75 @@ def settings(**overrides):
     return dict(values, **overrides)
 
 
+@pytest.mark.parametrize("actual,expected", [
+    (r"C:\QMT\bin.x64\XtItClient.exe", True),
+    (r"C:\QMT-SIM\bin.x64\XtItClient.exe", False),
+])
+def test_resident_identity_verifies_executable_and_publishes_actual_pid(monkeypatch, capsys, actual, expected):
+    h = Fixture(monkeypatch, native_pid=0, native_executable=r"C:\QMT\bin.x64\XtItClient.exe",
+        source_identity_path=r"C:\QMT\source.json",
+        account_id="8882152350", environment="LIVE", persistent_live_read_write=True,
+        max_seconds=0, max_requests=0, hard_deadline_unix=None)
+
+    def module_path(module, buffer, size):
+        buffer.value = actual
+        return len(actual)
+
+    monkeypatch.setattr(ctypes.windll.kernel32, "GetModuleFileNameW", module_path, raising=False)
+    opened = mock.mock_open()
+    h.namespace["open"] = opened
+    monkeypatch.setattr(os, "replace", mock.Mock())
+    if not expected:
+        with pytest.raises(RuntimeError, match="native executable mismatch"):
+            h.start()
+        assert h.context.accounts == []
+        return
+    h.start()
+    ready = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("AQP_DUAL_SHM_READY "))
+    identity = json.loads(ready.split(" ", 1)[1])
+    assert identity["native_pid"] == os.getpid()
+    assert identity["read_name"].startswith(h.settings["read_name"] + "_")
+    assert identity["execution_name"].startswith(h.settings["execution_name"] + "_")
+    published = json.loads("".join(call.args[0] for call in opened().write.call_args_list))
+    assert published == dict(identity, status="READY")
+    os.replace.assert_called_once_with(r"C:\QMT\source.json.new", r"C:\QMT\source.json")
+    h.close()
+
+
+@pytest.mark.parametrize("overrides", [
+    dict(native_pid=0), dict(native_pid=0, native_executable="XtItClient.exe"),
+    dict(native_pid=0, native_executable=r"C:\QMT\python.exe"),
+    dict(native_executable=r"C:\QMT\XtItClient.exe"),
+])
+def test_resident_mode_never_implicitly_weakens_pid_binding(overrides):
+    with pytest.raises(ValueError):
+        BUILDER.build_source(**settings(**overrides))
+
+
+def test_resident_model_launches_only_explicit_runtime_after_verified_sources(monkeypatch):
+    launcher = dict(python=r"C:\Python\python.exe", script=r"C:\AQP\supervise_qmt_runtime.py", config=r"C:\AQP\runtime.json")
+    h = Fixture(monkeypatch, native_pid=0, native_executable=r"C:\QMT\XtItClient.exe",
+        source_identity_path=r"C:\AQP\source.json", runtime_launcher=launcher,
+        account_id="8882152350", environment="LIVE", persistent_live_read_write=True,
+        max_seconds=0, max_requests=0, hard_deadline_unix=None)
+
+    def module_path(module, buffer, size):
+        buffer.value = r"C:\QMT\XtItClient.exe"
+        return len(buffer.value)
+
+    monkeypatch.setattr(ctypes.windll.kernel32, "GetModuleFileNameW", module_path, raising=False)
+    h.namespace["open"] = mock.mock_open()
+    monkeypatch.setattr(os, "replace", mock.Mock())
+    launched = mock.Mock()
+    monkeypatch.setattr(subprocess, "Popen", launched)
+    h.start()
+    assert all(runtime["_SERVER"] is not None for runtime in h.namespace["_RUNTIMES"].values())
+    launched.assert_called_once_with([launcher["python"], launcher["script"], "--config", launcher["config"]],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        close_fds=False, creationflags=0x208)
+    h.close()
+
+
 class Fixture:
     def __init__(self, monkeypatch, **overrides):
         self.settings = settings(**overrides)

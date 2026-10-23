@@ -6,6 +6,7 @@ import ast
 import base64
 import importlib.util
 import math
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -44,7 +45,8 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
                  execution_name, symbols, account_id=ACCOUNT, max_seconds=900,
                  max_requests=1000, enable_market_rpc=False, persistent_readonly=False,
                  persistent_simulation_read_write=False, environment="SIM", persistent_live_read_write=False,
-                 live_account_query_login=False):
+                 live_account_query_login=False, native_executable=None, runtime_launcher=None,
+                 source_identity_path=None):
     if environment not in ("SIM", "LIVE"):
         raise ValueError("explicit SIM/LIVE environment required")
     if type(live_account_query_login) is not bool or (live_account_query_login and environment != "LIVE"):
@@ -58,7 +60,26 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         raise ValueError("persistent LIVE policy requires LIVE environment")
     elif account_id != ACCOUNT:
         raise ValueError("this candidate is limited to simulation account 55013746")
-    if type(native_pid) is not int or native_pid <= 0 or type(windows_session) is not int or windows_session < 0:
+    resident_identity = native_pid == 0 and type(native_pid) is int
+    if resident_identity:
+        if (environment != "LIVE" or persistent_live_read_write is not True
+                or not isinstance(native_executable, str) or not ntpath.isabs(native_executable)
+                or ntpath.basename(native_executable).lower() != "xtitclient.exe"
+                or ntpath.normpath(native_executable) != native_executable):
+            raise ValueError("resident identity requires explicit LIVE QMT executable absolute path")
+    elif native_executable is not None:
+        raise ValueError("native executable binding requires explicit native_pid=0 resident mode")
+    if resident_identity and (not isinstance(source_identity_path, str) or not ntpath.isabs(source_identity_path)):
+        raise ValueError("resident identity requires explicit absolute source identity path")
+    if not resident_identity and source_identity_path is not None:
+        raise ValueError("source identity publication requires resident mode")
+    if runtime_launcher is not None:
+        if (not resident_identity or not isinstance(runtime_launcher, dict)
+                or set(runtime_launcher) != {"python", "script", "config"}
+                or any(not isinstance(v, str) or not ntpath.isabs(v) for v in runtime_launcher.values())
+                or ntpath.basename(runtime_launcher["script"]) != "supervise_qmt_runtime.py"):
+            raise ValueError("resident runtime launcher requires three explicit absolute paths")
+    if type(native_pid) is not int or native_pid < 0 or type(windows_session) is not int or windows_session < 0:
         raise ValueError("explicit native PID and Windows session required")
     if (type(persistent_readonly) is not bool or type(persistent_simulation_read_write) is not bool
             or type(persistent_live_read_write) is not bool):
@@ -86,6 +107,8 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         raise ValueError("independent readonly mailbox name required")
     if not isinstance(execution_name, str) or not re.fullmatch(r"Local\\AQP_SHM_TRADE_[A-Za-z0-9_-]{1,58}", execution_name):
         raise ValueError("independent execution mailbox name required")
+    if resident_identity and max(len(read_name), len(execution_name)) + 17 > len("Local\\AQP_SHM_") + 64:
+        raise ValueError("resident mailbox base requires room for independent instance suffix")
     symbol_limit = 128 if environment == "LIVE" else 64
     if not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= symbol_limit or any(not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", code) for code in symbols) or len(set(symbols)) != len(symbols):
         raise ValueError("1-%d unique confirmed SH/SZ/BJ symbols required" % symbol_limit)
@@ -120,7 +143,9 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         hard_deadline_unix=None if persistent else float(hard_deadline_unix), max_seconds=max_seconds,
         max_requests_per_source=max_requests, market_rpc_enabled=enable_market_rpc,
         persistent_readonly=persistent_readonly, persistent_simulation_read_write=persistent_simulation_read_write,
-        persistent_live_read_write=persistent_live_read_write, live_account_query_login=live_account_query_login)
+        persistent_live_read_write=persistent_live_read_write, live_account_query_login=live_account_query_login,
+        native_executable=native_executable, runtime_launcher=runtime_launcher,
+        source_identity_path=source_identity_path)
     output = TEMPLATE.replace("__DUAL_SETTINGS__", repr(settings)).replace("__DUAL_PAYLOADS__", repr(payloads))
     output = output.encode("ascii", "backslashreplace").decode("ascii")
     ast.parse(output, feature_version=(3, 6))
@@ -132,8 +157,11 @@ TEMPLATE = '''#coding:gbk
 import base64
 import ctypes
 import json
+import ntpath
 import os
+import subprocess
 import time
+import uuid
 
 DUAL_SHM_SETTINGS = __DUAL_SETTINGS__
 _SOURCE_PAYLOADS = __DUAL_PAYLOADS__
@@ -143,6 +171,7 @@ _CLOSED = False
 _STARTED_AT = None
 _STARTED_AT_UNIX = None
 _SOURCE_DEADLINE = None
+_BOUND_NATIVE_PID = None
 _READ_CAPABILITIES = ["ping", "get_asset", "get_positions", "get_full_tick", "get_ticks", "query_orders", "query_trades"]
 
 for _key in ("read", "execution"):
@@ -152,20 +181,34 @@ for _key in ("read", "execution"):
 
 
 def _verify_identity():
-    if os.getpid() != DUAL_SHM_SETTINGS["native_pid"]:
+    configured = DUAL_SHM_SETTINGS["native_pid"]
+    if configured == 0:
+        path = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetModuleFileNameW(None, path, len(path))
+        expected = DUAL_SHM_SETTINGS["native_executable"]
+        if (not length or length >= len(path) or not expected
+                or ntpath.normcase(path.value) != ntpath.normcase(expected)):
+            raise RuntimeError("native executable mismatch")
+    elif os.getpid() != configured:
         raise RuntimeError("native PID mismatch")
     session = ctypes.c_uint()
     if not ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)) or session.value != DUAL_SHM_SETTINGS["windows_session"]:
         raise RuntimeError("Windows session mismatch")
+    return os.getpid()
 
 
 def init(ContextInfo):
-    global _INIT_ATTEMPTED, _STARTED_AT, _STARTED_AT_UNIX, _SOURCE_DEADLINE
+    global _INIT_ATTEMPTED, _STARTED_AT, _STARTED_AT_UNIX, _SOURCE_DEADLINE, _BOUND_NATIVE_PID
     if _INIT_ATTEMPTED or _CLOSED:
         raise RuntimeError("init may only be attempted once; build a fresh source")
     _INIT_ATTEMPTED = True
     try:
-        _verify_identity()
+        _BOUND_NATIVE_PID = _verify_identity()
+        if DUAL_SHM_SETTINGS["native_pid"] == 0:
+            # 新实例使用独立邮箱；旧消费者即使尚未退出，也不能阻止新来源初始化或覆盖旧请求。
+            suffix = "_" + uuid.uuid4().hex[:16]
+            for key, field in (("read", "READONLY_SHM_NAME"), ("execution", "SHM_RPC_NAME")):
+                _RUNTIMES[key][field] = _RUNTIMES[key][field] + suffix
         _STARTED_AT = time.monotonic()
         _STARTED_AT_UNIX = time.time()
         live_write = DUAL_SHM_SETTINGS["persistent_live_read_write"]
@@ -226,7 +269,7 @@ def init(ContextInfo):
             _RUNTIMES[key]["init"](ContextInfo)
         read_server = _RUNTIMES["read"]["_SERVER"]
         execution_server = execution["_SERVER"]
-        if read_server.mailbox.server_pid != DUAL_SHM_SETTINGS["native_pid"] or execution_server.bridge.mailbox.server_pid != DUAL_SHM_SETTINGS["native_pid"] or read_server.mailbox.session_id == execution_server.bridge.mailbox.session_id:
+        if read_server.mailbox.server_pid != _BOUND_NATIVE_PID or execution_server.bridge.mailbox.server_pid != _BOUND_NATIVE_PID or read_server.mailbox.session_id == execution_server.bridge.mailbox.session_id:
             raise RuntimeError("dual source PID/session identity mismatch")
         if (read_server.windows_session_id != DUAL_SHM_SETTINGS["windows_session"]
                 or execution_server.bridge.runtime_metadata["windows_session_id"] != DUAL_SHM_SETTINGS["windows_session"]):
@@ -238,8 +281,8 @@ def init(ContextInfo):
                 read_capabilities += ["download_history_data"]
         rpc_transport = execution["_load_embedded"]("bigqmt_signal_trader.transports.shm_rpc")
         execution_capabilities = sorted(rpc_transport.READ_METHODS | (rpc_transport.WRITE_METHODS if read_write else frozenset()))
-        print("AQP_DUAL_SHM_READY " + json.dumps(dict(
-            account_id=DUAL_SHM_SETTINGS["account_id"], environment=environment, native_pid=DUAL_SHM_SETTINGS["native_pid"],
+        identity = dict(
+            account_id=DUAL_SHM_SETTINGS["account_id"], environment=environment, native_pid=_BOUND_NATIVE_PID,
             windows_session=DUAL_SHM_SETTINGS["windows_session"],
             read_name=_RUNTIMES["read"]["READONLY_SHM_NAME"], execution_name=execution["SHM_RPC_NAME"],
             read_session_id=read_server.mailbox.session_id, execution_session_id=execution_server.bridge.mailbox.session_id,
@@ -249,7 +292,20 @@ def init(ContextInfo):
             account_callback_route="outer_to_execution", execution_bind_account_callbacks=False,
             max_seconds=DUAL_SHM_SETTINGS["max_seconds"], max_requests_per_source=DUAL_SHM_SETTINGS["max_requests_per_source"],
             market_rpc_enabled=read_server.market_enabled, read_capabilities=read_capabilities,
-            execution_capabilities=execution_capabilities), sort_keys=True))
+            execution_capabilities=execution_capabilities)
+        identity_path = DUAL_SHM_SETTINGS["source_identity_path"]
+        if identity_path is not None:
+            temporary = identity_path + ".new"
+            with open(temporary, "w") as stream:
+                json.dump(dict(identity, status="READY"), stream, sort_keys=True)
+            os.replace(temporary, identity_path)
+        print("AQP_DUAL_SHM_READY " + json.dumps(identity, sort_keys=True))
+        launcher = DUAL_SHM_SETTINGS["runtime_launcher"]
+        if launcher is not None:
+            subprocess.Popen([launcher["python"], launcher["script"], "--config", launcher["config"]],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                # QMT内置Python3.6在Windows重定向标准句柄时不支持close_fds=True。
+                close_fds=False, creationflags=0x00000200 | 0x00000008)
         return None
     except BaseException:
         stop(ContextInfo)
@@ -324,6 +380,8 @@ def main():
     parser.add_argument("--account-id", default=ACCOUNT)
     parser.add_argument("--environment", choices=("SIM", "LIVE"), default="SIM")
     parser.add_argument("--native-pid", type=int, required=True)
+    parser.add_argument("--native-executable", help="native-pid=0 时固定实际QMT可执行文件，允许重启后重新核验PID")
+    parser.add_argument("--source-identity-path", help="常驻来源原子发布实际PID、邮箱及双SID的绝对路径")
     parser.add_argument("--windows-session", type=int, required=True)
     parser.add_argument("--hard-deadline-unix", type=float)
     parser.add_argument("--read-name", required=True)
@@ -342,7 +400,8 @@ def main():
         max_seconds=args.max_seconds, max_requests=args.max_requests, enable_market_rpc=args.enable_market_rpc,
         persistent_readonly=args.persistent_readonly,
         persistent_simulation_read_write=args.persistent_simulation_read_write,
-        environment=args.environment, persistent_live_read_write=args.persistent_live_read_write)
+        environment=args.environment, persistent_live_read_write=args.persistent_live_read_write,
+        native_executable=args.native_executable, source_identity_path=args.source_identity_path)
     descriptor = os.open(str(args.output), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
         stream.write(source)
