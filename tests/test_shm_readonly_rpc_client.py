@@ -121,6 +121,19 @@ class RpcWireTest(FIXTURE.BridgeFixture):
         assert caught.value.source_evidence["status"] == "PARTIAL"
         assert caught.value.source_evidence["complete"] is False
 
+    def test_zero_total_conflict_reaches_rpc_client_without_reconstruction_or_retry(self):
+        self.query.return_value = [FIXTURE.account_row(
+            m_dBalance=0, m_dAvailable=772.5, m_dFrozenCash=0, m_dInstrumentValue=1422341.90)]
+        with pytest.raises(ShmReadOnlyRpcError) as caught:
+            self.rpc_roundtrip(self.make_rpc(), "get_asset")
+        error = caught.value
+        assert error.server_error == "ACCOUNT_TOTAL_ASSET_ZERO_CONFLICT"
+        assert error.data["asset"]["total_asset"] == 0
+        assert error.source_evidence["complete"] is False
+        assert error.source_evidence["reconciliation"]["status"] == "MISMATCH"
+        self.query.assert_called_once_with(FIXTURE.ACCOUNT, "STOCK", "ACCOUNT")
+        assert self.bridge.request_count == 1
+
     def test_timeout_does_not_reopen_or_resubmit(self):
         client = self.make_rpc()
         with pytest.raises(ShmTimeoutError):

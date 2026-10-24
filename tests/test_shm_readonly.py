@@ -855,6 +855,34 @@ class AccountReadTest(BridgeFixture):
         self.assertEqual(response["data"]["asset"]["market_value"], 0.0)
         self.assertEqual(response["data"]["source_evidence"]["reconciliation"]["status"], "MATCH")
 
+    def test_zero_total_with_nonzero_components_is_not_complete_or_reconstructed(self):
+        cases = [
+            dict(m_dAvailable=772.5, m_dFrozenCash=0, m_dInstrumentValue=1422341.90),
+            dict(m_dAvailable=1, m_dFrozenCash=0, m_dInstrumentValue=0),
+            dict(m_dAvailable=0, m_dFrozenCash=1, m_dInstrumentValue=0),
+            dict(m_dAvailable=0, m_dFrozenCash=0, m_dInstrumentValue=1),
+        ]
+        for fields in cases:
+            with self.subTest(fields=fields):
+                self.query.return_value = [account_row(m_dBalance=0, m_dAsset=1423114.4, **fields)]
+                response = self.process("get_asset")
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["server_error"], "ACCOUNT_TOTAL_ASSET_ZERO_CONFLICT")
+                self.assertEqual(response["data"]["asset"]["total_asset"], 0)
+                evidence = response["data"]["source_evidence"]
+                self.assertFalse(evidence["complete"])
+                self.assertEqual(evidence["status"], "PARTIAL")
+                self.assertEqual(evidence["field_sources"]["total_asset"], "m_dBalance")
+                self.assertEqual(evidence["reconciliation"]["status"], "MISMATCH")
+
+    def test_zero_total_with_only_rounding_difference_stays_valid(self):
+        self.query.return_value = [account_row(m_dBalance=0, m_dAvailable=0.01,
+                                               m_dFrozenCash=0, m_dInstrumentValue=0)]
+        response = self.process("get_asset")
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["data"]["source_evidence"]["complete"])
+        self.assertEqual(response["data"]["source_evidence"]["reconciliation"]["status"], "MATCH")
+
     def test_empty_or_multiple_asset_rows_do_not_select_an_arbitrary_row(self):
         for rows, code in (([], "ACCOUNT_ROWS_UNAVAILABLE"), ([account_row(), account_row()], "ACCOUNT_ROWS_AMBIGUOUS")):
             with self.subTest(code=code):

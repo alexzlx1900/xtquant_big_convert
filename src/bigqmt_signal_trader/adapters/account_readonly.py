@@ -255,6 +255,10 @@ class ReadOnlyAccountProvider:
                 "status": "MATCH" if abs(delta) <= 0.02 else "MISMATCH",
                 "total_minus_components": delta, "tolerance": 0.02,
             }
+            # 保留原生原值，但零总资产与非零分项冲突时不能作为完整资产。
+            if values["total_asset"] == 0 and delta < -0.02:
+                evidence.update(complete=False, status="PARTIAL",
+                                error_code="ACCOUNT_TOTAL_ASSET_ZERO_CONFLICT")
         else:
             evidence["reconciliation"] = {"status": "UNKNOWN", "total_minus_components": None, "tolerance": 0.02}
         return result
