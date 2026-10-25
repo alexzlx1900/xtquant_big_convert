@@ -92,9 +92,9 @@ class ShmReadOnlyRpcClient:
                 or any(not isinstance(value, str) or len(value) != 14
                        or not all("0" <= char <= "9" for char in value) or not value.startswith(day)
                        for value in (start, end)) or start >= end
-                or not isinstance(symbols, list) or not 1 <= len(symbols) <= 64):
-            raise ShmProtocolError("scoped capture requires bounded identity, same-day ordered times and 1-64 symbols")
-        ShmReadOnlyRpcClient._quote_params({"codes": symbols})
+                or not isinstance(symbols, list) or not 1 <= len(symbols) <= 128):
+            raise ShmProtocolError("scoped capture requires bounded identity, same-day ordered times and 1-128 symbols")
+        ShmReadOnlyRpcClient._quote_params({"codes": symbols}, max_symbols=128)
         if code not in symbols:
             raise ShmProtocolError("subscribed code must belong to the complete capture contract")
         try:

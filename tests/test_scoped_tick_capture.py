@@ -97,14 +97,14 @@ def source(monkeypatch):
 
 
 @pytest.mark.parametrize("contract,code", [
-    (capture(symbols=["%06d.SZ" % number for number in range(65)]), "000000.SZ"),
+    (capture(symbols=["%06d.SZ" % number for number in range(129)]), "000000.SZ"),
     (capture(symbols=[A, A]), A), (capture(symbols=[A, "999999.BJ"]), A),
     (capture(trade_date="20260230"), A), (capture(end_time="20261022135800"), A),
     (capture(end_time="20261022135900"), A),
     (capture(start_time="20261021135900"), A), (capture(), "999999.BJ"),
 ])
 def test_entire_scoped_contract_is_rejected_before_the_first_native_subscription(source, contract, code):
-    value = source(codes=sorted({A, B} | {"%06d.SZ" % number for number in range(65)}))
+    value = source(codes=sorted({A, B} | {"%06d.SZ" % number for number in range(129)}))
     response = value.subscribe(code, contract)
     assert response["ok"] is False
     assert value.native_subscribes == [] and value.native_cancels == []
@@ -113,7 +113,7 @@ def test_entire_scoped_contract_is_rejected_before_the_first_native_subscription
 def test_exact_capture_and_code_are_idempotent_and_conflicts_do_not_replace_handles(source):
     value = source()
     ping = value.call("read", "ping")["data"]
-    assert ping["quote_subscription_contract"] == CONTRACT and ping["quote_subscription_limit"] == 64
+    assert ping["quote_subscription_contract"] == CONTRACT and ping["quote_subscription_limit"] == 128
     first = value.subscribe(A, capture())["data"]
     second = value.subscribe(B, capture())["data"]
     assert first["subscription_id"] != second["subscription_id"]
@@ -132,11 +132,24 @@ def test_legacy_subscription_cannot_be_joined_by_a_scoped_capture(source):
     assert len(value.native_subscribes) == 1 and value.native_cancels == []
 
 
-def test_the_64_symbol_scoped_limit_is_inclusive_and_simulation_does_not_gain_scoped_live_permission(source):
-    codes = ["%06d.SZ" % number for number in range(300000, 300064)]
+@pytest.mark.parametrize("count", [82, 128])
+def test_complete_live_scope_is_simultaneously_active_and_simulation_does_not_gain_permission(source, count):
+    codes = ["%06d.SZ" % number for number in range(300000, 300000 + count)]
     live = source(codes)
-    assert live.subscribe(codes[0], capture(symbols=codes))["ok"] is True
-    assert len(live.native_subscribes) == 1
+    contract = capture(symbols=codes)
+    owners = {code: live.subscribe(code, contract)["data"]["subscription_id"] for code in codes}
+    assert len(set(owners.values())) == len(live.native_subscribes) == count
+    for code, sid in owners.items():
+        live.callbacks[code]({code: tick()})
+        polled = live.poll(sid)["data"]
+        assert polled["active"] is True and polled["active_subscription_count"] == count
+        assert polled["capture"] == contract and polled["code"] == code
+        assert polled["events"][0]["subscription_id"] == sid
+        assert polled["events"][0]["sequence"] == 1
+    for sid in owners.values():
+        assert live.cancel(sid)["ok"] is True
+        assert live.poll(sid)["data"]["active"] is False
+    assert len(live.native_cancels) == count
     simulation = source(live=False)
     assert simulation.subscribe(A, capture())["ok"] is False
     assert simulation.native_subscribes == []
@@ -248,9 +261,20 @@ def test_client_validator_accepts_the_new_scoped_shape_without_changing_legacy_h
         ShmReadOnlyRpcClient._quote_params({"codes": ["%06d.SZ" % number for number in range(65)]})
 
 
+@pytest.mark.parametrize("count", [82, 128, 129])
+def test_client_enforces_the_complete_capture_symbol_boundary(count):
+    codes = ["%06d.SZ" % number for number in range(300000, 300000 + count)]
+    original = capture(symbols=codes)
+    if count == 129:
+        with pytest.raises(ShmProtocolError):
+            ShmReadOnlyRpcClient._capture_params(original, codes[0])
+    else:
+        assert ShmReadOnlyRpcClient._capture_params(original, codes[0]) == original
+
+
 @pytest.mark.parametrize("bad", [capture(symbols=[A, A]), capture(capture_id=" "), capture(trade_date="20260230"),
     capture(start_time="20261021135900"), capture(end_time="20261022135900"),
-    capture(symbols=["%06d.SZ" % number for number in range(65)])])
+    capture(symbols=["%06d.SZ" % number for number in range(129)])])
 def test_client_capture_validation_rejects_invalid_contracts(bad):
     with pytest.raises(ShmProtocolError):
         ShmReadOnlyRpcClient._capture_params(bad, A)
