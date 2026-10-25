@@ -141,10 +141,13 @@ class BridgeFixture(unittest.TestCase):
         self.counter = 0
 
     def tearDown(self):
-        for client in self.clients:
-            client.close()
-        self.bridge.close()
-        self.redirect.__exit__(None, None, None)
+        try:
+            for client in self.clients:
+                client.close()
+            if self.bridge is not None:
+                self.bridge.close()
+        finally:
+            self.redirect.__exit__(None, None, None)
 
     def envelope(self, method="ping", **overrides):
         self.counter += 1
@@ -1187,6 +1190,10 @@ class MarketRpcTest(BridgeFixture):
         self.assertIn("CLEANUP_FAILED", self.output.getvalue())
         self.callback(self.tick())
         self.assertEqual(self.bridge.event_sequence, 0)
+        with self.assertRaisesRegex(ValueError, "native unsubscribe"):
+            self.bridge.close("reload")
+        self.context.unsubscribe_quote.assert_called_once_with(27)
+        self.bridge = None  # 已验证并处理的清理失败，不由通用tearDown再次触发。
 
     def test_dataframe_axes_and_sparse_dict_fields_preserved(self):
         self.context.get_local_data.return_value = SimpleNamespace(

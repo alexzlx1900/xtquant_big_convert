@@ -80,13 +80,39 @@ class ShmReadOnlyRpcClient:
         return result
 
     @staticmethod
+    def _capture_params(capture, code):
+        if (not isinstance(capture, dict)
+                or set(capture) != {"capture_id", "trade_date", "start_time", "end_time", "symbols"}):
+            raise ShmProtocolError("explicit complete scoped capture contract required")
+        identity, day = capture["capture_id"], capture["trade_date"]
+        start, end, symbols = capture["start_time"], capture["end_time"], capture["symbols"]
+        if (not isinstance(identity, str) or not 1 <= len(identity) <= 128 or identity.strip() != identity
+                or any(ord(char) < 32 for char in identity)
+                or not isinstance(day, str) or len(day) != 8 or not all("0" <= char <= "9" for char in day)
+                or any(not isinstance(value, str) or len(value) != 14
+                       or not all("0" <= char <= "9" for char in value) or not value.startswith(day)
+                       for value in (start, end)) or start >= end
+                or not isinstance(symbols, list) or not 1 <= len(symbols) <= 64):
+            raise ShmProtocolError("scoped capture requires bounded identity, same-day ordered times and 1-64 symbols")
+        ShmReadOnlyRpcClient._quote_params({"codes": symbols})
+        if code not in symbols:
+            raise ShmProtocolError("subscribed code must belong to the complete capture contract")
+        try:
+            _dt.datetime.strptime(day, "%Y%m%d")
+            for value in (start, end):
+                _dt.datetime.strptime(value, "%Y%m%d%H%M%S")
+        except ValueError:
+            raise ShmProtocolError("scoped capture date/time is invalid")
+        return dict(capture_id=identity, trade_date=day, start_time=start, end_time=end, symbols=sorted(symbols))
+
+    @staticmethod
     def _market_params(method, values):
         allowed = {
             "get_local_data": {"account_id", "code", "period", "start_time", "end_time", "count", "divid_type"},
             "get_market_data_ex": {"account_id", "code", "period", "start_time", "end_time", "count", "dividend_type", "fill_data", "subscribe"},
             "download_history_data": {"account_id", "code", "period", "start_time", "end_time", "incrementally"},
-            "subscribe_quote": {"account_id", "code", "period", "dividend_type", "result_type"},
-            "poll_quote_events": {"account_id", "after_sequence"},
+            "subscribe_quote": {"account_id", "code", "period", "dividend_type", "result_type", "capture"},
+            "poll_quote_events": {"account_id", "after_sequence", "subscription_id"},
             "unsubscribe_quote": {"account_id", "subscription_id"},
         }[method]
         if set(values) - allowed:
@@ -126,10 +152,18 @@ class ShmReadOnlyRpcClient:
                     or values.get("dividend_type", "none") != "none"
                     or values.get("result_type", "dict") != "dict"):
                 raise ShmProtocolError("subscription requires a supported period and dict/none")
+            if "capture" in values:
+                if values.get("period", "tick") != "tick":
+                    raise ShmProtocolError("scoped capture is limited to tick subscriptions")
+                values = dict(values, capture=ShmReadOnlyRpcClient._capture_params(values["capture"], values["code"]))
         elif method == "poll_quote_events":
             after = values.get("after_sequence")
             if type(after) is not int or after < 0:
                 raise ShmProtocolError("after_sequence must be nonnegative integer")
+            if "subscription_id" in values and (not isinstance(values["subscription_id"], str)
+                    or not 1 <= len(values["subscription_id"]) <= 128
+                    or any(char.isspace() for char in values["subscription_id"])):
+                raise ShmProtocolError("explicit bounded subscription_id required")
         else:
             identity = values.get("subscription_id")
             if not isinstance(identity, str) or not identity or len(identity) > 128:

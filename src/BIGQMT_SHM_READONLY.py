@@ -24,6 +24,8 @@ READONLY_PERSISTENT_READONLY = False  # 仅显式55013746禁写驻留候选；�
 READONLY_PERSISTENT_MARKET_RPC = False  # 双源读写候选显式开放已有市场只读方法。
 READONLY_PERSISTENT_LIVE_READ_WRITE = False  # 仅显式实盘双源候选，读源始终禁写。
 RPC_REVISION = "shm-readonly-single-file-v2"
+QUOTE_SUBSCRIPTION_CONTRACT = "SCOPED_TICK_CAPTURE_V1"
+QUOTE_SUBSCRIPTION_LIMIT = 64
 HISTORY_PAYLOAD_LIMIT_BYTES = 8 * 1024 * 1024 - 16384
 _EMBEDDED_SOURCES = {}  # BUILD_READONLY_EMBEDDED
 _MODULE_CACHE = {}
@@ -85,9 +87,10 @@ def _load_embedded(name):
 
 
 class ReadOnlyRequestError(ValueError):
-    def __init__(self, code, message):
+    def __init__(self, code, message, data=None):
         super(ReadOnlyRequestError, self).__init__(message)
         self.code = code
+        self.data = data
 
 
 class ShmReadOnlyBridge:
@@ -151,6 +154,10 @@ class ShmReadOnlyBridge:
         self.subscription = None
         self.subscription_generation = 0
         self.callback_error = None
+        self.capture_contract = None
+        self.capture_subscriptions = {}
+        self.capture_error = None
+        self.cleanup_error = None
         self.serializer = _load_embedded("aqp_readonly_serializer").to_jsonable
         positions = _load_embedded("bigqmt_signal_trader.adapters.position_bigqmt")
         self.positions = positions.BigQmtPositionProvider(query, account_type="STOCK")
@@ -240,6 +247,7 @@ class ShmReadOnlyBridge:
                             callable(getattr(self.context, name, None)) for name in
                             ("get_all_subscription", "subscribe_quote", "unsubscribe_quote", "get_market_data_ex")) else [],
                         "session_id": self.mailbox.session_id, "native_pid": self.mailbox.server_pid, "capabilities": list(allowed_methods)}
+                data.update(self.quote_subscription_metadata())
             elif method in ("get_local_data", "get_market_data_ex", "download_history_data", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"):
                 data = self.market_request(method, params)
                 data.update(account_id=self.account_id, session_id=self.mailbox.session_id,
@@ -333,6 +341,8 @@ class ShmReadOnlyBridge:
                 raise ReadOnlyRequestError("READ_EXPIRED_DURING_EXECUTION", "read finished after its deadline; result is unconfirmed")
             response.update(ok=True, data=self.serializer(data))
         except Exception as exc:
+            if isinstance(exc, ReadOnlyRequestError) and exc.data is not None:
+                response["data"] = self.serializer(exc.data)
             response["error"] = "%s: %s" % (type(exc).__name__, exc)
             response["server_error"] = exc.code if isinstance(exc, ReadOnlyRequestError) else "QMT_QUERY_FAILED"
         if isinstance(response["data"], dict) and isinstance(response["data"].get("source_evidence"), dict):
@@ -510,12 +520,218 @@ class ShmReadOnlyBridge:
                                     "end_time": end, "incrementally": incremental,
                                     "native_returned_none": returned is None}}
 
+    def quote_subscription_metadata(self):
+        if (self.environment == "LIVE" and self.market_enabled
+                and callable(getattr(self.context, "subscribe_quote", None))
+                and callable(getattr(self.context, "unsubscribe_quote", None))):
+            return {"quote_subscription_contract": QUOTE_SUBSCRIPTION_CONTRACT,
+                    "quote_subscription_limit": QUOTE_SUBSCRIPTION_LIMIT}
+        return {}
+
+    def _quote_callback(self, subscription, scoped=False):
+        def callback(raw):
+            with self.event_lock:
+                current = (self.capture_subscriptions.get(subscription["subscription_id"])
+                           if scoped else self.subscription)
+                if self.closed or current is not subscription or not subscription["active"]:
+                    return
+                try:
+                    if not isinstance(raw, dict) or set(raw) != {subscription["code"]}:
+                        raise ValueError("callback must contain exactly subscribed symbol")
+                    quotes = raw[subscription["code"]]
+                    quotes = [quotes] if isinstance(quotes, dict) else quotes
+                    if not isinstance(quotes, list) or not 1 <= len(quotes) <= 64:
+                        raise ValueError("callback batch must contain 1-64 ticks")
+                    for quote in quotes:
+                        price = quote.get("lastPrice") if isinstance(quote, dict) else None
+                        timestamp = quote.get("time") if isinstance(quote, dict) else None
+                        if (isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price)
+                                or price <= 0 or type(timestamp) is not int or timestamp <= 0):
+                            raise ValueError("callback price/time invalid")
+                    payload = json.loads(json.dumps(self.serializer(raw), allow_nan=False))
+                    sequence = subscription["event_sequence"] if scoped else self.event_sequence
+                    event = {"sequence": sequence + 1, "account_id": self.account_id,
+                             "session_id": self.mailbox.session_id, "subscription_id": subscription["subscription_id"],
+                             "native_time": [quote["time"] for quote in quotes],
+                             "received_at": _dt.datetime.now().isoformat(), "data": payload}
+                    if scoped:
+                        event.update(capture_id=subscription["capture"]["capture_id"], code=subscription["code"])
+                    if len(json.dumps(event, ensure_ascii=True, allow_nan=False).encode("ascii")) > 2048:
+                        raise ValueError("callback batch exceeds 2048-byte event bound")
+                    events = subscription["events"] if scoped else self.events
+                    if scoped:
+                        subscription["event_sequence"] += 1
+                    else:
+                        self.event_sequence += 1
+                    if len(events) == 32:
+                        events.pop(0)
+                        if scoped:
+                            subscription["dropped_count"] += 1
+                        else:
+                            self.dropped_count += 1
+                    events.append(event)
+                except Exception as exc:
+                    error = "%s: %s" % (type(exc).__name__, exc)
+                    if scoped:
+                        subscription["callback_error"] = subscription["callback_error"] or error
+                    else:
+                        self.callback_error = error
+        return callback
+
+    def _capture_params(self, capture, code):
+        if (not isinstance(capture, dict)
+                or set(capture) != {"capture_id", "trade_date", "start_time", "end_time", "symbols"}):
+            raise ReadOnlyRequestError("INVALID_PARAMS", "explicit complete capture contract required")
+        identity, day = capture["capture_id"], capture["trade_date"]
+        start, end, symbols = capture["start_time"], capture["end_time"], capture["symbols"]
+        if (not isinstance(identity, str) or not 1 <= len(identity) <= 128 or identity.strip() != identity
+                or any(ord(char) < 32 for char in identity)
+                or not isinstance(day, str) or len(day) != 8 or not all("0" <= char <= "9" for char in day)
+                or any(not isinstance(value, str) or len(value) != 14
+                       or not all("0" <= char <= "9" for char in value) or not value.startswith(day)
+                       for value in (start, end)) or start >= end
+                or not isinstance(symbols, list) or not 1 <= len(symbols) <= QUOTE_SUBSCRIPTION_LIMIT
+                or any(not self._history_symbol(symbol) for symbol in symbols)
+                or len(set(symbols)) != len(symbols) or code not in symbols):
+            raise ReadOnlyRequestError("INVALID_PARAMS", "capture identity, same-day times and unique symbols are required")
+        try:
+            _dt.datetime.strptime(day, "%Y%m%d")
+            for value in (start, end):
+                _dt.datetime.strptime(value, "%Y%m%d%H%M%S")
+        except ValueError:
+            raise ReadOnlyRequestError("INVALID_PARAMS", "capture date/time is invalid")
+        if any(symbol not in self.quote_symbols for symbol in symbols):
+            raise ReadOnlyRequestError("SYMBOL_DENIED", "the complete capture must belong to the configured allowlist")
+        return dict(capture_id=identity, trade_date=day, start_time=start, end_time=end, symbols=sorted(symbols))
+
+    @staticmethod
+    def _capture_subscription_result(subscription):
+        keys = ("subscription_id", "account_id", "session_id", "code", "period", "active", "native_handle",
+                "initial_sequence", "capture", "registration_error", "cleanup_error", "unconfirmed_native_handle")
+        return json.loads(json.dumps({key: subscription[key] for key in keys if key in subscription}))
+
+    def _capture_finished(self):
+        return not self.capture_error and bool(self.capture_subscriptions) and all(
+            subscription.get("cancel_result") and subscription.get("tail_delivered")
+            and not any(subscription.get(key) for key in (
+                "delivery_error", "callback_error", "registration_error", "cleanup_error"))
+            for subscription in self.capture_subscriptions.values())
+
+    def _subscribe_capture(self, params):
+        if (set(params) - {"account_id", "code", "period", "result_type", "dividend_type", "capture"}
+                or self.environment != "LIVE" or not self.quote_subscription_metadata()
+                or params.get("period", "tick") != "tick" or params.get("result_type", "dict") != "dict"
+                or params.get("dividend_type", "none") != "none"):
+            raise ReadOnlyRequestError("INVALID_PARAMS", "scoped capture requires explicit LIVE tick/dict/none")
+        capture = self._capture_params(params["capture"], params.get("code"))
+        if self.subscription is not None:
+            raise ReadOnlyRequestError("SUBSCRIPTION_ACTIVE", "legacy and scoped subscriptions cannot mix")
+        if self.capture_error:
+            raise ReadOnlyRequestError("SUBSCRIPTION_UNCONFIRMED", self.capture_error)
+        if self.capture_contract is not None and capture != self.capture_contract:
+            if capture["capture_id"] == self.capture_contract["capture_id"] or not self._capture_finished():
+                raise ReadOnlyRequestError("CAPTURE_CONFLICT", "another capture contract is retained")
+            self.capture_subscriptions = {}
+            self.capture_contract = None
+        self.capture_contract = capture
+        for subscription in self.capture_subscriptions.values():
+            if subscription["code"] == params["code"]:
+                return self._capture_subscription_result(subscription)
+        self.subscription_generation += 1
+        subscription = dict(subscription_id="%s-%s" % (self.mailbox.session_id, self.subscription_generation),
+            account_id=self.account_id, session_id=self.mailbox.session_id, code=params["code"], period="tick",
+            active=True, native_handle=None, initial_sequence=0, capture=capture,
+            event_sequence=0, events=[], dropped_count=0, callback_error=None, tail_delivered=False)
+        with self.event_lock:
+            self.capture_subscriptions[subscription["subscription_id"]] = subscription
+        try:
+            handle = self.context.subscribe_quote(subscription["code"], period="tick", dividend_type="none", result_type="dict",
+                                                  callback=self._quote_callback(subscription, scoped=True))
+            if type(handle) is int:
+                subscription["unconfirmed_native_handle"] = handle
+            if type(handle) is not int or handle < 0:
+                raise ReadOnlyRequestError("SUBSCRIPTION_UNCONFIRMED", "native registration returned an unknown handle")
+            if any(other is not subscription and other.get("native_handle") == handle
+                   for other in self.capture_subscriptions.values()):
+                raise ReadOnlyRequestError("SUBSCRIPTION_UNCONFIRMED", "native handle belongs to another scoped owner")
+            subscription["native_handle"] = handle
+            subscription.pop("unconfirmed_native_handle", None)
+        except Exception as exc:
+            with self.event_lock:
+                subscription["active"] = False
+                subscription["registration_error"] = "%s: %s" % (type(exc).__name__, exc)
+                self.capture_error = subscription["registration_error"]
+            raise ReadOnlyRequestError("SUBSCRIPTION_UNCONFIRMED", self.capture_error,
+                                       self._capture_subscription_result(subscription))
+        return self._capture_subscription_result(subscription)
+
+    def _poll_capture(self, params):
+        after = params.get("after_sequence")
+        identity = params.get("subscription_id")
+        subscription = self.capture_subscriptions.get(identity) if isinstance(identity, str) else None
+        if (set(params) - {"account_id", "after_sequence", "subscription_id"}
+                or type(after) is not int or after < 0 or subscription is None):
+            raise ReadOnlyRequestError("INVALID_PARAMS", "explicit scoped SID and nonnegative cursor required")
+        with self.event_lock:
+            latest, events = subscription["event_sequence"], subscription["events"]
+            if after > latest:
+                raise ReadOnlyRequestError("INVALID_PARAMS", "cursor exceeds scoped latest sequence")
+            oldest = events[0]["sequence"] if events else latest + 1
+            result = dict(events=[event for event in events if event["sequence"] > after], latest_sequence=latest,
+                oldest_sequence=oldest, dropped_count=subscription["dropped_count"], gap=after < oldest - 1,
+                subscription_id=subscription["subscription_id"], account_id=self.account_id,
+                session_id=self.mailbox.session_id, capture=subscription["capture"], code=subscription["code"],
+                active=subscription["active"], callback_error=subscription["callback_error"], delivery="poll",
+                active_subscription_count=sum(item["active"] for item in self.capture_subscriptions.values()))
+            for key in ("cleanup_error", "registration_error"):
+                if key in subscription:
+                    result[key] = subscription[key]
+            error = ("CAPTURE_EVENT_GAP" if result["gap"] else subscription.get("callback_error")
+                     or subscription.get("registration_error") or subscription.get("cleanup_error"))
+            if error:
+                subscription["delivery_error"] = subscription.get("delivery_error") or error
+                self.capture_error = self.capture_error or subscription["delivery_error"]
+                subscription["tail_delivered"] = False
+            if subscription.get("delivery_error"):
+                result["delivery_error"] = subscription["delivery_error"]
+            elif subscription.get("cancel_result"):
+                subscription["tail_delivered"] = True
+            return result
+
+    def _cancel_capture_subscription(self, subscription):
+        with self.event_lock:
+            subscription["active"] = False
+        if subscription.get("cancel_result"):
+            return dict(subscription["cancel_result"])
+        error = subscription.get("cleanup_error") or subscription.get("registration_error")
+        if error:
+            raise ReadOnlyRequestError("CLEANUP_FAILED", error, self._capture_subscription_result(subscription))
+        try:
+            if self.context.unsubscribe_quote(subscription["native_handle"]) is not True:
+                raise RuntimeError("native unsubscribe did not confirm success")
+        except Exception as exc:
+            subscription["cleanup_error"] = "%s: %s" % (type(exc).__name__, exc)
+            self.capture_error = self.capture_error or subscription["cleanup_error"]
+            raise ReadOnlyRequestError("CLEANUP_FAILED", subscription["cleanup_error"],
+                                       self._capture_subscription_result(subscription))
+        result = dict(cancelled=True, cleanup_status="CANCELLED", subscription_id=subscription["subscription_id"],
+                      account_id=self.account_id, session_id=self.mailbox.session_id, code=subscription["code"],
+                      capture=subscription["capture"])
+        subscription["cancel_result"] = result
+        return dict(result)
+
     def market_request(self, method, params):
         if method in ("get_local_data", "get_market_data_ex"):
             return self._history_request(method, params)
         if method == "download_history_data":
             return self._download_request(params)
         if method == "subscribe_quote":
+            if "capture" in params:
+                return self._subscribe_capture(params)
+            if self.capture_subscriptions and not self._capture_finished():
+                raise ReadOnlyRequestError("SUBSCRIPTION_ACTIVE", "legacy and scoped subscriptions cannot mix")
+            if self.capture_subscriptions:
+                raise ReadOnlyRequestError("CAPTURE_CONFLICT", "retained scoped records require a new explicit capture")
             if (set(params) - {"account_id", "code", "period", "result_type", "dividend_type"}
                     or params.get("code") not in self.quote_symbols
                     or params.get("period", "tick") not in ("tick", "1m", "5m", "15m", "30m", "60m", "1d")
@@ -546,39 +762,7 @@ class ShmReadOnlyBridge:
                 self.dropped_count += len(self.events)
                 self.events = []
                 self.callback_error = None
-            def callback(raw):
-                with self.event_lock:
-                    if self.closed or self.subscription is not subscription or not subscription["active"]:
-                        return
-                    try:
-                        if not isinstance(raw, dict) or set(raw) != {subscription["code"]}:
-                            raise ValueError("callback must contain exactly subscribed symbol")
-                        quotes = raw[subscription["code"]]
-                        quotes = [quotes] if isinstance(quotes, dict) else quotes
-                        if not isinstance(quotes, list) or not 1 <= len(quotes) <= 64:
-                            raise ValueError("callback batch must contain 1-64 ticks")
-                        for quote in quotes:
-                            price = quote.get("lastPrice") if isinstance(quote, dict) else None
-                            timestamp = quote.get("time") if isinstance(quote, dict) else None
-                            if (isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price)
-                                    or price <= 0 or type(timestamp) is not int or timestamp <= 0):
-                                raise ValueError("callback price/time invalid")
-                        payload = self.serializer(raw)
-                        # JSON roundtrip freezes nested containers before returning to QMT.
-                        payload = json.loads(json.dumps(payload, allow_nan=False))
-                        event = {"sequence": self.event_sequence + 1, "account_id": self.account_id,
-                                 "session_id": self.mailbox.session_id, "subscription_id": subscription["subscription_id"],
-                                 "native_time": [quote["time"] for quote in quotes],
-                                 "received_at": _dt.datetime.now().isoformat(), "data": payload}
-                        if len(json.dumps(event, ensure_ascii=True, allow_nan=False).encode("ascii")) > 2048:
-                            raise ValueError("callback batch exceeds 2048-byte event bound")
-                        self.event_sequence += 1
-                        if len(self.events) == 32:
-                            self.events.pop(0)
-                            self.dropped_count += 1
-                        self.events.append(event)
-                    except Exception as exc:
-                        self.callback_error = "%s: %s" % (type(exc).__name__, exc)
+            callback = self._quote_callback(subscription)
             try:
                 handle = self.context.subscribe_quote(subscription["code"], period=period, dividend_type="none", result_type="dict",
                                                       callback=callback if period == "tick" else None)
@@ -597,6 +781,15 @@ class ShmReadOnlyBridge:
                 raise
             return dict(subscription)
         if method == "poll_quote_events":
+            if "subscription_id" in params:
+                return self._poll_capture(params)
+            if self.capture_subscriptions:
+                if not self._capture_finished():
+                    raise ReadOnlyRequestError("SUBSCRIPTION_ACTIVE", "scoped events require an explicit subscription_id")
+                if set(params) - {"account_id", "after_sequence"} or type(params.get("after_sequence")) is not int or params["after_sequence"] != 0:
+                    raise ReadOnlyRequestError("INVALID_PARAMS", "idle scoped baseline requires cursor zero")
+                return dict(events=[], latest_sequence=0, oldest_sequence=1, dropped_count=0, gap=False,
+                            subscription_id=None, callback_error=None, delivery="poll", active_subscription_count=0)
             after = params.get("after_sequence")
             if set(params) - {"account_id", "after_sequence"} or type(after) is not int or after < 0:
                 raise ReadOnlyRequestError("INVALID_PARAMS", "after_sequence must be nonnegative integer")
@@ -608,7 +801,12 @@ class ShmReadOnlyBridge:
                         "latest_sequence": self.event_sequence, "oldest_sequence": oldest,
                         "dropped_count": self.dropped_count, "gap": after < oldest - 1,
                         "subscription_id": self.subscription["subscription_id"] if self.subscription else None,
-                        "callback_error": self.callback_error, "delivery": "poll"}
+                        "callback_error": self.callback_error, "delivery": "poll",
+                        "active_subscription_count": int(self.subscription is not None and self.subscription["active"])}
+        identity = params.get("subscription_id")
+        scoped = self.capture_subscriptions.get(identity) if isinstance(identity, str) else None
+        if scoped is not None and not set(params) - {"account_id", "subscription_id"}:
+            return self._cancel_capture_subscription(scoped)
         if set(params) - {"account_id", "subscription_id"} or self.subscription is None or params.get("subscription_id") != self.subscription["subscription_id"]:
             raise ReadOnlyRequestError("INVALID_PARAMS", "explicit active subscription_id is required")
         return self.cancel_subscription()
@@ -620,6 +818,8 @@ class ShmReadOnlyBridge:
         # Close callback gate even if native cancellation fails; retain handle for cleanup evidence.
         with self.event_lock:
             subscription["active"] = False
+        if subscription.get("cleanup_error"):
+            raise ReadOnlyRequestError("CLEANUP_FAILED", subscription["cleanup_error"])
         try:
             if self.context.unsubscribe_quote(subscription["native_handle"]) is not True:
                 raise RuntimeError("native unsubscribe did not confirm success")
@@ -628,7 +828,8 @@ class ShmReadOnlyBridge:
                 if not isinstance(after, dict) or after != self.managed_subscriptions_before:
                     raise RuntimeError("native subscription table did not return to its original state")
         except Exception as exc:
-            raise ReadOnlyRequestError("CLEANUP_FAILED", "%s: %s" % (type(exc).__name__, exc))
+            subscription["cleanup_error"] = "%s: %s" % (type(exc).__name__, exc)
+            raise ReadOnlyRequestError("CLEANUP_FAILED", subscription["cleanup_error"])
         self.subscription = None
         result = {"cancelled": True, "cleanup_status": "CANCELLED", "subscription_id": subscription["subscription_id"]}
         if "subscriptions_before_count" in subscription:
@@ -677,6 +878,8 @@ class ShmReadOnlyBridge:
 
     def close(self, reason="stop", failed=False):
         if self.closed:
+            if self.cleanup_error is not None:
+                raise self.cleanup_error
             return
         self.closed = True
         cleanup_error = None
@@ -684,9 +887,16 @@ class ShmReadOnlyBridge:
             self.cancel_subscription()
         except Exception as exc:
             cleanup_error = exc
+        for subscription in self.capture_subscriptions.values():
+            try:
+                self._cancel_capture_subscription(subscription)
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
+        self.cleanup_error = cleanup_error
         try:
             self.mailbox.close(failed=failed or cleanup_error is not None)
         except Exception as exc:
+            self.cleanup_error = self.cleanup_error or exc
             print("AQP_SHM_READONLY_CLOSED " + json.dumps({"reason": reason, "requests": self.request_count, "native_handles_closed": False, "cleanup_error": str(exc)}, sort_keys=True))
             raise
         print("AQP_SHM_READONLY_CLOSED " + json.dumps({"reason": reason, "requests": self.request_count, "native_handles_closed": True,
@@ -733,6 +943,7 @@ def init(ContextInfo):
         "started_at_unix": _SERVER.created_at_unix,
         "source_deadline_unix": None if _SERVER.persistent_readonly else _SERVER.created_at_unix + READONLY_MAX_SECONDS,
         "background_threads": False, "rpc_revision": RPC_REVISION,
+        **_SERVER.quote_subscription_metadata(),
     }, sort_keys=True))
 
 
