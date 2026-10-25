@@ -172,6 +172,126 @@ def test_resident_model_launches_only_explicit_runtime_after_verified_sources(mo
     h.close()
 
 
+def sim_resident_settings(**overrides):
+    values = dict(native_pid=0, native_executable=BUILDER.SIM_NATIVE_EXECUTABLE,
+        source_identity_path=r"C:\Users\zhanglongxiang\AppData\Local\AQP\qmt-sim\source.identity.json",
+        read_name=r"Local\AQP_SHM_READONLY_VM_SIM_RESIDENT",
+        execution_name=r"Local\AQP_SHM_TRADE_VM_SIM_RESIDENT",
+        persistent_readonly=True, max_seconds=0, max_requests=0, hard_deadline_unix=None)
+    return dict(values, **overrides)
+
+
+def test_sim_resident_same_source_rebinds_actual_pid_and_publishes_new_private_identity(monkeypatch, capsys):
+    identities, sources = [], []
+    for pid in (2988, 23572):
+        with mock.patch.object(os, "getpid", return_value=pid):
+            h = Fixture(monkeypatch, **sim_resident_settings())
+
+            def module_path(module, buffer, size):
+                buffer.value = BUILDER.SIM_NATIVE_EXECUTABLE
+                return len(buffer.value)
+
+            monkeypatch.setattr(ctypes.windll.kernel32, "GetModuleFileNameW", module_path, raising=False)
+            opened = mock.mock_open()
+            h.namespace["open"] = opened
+            replaced, launched = mock.Mock(), mock.Mock()
+            monkeypatch.setattr(os, "replace", replaced)
+            monkeypatch.setattr(subprocess, "Popen", launched)
+            h.start()
+            identity = json.loads(next(line.split(" ", 1)[1] for line in capsys.readouterr().out.splitlines()
+                if line.startswith("AQP_DUAL_SHM_READY ")))
+            assert identity["native_pid"] == pid and identity["windows_session"] == 1
+            assert identity["account_id"] == ACCOUNT and identity["environment"] == "SIM"
+            assert identity["runtime_policy"] == "PERSISTENT_READONLY"
+            assert identity["allow_order_methods"] is False and identity["market_rpc_enabled"] is False
+            assert identity["account_bound_once"] is True and identity["account_callback_route"] == "outer_to_execution"
+            assert identity["execution_bind_account_callbacks"] is False
+            assert identity["read_name"].startswith(h.settings["read_name"] + "_")
+            assert identity["execution_name"].startswith(h.settings["execution_name"] + "_")
+            assert len(identity["read_name"]) == len(h.settings["read_name"]) + 17
+            assert len(identity["execution_name"]) == len(h.settings["execution_name"]) + 17
+            assert identity["source_deadline_unix"] is None
+            assert identity["max_seconds"] == identity["max_requests_per_source"] == 0
+            published = json.loads("".join(call.args[0] for call in opened().write.call_args_list))
+            assert published == dict(identity, status="READY")
+            path = h.settings["source_identity_path"]
+            replaced.assert_called_once_with(path + ".new", path)
+            launched.assert_not_called()
+            assert h.context.accounts == [ACCOUNT]
+            for key in ("read", "execution"):
+                ping = h.call(key, "ping")["data"]
+                assert ping["native_pid"] == pid and ping["allow_order_methods"] is False
+                for method in ("submit_order", "cancel_order"):
+                    assert h.call(key, method)["ok"] is False
+            sources.append(h.source)
+            identities.append(identity)
+            h.close()
+    assert sources[0] == sources[1]
+    assert len({value[field] for value in identities for field in ("read_session_id", "execution_session_id")}) == 4
+    for field in ("read_name", "execution_name"):
+        assert identities[0][field] != identities[1][field]
+
+
+@pytest.mark.parametrize("overrides", [
+    dict(account_id="8882152350"),
+    dict(environment="LIVE"),
+    dict(native_executable=r"C:\国金证券QMT交易端\bin.x64\XtItClient.exe"),
+    dict(native_executable=r"C:\Other-SIM\bin.x64\XtItClient.exe"),
+    dict(persistent_readonly=False),
+    dict(persistent_readonly=False, persistent_simulation_read_write=True),
+    dict(persistent_live_read_write=True),
+    dict(enable_market_rpc=True),
+    dict(runtime_launcher=dict(python=r"C:\Python\python.exe", script=r"C:\AQP\supervise_qmt_runtime.py", config=r"C:\AQP\runtime.json")),
+    dict(source_identity_path=None),
+])
+def test_sim_resident_builder_rejects_any_other_account_executable_or_policy(overrides):
+    with pytest.raises(ValueError):
+        BUILDER.build_source(**settings(**sim_resident_settings(**overrides)))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("account_id", "8882152350"),
+    ("environment", "LIVE"),
+    ("persistent_readonly", False),
+    ("persistent_simulation_read_write", True),
+    ("persistent_live_read_write", True),
+    ("market_rpc_enabled", True),
+    ("runtime_launcher", dict(python=r"C:\Python\python.exe", script=r"C:\AQP\supervise_qmt_runtime.py", config=r"C:\AQP\runtime.json")),
+    ("native_executable", r"C:\国金证券QMT交易端\bin.x64\XtItClient.exe"),
+    ("source_identity_path", "source.json"),
+    ("windows_session", 2),
+    ("windows_session", True),
+])
+def test_sim_resident_rejects_changed_identity_before_account_binding(monkeypatch, field, value):
+    h = Fixture(monkeypatch, **sim_resident_settings())
+
+    def module_path(module, buffer, size):
+        buffer.value = BUILDER.SIM_NATIVE_EXECUTABLE
+        return len(buffer.value)
+
+    monkeypatch.setattr(ctypes.windll.kernel32, "GetModuleFileNameW", module_path, raising=False)
+    h.namespace["DUAL_SHM_SETTINGS"][field] = value
+    with pytest.raises(RuntimeError):
+        h.start()
+    assert h.context.accounts == [] and h.query_calls == []
+    assert all(runtime["_SERVER"] is None for runtime in h.namespace["_RUNTIMES"].values())
+    h.writes.assert_not_called()
+
+
+def test_sim_resident_wrong_actual_executable_rejected_before_account_binding(monkeypatch):
+    h = Fixture(monkeypatch, **sim_resident_settings())
+
+    def module_path(module, buffer, size):
+        buffer.value = r"C:\国金证券QMT交易端\bin.x64\XtItClient.exe"
+        return len(buffer.value)
+
+    monkeypatch.setattr(ctypes.windll.kernel32, "GetModuleFileNameW", module_path, raising=False)
+    with pytest.raises(RuntimeError, match="native executable mismatch"):
+        h.start()
+    assert h.context.accounts == [] and h.query_calls == []
+    assert all(runtime["_SERVER"] is None for runtime in h.namespace["_RUNTIMES"].values())
+
+
 class Fixture:
     def __init__(self, monkeypatch, **overrides):
         self.settings = settings(**overrides)
@@ -222,7 +342,7 @@ class Fixture:
     def start(self):
         assert self.namespace["init"](self.context) is None
         for key, transport in self.transports.items():
-            name = self.settings["read_name" if key == "read" else "execution_name"]
+            name = self.namespace["_RUNTIMES"][key]["READONLY_SHM_NAME" if key == "read" else "SHM_RPC_NAME"]
             self.clients[key] = transport.ShmReadOnlyClient(name, self.account)
 
     def call(self, key, method, params=None, **overrides):

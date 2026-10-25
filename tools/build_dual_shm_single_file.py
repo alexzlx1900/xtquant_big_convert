@@ -14,6 +14,7 @@ import re
 
 ROOT = Path(__file__).resolve().parent.parent
 ACCOUNT = "55013746"
+SIM_NATIVE_EXECUTABLE = r"C:\国金QMT交易端模拟\bin.x64\XtItClient.exe"
 
 
 def _load_builder(filename):
@@ -62,11 +63,15 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         raise ValueError("this candidate is limited to simulation account 55013746")
     resident_identity = native_pid == 0 and type(native_pid) is int
     if resident_identity:
-        if (environment != "LIVE" or persistent_live_read_write is not True
-                or not isinstance(native_executable, str) or not ntpath.isabs(native_executable)
+        if (not isinstance(native_executable, str) or not ntpath.isabs(native_executable)
                 or ntpath.basename(native_executable).lower() != "xtitclient.exe"
                 or ntpath.normpath(native_executable) != native_executable):
-            raise ValueError("resident identity requires explicit LIVE QMT executable absolute path")
+            raise ValueError("resident identity requires explicit QMT executable absolute path")
+        if environment == "SIM" and (
+                persistent_readonly is not True or persistent_simulation_read_write is not False
+                or enable_market_rpc is not False or runtime_launcher is not None
+                or ntpath.normcase(native_executable) != ntpath.normcase(SIM_NATIVE_EXECUTABLE)):
+            raise ValueError("SIM resident identity requires the fixed simulation executable and persistent readonly policy without launcher")
     elif native_executable is not None:
         raise ValueError("native executable binding requires explicit native_pid=0 resident mode")
     if resident_identity and (not isinstance(source_identity_path, str) or not ntpath.isabs(source_identity_path)):
@@ -147,6 +152,7 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         native_executable=native_executable, runtime_launcher=runtime_launcher,
         source_identity_path=source_identity_path)
     output = TEMPLATE.replace("__DUAL_SETTINGS__", repr(settings)).replace("__DUAL_PAYLOADS__", repr(payloads))
+    output = output.replace("__SIM_NATIVE_EXECUTABLE__", repr(SIM_NATIVE_EXECUTABLE))
     output = output.encode("ascii", "backslashreplace").decode("ascii")
     ast.parse(output, feature_version=(3, 6))
     return output
@@ -164,6 +170,7 @@ import time
 import uuid
 
 DUAL_SHM_SETTINGS = __DUAL_SETTINGS__
+_SIM_NATIVE_EXECUTABLE = __SIM_NATIVE_EXECUTABLE__
 _SOURCE_PAYLOADS = __DUAL_PAYLOADS__
 _RUNTIMES = {}
 _INIT_ATTEMPTED = False
@@ -183,6 +190,21 @@ for _key in ("read", "execution"):
 def _verify_identity():
     configured = DUAL_SHM_SETTINGS["native_pid"]
     if configured == 0:
+        if DUAL_SHM_SETTINGS["environment"] == "SIM" and (
+                DUAL_SHM_SETTINGS["account_id"] != "55013746"
+                or type(configured) is not int
+                or type(DUAL_SHM_SETTINGS["windows_session"]) is not int
+                or DUAL_SHM_SETTINGS["windows_session"] < 0
+                or DUAL_SHM_SETTINGS["persistent_readonly"] is not True
+                or DUAL_SHM_SETTINGS["persistent_simulation_read_write"] is not False
+                or DUAL_SHM_SETTINGS["persistent_live_read_write"] is not False
+                or DUAL_SHM_SETTINGS["market_rpc_enabled"] is not False
+                or DUAL_SHM_SETTINGS["runtime_launcher"] is not None
+                or not isinstance(DUAL_SHM_SETTINGS["native_executable"], str)
+                or ntpath.normcase(DUAL_SHM_SETTINGS["native_executable"]) != ntpath.normcase(_SIM_NATIVE_EXECUTABLE)
+                or not isinstance(DUAL_SHM_SETTINGS["source_identity_path"], str)
+                or not ntpath.isabs(DUAL_SHM_SETTINGS["source_identity_path"])):
+            raise RuntimeError("SIM resident identity policy changed")
         path = ctypes.create_unicode_buffer(32768)
         length = ctypes.windll.kernel32.GetModuleFileNameW(None, path, len(path))
         expected = DUAL_SHM_SETTINGS["native_executable"]
