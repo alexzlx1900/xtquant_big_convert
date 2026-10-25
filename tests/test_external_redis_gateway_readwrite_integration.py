@@ -50,7 +50,9 @@ def gateway_modules(monkeypatch):
 
 class Harness:
     def __init__(self, monkeypatch, gateway, *, allow_writes=True, unknown_submit=False,
-                 live=False, start_write_blocked=None, live_write_authorized=False, symbols=None):
+                 live=False, start_write_blocked=None, live_write_authorized=False, symbols=None,
+                 order_submit_mode="SYNC", redis_factory=MemoryRedis,
+                 receive_policy="QUEUE_AND_PUBSUB"):
         self.allow_writes, self.unknown_submit = allow_writes, unknown_submit
         self.account = "8882152350" if live else ACCOUNT
         self.environment = "LIVE" if live else "SIM"
@@ -66,7 +68,7 @@ class Harness:
             enable_market_rpc=allow_writes,
             symbols=[CODE] if symbols is None else symbols,
         )
-        self.gateway, self.redis = gateway, MemoryRedis()
+        self.gateway, self.redis = gateway, redis_factory()
         self.orders, self.trades, self.submit_calls, self.cancel_calls = [], [], [], []
         original_query = self.source.query
 
@@ -101,13 +103,14 @@ class Harness:
             timeout_seconds=1.0, max_requests=0, deadline_unix=None,
             allow_order_methods=allow_writes,
             runtime_policy=self.policy,
+            receive_policy=receive_policy,
         )
         self.pool = ThreadPoolExecutor(1)
         self.stop = threading.Event()
         self.pump = None
         self.profile = gateway.config.GatewayAccountProfile(
             profile_id=self.profile_id, label="local external fixture", environment=self.environment,
-            account_id=self.account, userdata_mini_path="fixture-not-accessed", order_submit_mode="SYNC",
+            account_id=self.account, userdata_mini_path="fixture-not-accessed", order_submit_mode=order_submit_mode,
             bigqmt_rpc=gateway.config.BigQmtRpcConfig(
                 transport="redis_shm", timeout_seconds=1.0, allow_order_methods=allow_writes,
                 expected_rpc_revision="external-redis-dual-shm-v1",
