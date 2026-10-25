@@ -21,7 +21,9 @@ from .redis_rpc import decode_rpc_request_payload
 from .transports.readonly_shm import ShmProtocolError
 from .transports.readonly_shm_client import MARKET_RPC_METHODS, ShmReadOnlyRpcClient
 from .transports.redis_transport import _is_redis_timeout
-from .transports.shm_rpc import WRITE_METHODS
+from .transports.shm_rpc import (
+    ALL_WRITE_METHODS, ASYNC_SUBMIT_CONTRACT, ASYNC_WRITE_METHODS, WRITE_METHODS, validate_async_submit_params,
+)
 
 
 EXECUTION_METHODS = frozenset((
@@ -40,6 +42,16 @@ local prior = redis.call('HGET', KEYS[1], ARGV[1])
 if prior then return {0, prior} end
 if redis.call('HLEN', KEYS[1]) >= tonumber(ARGV[2]) then return {-1, ''} end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+return {1, ARGV[3]}
+"""
+_CLAIM_ASYNC_WRITE = """
+local prior = redis.call('HGET', KEYS[1], ARGV[1])
+if prior then return {0, prior} end
+local prior_rid = redis.call('HGET', KEYS[2], ARGV[4])
+if prior_rid then return {-2, prior_rid} end
+if redis.call('HLEN', KEYS[1]) >= tonumber(ARGV[2]) then return {-1, ''} end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+redis.call('HSET', KEYS[2], ARGV[4], ARGV[1])
 return {1, ARGV[3]}
 """
 _SETTLE_WRITE = """
@@ -127,6 +139,7 @@ class RedisShmReadOnlyProxy:
         self.live_write_authorized = live_write_authorized
         self.receive_policy = receive_policy
         self._write_ledger_key = "aqp:redis_shm:write_ledger:%s:v1" % account_id
+        self._async_cid_key = self._write_ledger_key + ":cid"
         self.timeout_seconds = float(timeout_seconds)
         self.max_requests = max_requests
         self.deadline_unix = deadline_unix
@@ -224,6 +237,8 @@ class RedisShmReadOnlyProxy:
                     execution_source=copy.deepcopy(self._source_identity["execution"]))
         if self.environment == "LIVE":
             result["live_write_authorized"] = self.live_write_authorized
+        if ASYNC_WRITE_METHODS <= self._capabilities:
+            result["async_submit_contract"] = ASYNC_SUBMIT_CONTRACT
         if "windows_session_id" in self._source_identity["execution"]:
             result["windows_session_id"] = self._source_identity["execution"]["windows_session_id"]
         binding = self._source_binding()
@@ -245,7 +260,7 @@ class RedisShmReadOnlyProxy:
                     native_pid=self.expected_native_pid, windows_session_id=windows_session)
 
     def _validate_source_binding(self, request):
-        required = request.get("method") in WRITE_METHODS
+        required = request.get("method") in ALL_WRITE_METHODS
         if not required and "expected_source_binding" not in request:
             return
         binding = request.get("expected_source_binding")
@@ -271,6 +286,7 @@ class RedisShmReadOnlyProxy:
         if not isinstance(records, dict) or len(records) > 1000:
             raise ShmProtocolError("persistent write ledger is malformed or over its fixed bound")
         self._write_record_count = len(records)
+        has_async_records = False
         if len(records) >= self.write_ledger_capacity:
             self._block_writes("WRITE_LEDGER_CAPACITY_EXHAUSTED")
         for rid, encoded in records.items():
@@ -281,12 +297,50 @@ class RedisShmReadOnlyProxy:
                     or record["binding"].get("account_id") != self.account_id
                     or (self.environment == "LIVE" and (record["binding"].get("environment") != "LIVE"
                         or record["binding"].get("runtime_policy") != self.runtime_policy))
-                    or record.get("state") not in ("CLAIMED", "CONFIRMED", "UNKNOWN", "PUBLISH_PENDING", "PUBLISH_UNCONFIRMED", "RECONCILED")):
+                    or record.get("state") not in ("CLAIMED", "CONFIRMED", "UNKNOWN", "PUBLISH_PENDING", "PUBLISH_UNCONFIRMED", "RECONCILED", "SUBMITTED_PENDING", "NOT_EXECUTED")):
                 raise ShmProtocolError("persistent write ledger identity is malformed")
+            try:
+                fingerprint = json.loads(record["fingerprint"])
+            except ValueError:
+                fingerprint = None
+            async_record = (isinstance(fingerprint, list) and len(fingerprint) == 4
+                            and isinstance(fingerprint[2], str) and fingerprint[2] in ASYNC_WRITE_METHODS)
+            if async_record:
+                if (fingerprint[:2] != [1, self.account_id] or type(fingerprint[0]) is not int
+                        or not isinstance(fingerprint[3], dict)
+                        or record.get("client_order_id") != validate_async_submit_params(fingerprint[3])):
+                    raise ShmProtocolError("persistent async request fingerprint lost its client_order_id")
+            elif "client_order_id" in record:
+                raise ShmProtocolError("persistent async CID is attached to a non-async fingerprint")
+            has_async_records = has_async_records or async_record
             if record["state"] == "RECONCILED":
                 self._validate_reconciled_record(record)
+            elif record["state"] == "SUBMITTED_PENDING":
+                self._validate_pending_record(record)
+            elif record["state"] == "NOT_EXECUTED":
+                self._validate_not_executed_record(record)
             elif record["state"] != "CONFIRMED":
                 self._block_writes("PERSISTED_WRITE_UNCONFIRMED")
+        # CID只对新异步合同生效；旧SYNC记录不要求新增索引。
+        if not ASYNC_WRITE_METHODS <= self._capabilities and not has_async_records:
+            return
+        index = self.transport.redis.hgetall(self._async_cid_key)
+        if not isinstance(index, dict) or len(index) > self.write_ledger_capacity:
+            raise ShmProtocolError("persistent async CID index is malformed or over its fixed bound")
+        indexed = {decode_text(cid): decode_text(rid) for cid, rid in index.items()}
+        expected = {}
+        for encoded in records.values():
+            record = json.loads(decode_text(encoded))
+            cid = record.get("client_order_id")
+            if cid is not None:
+                validate_async_submit_params(dict(client_order_id=cid))
+                if cid in expected:
+                    raise ShmProtocolError("persistent async CID has multiple request identities")
+                if record["state"] in ("CONFIRMED", "RECONCILED"):
+                    raise ShmProtocolError("async native-call receipts cannot be persisted as broker confirmations")
+                expected[cid] = record["request_id"]
+        if indexed != expected:
+            raise ShmProtocolError("persistent async CID index differs from the preserved write ledger")
 
     def _validate_identity_data(self, route, data):
         self._validate_environment(data, "native source")
@@ -302,8 +356,15 @@ class RedisShmReadOnlyProxy:
                 or not required <= set(data["capabilities"])
                 or (route == "execution" and data.get("transport") != "shm_rpc")
                 or (allowed_write and not WRITE_METHODS <= set(data["capabilities"]))
-                or (not allowed_write and bool(WRITE_METHODS & set(data["capabilities"])))):
+                or (not allowed_write and bool(ALL_WRITE_METHODS & set(data["capabilities"])))):
             raise ShmProtocolError("explicit bridge identity/capabilities verification failed")
+        if (ASYNC_WRITE_METHODS & set(data["capabilities"])
+                and (not ASYNC_WRITE_METHODS <= set(data["capabilities"])
+                     or data.get("async_submit_contract") != ASYNC_SUBMIT_CONTRACT
+                     or type(data.get("writes_blocked")) is not bool
+                     or not isinstance(data.get("write_block_reason"), str)
+                     or bool(data["write_block_reason"]) is not data["writes_blocked"])):
+            raise ShmProtocolError("explicit async submit contract verification failed")
         if (self.expected_windows_session_id is not None
                 and (type(data.get("windows_session_id")) is not int
                      or data["windows_session_id"] != self.expected_windows_session_id)):
@@ -406,7 +467,10 @@ class RedisShmReadOnlyProxy:
                     raise ShmProtocolError("write source requires two matching actual Windows sessions")
                 self._capabilities = frozenset(EXECUTION_METHODS | QUOTE_METHODS
                     | (MARKET_RPC_METHODS & set(result["readonly"]["capabilities"]))
-                    | (WRITE_METHODS if self.allow_order_methods else frozenset()))
+                    | (ALL_WRITE_METHODS & set(result["execution"]["capabilities"])
+                       if self.allow_order_methods else frozenset()))
+                if result["execution"].get("writes_blocked") is True:
+                    self._block_writes("NATIVE_WRITE_RESULT_UNKNOWN")
                 self._operation_phase = "WRITE_LEDGER_INSPECT"
                 self._inspect_write_ledger()
                 self._verified = True
@@ -467,8 +531,91 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("include_source_evidence must be boolean")
         if method == "poll_execution_events" and (type(params.get("after_sequence")) is not int or params["after_sequence"] < 0):
             raise ShmProtocolError("bounded nonnegative execution event cursor required")
+        if method in ASYNC_WRITE_METHODS:
+            validate_async_submit_params(params)
         return json.dumps([request["schema_version"], self.account_id, method, params],
                           sort_keys=True, allow_nan=False, separators=(",", ":"))
+
+    def _validate_async_body_identity(self, request, data, binding):
+        if (not isinstance(data, dict) or data.get("request_id") != request["request_id"]
+                or data.get("client_order_id") != request["params"]["client_order_id"]
+                or data.get("account_id") != self.account_id or data.get("environment") != self.environment
+                or data.get("session_id") != binding["execution_session_id"]
+                or type(data.get("native_pid")) is not int or data["native_pid"] != binding["native_pid"]
+                or type(data.get("windows_session_id")) is not int
+                or data["windows_session_id"] != binding["windows_session_id"]):
+            raise ShmProtocolError("async response body does not bind the exact request and native source")
+
+    def _validate_async_receipt(self, request, response, binding=None):
+        """收据仅证明原生调用返回，绝不证明柜台受理或订单终态。"""
+        binding = self._write_binding() if binding is None else binding
+        self._check_response(request, response, binding["execution_session_id"])
+        data = response.get("data")
+        self._validate_async_body_identity(request, data, binding)
+        if (response.get("ok") is not True or response.get("status") == "UNKNOWN"
+                or not isinstance(data, dict) or data.get("status") != "PENDING_CONFIRMATION"
+                or data.get("receipt_type") != "NATIVE_CALL_RETURNED"
+                or data.get("async_submit_contract") != ASYNC_SUBMIT_CONTRACT
+                or data.get("native_write_executed") is not True or data.get("broker_accepted") is not False
+                or data.get("qmt_async_seq", "missing") is not None or data.get("order_sys_id") != ""
+                or data.get("automatic_retry") is not False):
+            raise ShmProtocolError("async native-call receipt is incomplete or conflicts with the exact request/source")
+        return data
+
+    def _validate_async_not_executed(self, request, response, binding=None):
+        binding = self._write_binding() if binding is None else binding
+        self._check_response(request, response, binding["execution_session_id"])
+        data = response.get("data")
+        self._validate_async_body_identity(request, data, binding)
+        if (response.get("ok") is not True or response.get("status") == "UNKNOWN"
+                or data.get("status") != "BLOCKED" or data.get("native_write_executed") is not False
+                or data.get("writes_blocked") is not False or data.get("write_block_reason") != ""
+                or data.get("broker_accepted", False) is not False or data.get("qmt_async_seq") is not None
+                or data.get("order_sys_id", "") != ""
+                or data.get("automatic_retry") is not False):
+            raise ShmProtocolError("async rejection does not prove no native write")
+
+    def _async_record_request(self, record):
+        fingerprint = json.loads(record["fingerprint"])
+        if (not isinstance(fingerprint, list) or len(fingerprint) != 4
+                or fingerprint[:3] != [1, self.account_id, "submit_order_async"]
+                or type(fingerprint[0]) is not int or not isinstance(fingerprint[3], dict)
+                or record.get("client_order_id") != fingerprint[3].get("client_order_id")
+                or not isinstance(record.get("token"), str) or not record["token"]
+                or record.get("automatic_retry") is not False
+                or type(record.get("claimed_at_unix")) not in (int, float)
+                or not math.isfinite(record["claimed_at_unix"]) or record["claimed_at_unix"] <= 0):
+            raise ShmProtocolError("persistent async pending identity is incomplete")
+        binding = record["binding"]
+        if (type(binding.get("native_pid")) is not int or binding["native_pid"] <= 0
+                or type(binding.get("windows_session_id")) is not int or binding["windows_session_id"] < 0
+                or any(not isinstance(binding.get(key), str) or not binding[key]
+                       for key in ("read_session_id", "execution_session_id"))
+                or binding.get("allow_order_methods") is not True or binding.get("runtime_policy") not in WRITE_POLICIES):
+            raise ShmProtocolError("persistent async source binding is incomplete")
+        response = record.get("response")
+        source = response.get("source_binding") if isinstance(response, dict) else None
+        keys = ("read_session_id", "execution_session_id", "native_pid", "windows_session_id")
+        if (not isinstance(source, dict) or set(source) != set(keys)
+                or any(type(source[key]) is not type(binding[key]) or source[key] != binding[key] for key in keys)):
+            raise ShmProtocolError("persistent async response source differs from its exact claim")
+        validate_async_submit_params(fingerprint[3])
+        return dict(schema_version=1, request_id=record["request_id"],
+                    account_id=self.account_id, method="submit_order_async", params=fingerprint[3])
+
+    def _validate_async_record_binding(self, record):
+        if (record["binding"] != self._write_binding()
+                or not ASYNC_WRITE_METHODS <= self._capabilities):
+            self._block_writes("PERSISTED_ASYNC_SOURCE_CHANGED")
+
+    def _validate_pending_record(self, record):
+        self._validate_async_receipt(self._async_record_request(record), record.get("response"), record["binding"])
+        self._validate_async_record_binding(record)
+
+    def _validate_not_executed_record(self, record):
+        request = self._async_record_request(record)
+        self._validate_async_not_executed(request, record.get("response"), record["binding"])
+        self._validate_async_record_binding(record)
 
     def _write_binding(self):
         binding = dict(account_id=self.account_id, native_pid=self.expected_native_pid,
@@ -485,13 +632,44 @@ class RedisShmReadOnlyProxy:
         record = dict(request_id=request["request_id"], fingerprint=fingerprint,
                       binding=self._write_binding(), state="CLAIMED", token=uuid.uuid4().hex,
                       claimed_at_unix=time.time(), automatic_retry=False)
+        asynchronous = request["method"] in ASYNC_WRITE_METHODS
+        if asynchronous:
+            record["client_order_id"] = request["params"]["client_order_id"]
         encoded = json.dumps(record, sort_keys=True, allow_nan=False, separators=(",", ":"))
         try:
-            claimed = self.transport.redis.eval(_CLAIM_WRITE, 1, self._write_ledger_key,
-                request["request_id"], self.write_ledger_capacity, encoded)
+            if asynchronous:
+                claimed = self.transport.redis.eval(_CLAIM_ASYNC_WRITE, 2, self._write_ledger_key,
+                    self._async_cid_key, request["request_id"], self.write_ledger_capacity, encoded,
+                    record["client_order_id"])
+            else:
+                claimed = self.transport.redis.eval(_CLAIM_WRITE, 1, self._write_ledger_key,
+                    request["request_id"], self.write_ledger_capacity, encoded)
             if (not isinstance(claimed, (list, tuple)) or len(claimed) != 2
-                    or type(claimed[0]) is not int or claimed[0] not in (-1, 0, 1)):
+                    or type(claimed[0]) is not int or claimed[0] not in ((-2, -1, 0, 1) if asynchronous else (-1, 0, 1))):
                 raise ShmProtocolError("write reservation returned an invalid result")
+            if claimed[0] == -2:
+                prior_rid = decode_text(claimed[1])
+                self._request_id(dict(request_id=prior_rid))
+                prior = json.loads(decode_text(self.transport.redis.hget(self._write_ledger_key, prior_rid)))
+                if (not isinstance(prior, dict) or prior.get("request_id") != prior_rid
+                        or prior.get("client_order_id") != record["client_order_id"]):
+                    raise ShmProtocolError("persistent async CID index has no exact original request")
+                conflict = prior.get("fingerprint") != fingerprint or prior.get("binding") != record["binding"]
+                if conflict:
+                    self._block_writes("ASYNC_IDENTITY_CONFLICT")
+                elif prior.get("state") == "SUBMITTED_PENDING":
+                    self._validate_pending_record(prior)
+                elif prior.get("state") == "NOT_EXECUTED":
+                    self._validate_not_executed_record(prior)
+                else:
+                    self._block_writes("PERSISTED_WRITE_UNCONFIRMED")
+                unknown = conflict or prior.get("state") not in ("SUBMITTED_PENDING", "NOT_EXECUTED")
+                response = self._response(request, "client_order_id was already claimed; inspect the original request",
+                    "ASYNC_CLIENT_ORDER_ID_CONFLICT" if conflict else "ASYNC_CLIENT_ORDER_ID_ALREADY_CLAIMED",
+                    unknown=unknown)
+                response["data"] = dict(client_order_id=record["client_order_id"], original_request_id=prior_rid,
+                                        native_write_executed=False, automatic_retry=False)
+                return None, response
             if claimed[0] == -1:
                 self._block_writes("WRITE_LEDGER_CAPACITY_EXHAUSTED")
                 raise ShmProtocolError("persistent write capacity exhausted; records must not be evicted")
@@ -507,6 +685,12 @@ class RedisShmReadOnlyProxy:
                     or prior.get("fingerprint") != fingerprint or prior.get("binding") != record["binding"]):
                 raise ShmProtocolError("persisted write RID has conflicting parameters or source binding")
             replay = prior.get("reconciled_response") if prior.get("state") == "RECONCILED" else prior.get("response")
+            if prior.get("state") == "SUBMITTED_PENDING":
+                self._validate_pending_record(prior)
+                return None, copy.deepcopy(replay)
+            if prior.get("state") == "NOT_EXECUTED":
+                self._validate_not_executed_record(prior)
+                return None, copy.deepcopy(replay)
             if prior.get("state") in ("CONFIRMED", "RECONCILED") and isinstance(replay, dict):
                 self._check_response(request, replay, self._sessions["execution"])
                 return None, copy.deepcopy(replay)
@@ -923,6 +1107,8 @@ class RedisShmReadOnlyProxy:
                     # 期限只控制原生执行，不刷新 handled_at 或重新查询 QMT。
                     prior_fp, prior = self._replays[rid]
                     if prior_fp != fingerprint:
+                        if request["method"] in ASYNC_WRITE_METHODS:
+                            self._block_writes("ASYNC_IDENTITY_CONFLICT")
                         raise ShmProtocolError("request_id semantic conflict")
                     try:
                         self._operation_phase = "SHM_IDENTITY_CHECK"
@@ -935,7 +1121,7 @@ class RedisShmReadOnlyProxy:
                         response = self._response(request, exc, "SHM_IDENTITY_CHANGED", unknown=True)
                         self._seal("SHM_IDENTITY_CHANGED")
                 else:
-                    is_write = request["method"] in WRITE_METHODS
+                    is_write = request["method"] in ALL_WRITE_METHODS
                     self._operation_phase = "WRITE_GATE_CHECK" if is_write else "REQUEST_VALIDATE"
                     if (is_write and self._writes_blocked
                             and self.transport.redis.hget(self._write_ledger_key, rid) is None):
@@ -993,6 +1179,15 @@ class RedisShmReadOnlyProxy:
                         if time.time() >= deadline:
                             raise ShmProtocolError("SHM response arrived after deadline")
                         data = response.get("data")
+                        if request["method"] in ASYNC_WRITE_METHODS and prior_write is None:
+                            if response.get("ok") is not True:
+                                raise ShmProtocolError("async native execution lacks an explicit call-return or no-write receipt")
+                            if isinstance(data, dict) and data.get("status") == "BLOCKED":
+                                self._validate_async_not_executed(request, response)
+                            elif not (isinstance(data, dict) and data.get("status") == "UNKNOWN"):
+                                self._validate_async_receipt(request, response)
+                        if is_write and isinstance(data, dict) and data.get("writes_blocked") is True:
+                            self._block_writes("NATIVE_WRITE_RESULT_UNKNOWN")
                         # 登录回调尚未观测是已确认的业务未知，不能当作 SHM
                         # 请求结果未知；仅接受当前原生账户/会话的明确回读。
                         login_state_unknown = (
@@ -1015,7 +1210,12 @@ class RedisShmReadOnlyProxy:
                                 self._seal("SHM_RESULT_UNKNOWN")
                         if request["method"] == "ping" and response["ok"]:
                             self._validate_identity_data("execution", response["data"])
+                            if (ASYNC_WRITE_METHODS <= self._capabilities
+                                    and not ASYNC_WRITE_METHODS <= set(response["data"]["capabilities"])):
+                                self._block_writes("NATIVE_ASYNC_CAPABILITY_CHANGED")
                             self._source_identity["execution"] = copy.deepcopy(response["data"])
+                            if response["data"].get("writes_blocked") is True:
+                                self._block_writes("NATIVE_WRITE_RESULT_UNKNOWN")
                             response["data"] = self.identity_snapshot()
                         if request["method"] == "get_asset" and response["ok"]:
                             wrapped = response.get("data")
@@ -1040,12 +1240,19 @@ class RedisShmReadOnlyProxy:
                             self._record_error(exc)
                             response = self._response(request, exc, "WRITE_LEDGER_SETTLEMENT_UNCONFIRMED", unknown=True)
                             self._seal("WRITE_LEDGER_SETTLEMENT_UNCONFIRMED")
-                    self._replays[rid] = (fingerprint, copy.deepcopy(response))
+                    duplicate_cid = (is_write and reservation is None and isinstance(response.get("data"), dict)
+                                     and "original_request_id" in response["data"])
+                    if not duplicate_cid:
+                        self._replays[rid] = (fingerprint, copy.deepcopy(response))
                     self._processed_count += 1
                     if (not is_write and response.get("status") != "UNKNOWN"):
                         self._read_expiries[rid] = deadline
             except (ShmProtocolError, ValueError, TypeError) as exc:
-                response = self._response(request, exc, "PROXY_REQUEST_REJECTED")
+                response = self._response(request, exc, "PROXY_REQUEST_REJECTED",
+                    unknown=request.get("method") in ASYNC_WRITE_METHODS
+                    and self._write_block_reason == "ASYNC_IDENTITY_CONFLICT")
+            if request["method"] in ASYNC_WRITE_METHODS and response.get("status") == "UNKNOWN":
+                self._block_writes("NATIVE_WRITE_RESULT_UNKNOWN")
             binding = self._source_binding()
             if binding is not None:
                 response["source_binding"] = binding
@@ -1058,9 +1265,15 @@ class RedisShmReadOnlyProxy:
                     # 先持久留下发布待确认，再 fanout，全部完成才晋级；
                     # 即使最后一次 Redis 写失联，重启也不能解除停写门。
                     self._operation_phase = "WRITE_LEDGER_CONFIRM"
-                    write_settlement = self._settle_write(request, write_settlement, response, "CONFIRMED")
+                    state = ("SUBMITTED_PENDING" if request["method"] in ASYNC_WRITE_METHODS
+                             and isinstance(response.get("data"), dict)
+                             and response["data"].get("status") == "PENDING_CONFIRMATION" else
+                             "NOT_EXECUTED" if request["method"] in ASYNC_WRITE_METHODS else "CONFIRMED")
+                    write_settlement = self._settle_write(request, write_settlement, response, state)
             except Exception as exc:
                 self._record_error(exc)
+                if request["method"] in ASYNC_WRITE_METHODS:
+                    self._block_writes("REDIS_RESPONSE_PUBLISH_FAILED")
                 if (not self.stopped and self.receive_policy == "QUEUE_ONLY"
                         and self.runtime_policy != "BOUNDED" and request["method"] in PURE_READ_METHODS
                         and isinstance(exc, (RedisConnectionError, RedisTimeoutError))):

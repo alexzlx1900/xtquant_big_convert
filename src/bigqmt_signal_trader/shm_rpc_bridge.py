@@ -8,17 +8,20 @@ import threading
 import time
 from collections import deque
 
-from .exec_events import normalize_order_event, normalize_trade_event, normalize_order_error_event, normalize_cancel_error_event
+from .code_utils import normalize_stock_code
+from .exec_events import _attr as _event_attr, normalize_order_event, normalize_trade_event, normalize_order_error_event, normalize_cancel_error_event
 from .redis_rpc import to_jsonable
 from .transports.readonly_shm import ReadOnlyMailbox, ShmProtocolError, encode_payload, ShmCapacityError
-from .transports.shm_rpc import READ_METHODS, WRITE_METHODS
+from .transports.shm_rpc import (ALL_WRITE_METHODS, ASYNC_SUBMIT_CONTRACT, ASYNC_WRITE_METHODS,
+                                 READ_METHODS, WRITE_METHODS, validate_async_submit_params)
 
 
 class ShmRpcBridge:
     def __init__(self, *, name, account_id, handlers, allow_order_methods=False,
                  region=None, event_capacity=64, replay_capacity=1024, trade_login_reader=None,
                  persistent_readonly=False, persistent_simulation_read_write=False,
-                 environment="SIM", persistent_live_read_write=False):
+                 environment="SIM", persistent_live_read_write=False,
+                 async_pending_capacity=64, async_confirmation_timeout_seconds=30):
         if not isinstance(account_id, str) or not account_id or handlers.account_id != account_id:
             raise ValueError("handler fixed account mismatch")
         if type(allow_order_methods) is not bool or handlers.allow_order_methods is not allow_order_methods:
@@ -40,6 +43,12 @@ class ShmRpcBridge:
             raise ValueError("persistent LIVE policy requires LIVE environment")
         if type(event_capacity) is not int or not 1 <= event_capacity <= 128 or type(replay_capacity) is not int or not 1 <= replay_capacity <= 10000:
             raise ValueError("bounded capacities required")
+        if type(async_pending_capacity) is not int or not 1 <= async_pending_capacity <= 128:
+            raise ValueError("async pending capacity must be within [1,128]")
+        if (type(async_confirmation_timeout_seconds) not in (int, float)
+                or not math.isfinite(async_confirmation_timeout_seconds)
+                or not 0 < async_confirmation_timeout_seconds <= 300):
+            raise ValueError("async confirmation timeout must be within (0,300]")
         if getattr(handlers, "settle_orders_inline", False):
             raise ValueError("inline blocking settlement is unsupported")
         self.account_id, self.handlers = account_id, handlers
@@ -49,12 +58,17 @@ class ShmRpcBridge:
         self._thread = threading.get_ident()
         self._events, self._event_sequence = deque(maxlen=event_capacity), 0
         self._lost_sequence = 0
+        self._event_observed_cursor = 0
         self._replays, self._replay_capacity = {}, replay_capacity
         self.persistent_readonly = persistent_readonly
         self.persistent_simulation_read_write = persistent_simulation_read_write
         self.persistent_live_read_write = persistent_live_read_write
         self.persistent = persistent_readonly or persistent_simulation_read_write or persistent_live_read_write
         self.runtime_metadata = {}
+        self._async_pending, self._async_claims, self._async_contract_claims = {}, {}, {}
+        self._async_pending_capacity = async_pending_capacity
+        self._async_confirmation_timeout_seconds = async_confirmation_timeout_seconds
+        self._async_write_block_reason = ""
         self._read_replay_expiries = {}
         self._pending = None
         self.mailbox = ReadOnlyMailbox(name, create=True, region=region)
@@ -71,6 +85,157 @@ class ShmRpcBridge:
     def _callback_thread(self):
         if threading.get_ident() != self._thread:
             raise ShmProtocolError("QMT callback thread required")
+
+    def _async_data(self, request, status, *, native_write_executed=False, error=""):
+        params = request.get("params") or {}
+        data = dict(status=status, request_id=request.get("request_id"),
+                    client_order_id=params.get("client_order_id"), account_id=self.account_id,
+                    environment=self.environment, session_id=self.mailbox.session_id,
+                    native_pid=self.mailbox.server_pid,
+                    windows_session_id=self.runtime_metadata.get("windows_session_id"),
+                    async_submit_contract=ASYNC_SUBMIT_CONTRACT, native_write_executed=native_write_executed,
+                    broker_accepted=False, qmt_async_seq=None, order_sys_id="", automatic_retry=False,
+                    writes_blocked=bool(self._async_write_block_reason),
+                    write_block_reason=self._async_write_block_reason, error=str(error or ""),
+                    source_evidence={"account_id": self.account_id})
+        if status == "PENDING_CONFIRMATION":
+            data["receipt_type"] = "NATIVE_CALL_RETURNED"
+        return self._attach_source_identity(data)
+
+    def _block_async_writes(self, reason, record=None):
+        if not self._async_write_block_reason:
+            self._async_write_block_reason = reason
+        records = list(self._async_pending.values()) if record is None else [record]
+        for pending in records:
+            if pending["state"] == "CONFIRMED":
+                continue
+            pending["state"], pending["error"] = "UNKNOWN", reason
+            data = pending.get("response_data")
+            if data is not None:
+                data.clear()
+                data.update(self._async_data(pending["request"], "UNKNOWN",
+                    native_write_executed=pending["native_write_executed"], error=reason))
+
+    def _refresh_async_pending(self):
+        now = time.monotonic()
+        for pending in list(self._async_pending.values()):
+            if pending["state"] != "UNKNOWN" and now >= pending["deadline"]:
+                self._block_async_writes("ASYNC_CONFIRMATION_DEADLINE; outcome=UNKNOWN", pending)
+
+    def _async_order_facts(self, params):
+        action = self.handlers._order_action_from_params(params)
+        if action not in ("BUY", "SELL"):
+            raise ShmProtocolError("async order action must be BUY or SELL")
+        stock_code = normalize_stock_code(str(params.get("stock_code") or ""))
+        if not stock_code:
+            raise ShmProtocolError("explicit async order stock_code required")
+        volume = params.get("volume") or params.get("order_volume") or 0
+        price = params.get("price")
+        price = 0 if price in (None, "") else price
+        if (isinstance(volume, bool) or isinstance(price, bool) or int(volume) <= 0
+                or float(volume) != int(volume) or not math.isfinite(float(price)) or float(price) < 0):
+            raise ShmProtocolError("explicit valid async order quantity and price required")
+        return dict(stock_code=stock_code, action=action, volume=int(volume), price=float(price))
+
+    def _submit_async(self, request, fingerprint):
+        params, rid = request["params"], request["request_id"]
+        cid = validate_async_submit_params(params)
+        if type(self.runtime_metadata.get("windows_session_id")) is not int or self.runtime_metadata["windows_session_id"] < 0:
+            return self._async_data(request, "BLOCKED", error="ASYNC_WINDOWS_SESSION_UNVERIFIED")
+        prior = self._async_claims.get(cid)
+        if prior is not None:
+            if prior["fingerprint"] != fingerprint:
+                self._block_async_writes("ASYNC_IDENTITY_CONFLICT; outcome=UNKNOWN", prior)
+                return self._async_data(request, "UNKNOWN", error=self._async_write_block_reason)
+            return self._async_data(request, "BLOCKED", error="CLIENT_ORDER_ID_ALREADY_CLAIMED")
+        if len(self._async_pending) >= self._async_pending_capacity:
+            return self._async_data(request, "BLOCKED", error="ASYNC_PENDING_CAPACITY_EXHAUSTED")
+        try:
+            facts = self._async_order_facts(params)
+            business_params = dict(params, account_id=self.account_id, remark=cid, wait_settlement=False)
+            business_params.setdefault("signal_id", rid)
+            validate = getattr(self.handlers.order_gateway, "validate_submit_params", None)
+            if callable(validate):
+                validate(business_params)
+        except (ValueError, TypeError, OverflowError, ShmProtocolError) as exc:
+            return self._async_data(request, "BLOCKED", error=str(exc))
+        pending = dict(request=request, request_id=rid, client_order_id=cid, fingerprint=fingerprint,
+                       facts=facts, deadline=time.monotonic() + self._async_confirmation_timeout_seconds,
+                       state="NATIVE_CALL_IN_PROGRESS", native_write_executed=None, error="")
+        # passorder可能在返回前同步触发回调，必须先登记完整归属。
+        self._async_claims[cid] = self._async_pending[cid] = pending
+        try:
+            result = to_jsonable(self.handlers.handle("submit_order", business_params))
+            if (not isinstance(result, dict) or result.get("status") != "SUBMITTED"
+                    or result.get("user_order_id") != cid or result.get("confirmation_error")
+                    or result.get("error") or result.get("server_error")
+                    or result.get("explicit_failure") is True or result.get("success") is False):
+                raise ShmProtocolError("native async submit result identity/outcome unconfirmed")
+            pending["native_write_executed"] = True
+            if pending["state"] == "NATIVE_CALL_IN_PROGRESS":
+                pending["state"] = "PENDING_CONFIRMATION"
+            self._refresh_async_pending()
+            if self._async_write_block_reason and pending["state"] != "CONFIRMED":
+                self._block_async_writes(self._async_write_block_reason, pending)
+            status = "UNKNOWN" if pending["state"] == "UNKNOWN" else "PENDING_CONFIRMATION"
+            data = self._async_data(request, status, native_write_executed=True, error=pending["error"])
+        except Exception as exc:
+            error = "NATIVE_ASYNC_CALL_UNCONFIRMED:%s; outcome=UNKNOWN" % exc.__class__.__name__
+            self._block_async_writes(error, pending)
+            data = self._async_data(request, "UNKNOWN", native_write_executed=pending["native_write_executed"], error=error)
+        pending["response_data"] = data
+        return data
+
+    def _confirm_async_event(self, event_type, native_object, event):
+        self._refresh_async_pending()
+        if event_type not in ("order", "trade"):
+            return
+        cid = _event_attr(native_object, ("m_strRemark", "client_order_id", "user_order_id", "order_remark", "remark"))
+        if not isinstance(cid, str):
+            return
+        pending = self._async_claims.get(cid)
+        if pending is None or pending["state"] == "UNKNOWN":
+            return
+        account = _event_attr(native_object, ("m_strAccountID", "account_id"))
+        quantity_fields = (("m_nVolumeTotalOriginal", "order_volume", "volume") if event_type == "order"
+                           else ("m_nVolume", "volume", "traded_volume"))
+        quantity = _event_attr(native_object, quantity_fields)
+        price = event.get("price")
+        if (account is None or not event.get("stock_code") or not event.get("action")
+                or quantity is None or price is None or not event.get("order_sys_id")):
+            return
+        try:
+            facts = pending["facts"]
+            matches = (account == self.account_id and event["stock_code"] == facts["stock_code"]
+                       and event["action"] == facts["action"] and not isinstance(quantity, bool)
+                       and not isinstance(price, bool) and math.isfinite(float(quantity))
+                       and float(quantity).is_integer() and math.isfinite(float(price)))
+            if event_type == "trade":
+                # 成交量/价是实际执行事实，部分成交及价格改善不等于委托身份冲突。
+                matches = matches and 0 < float(quantity) <= facts["volume"] and float(price) > 0
+            else:
+                matches = matches and float(quantity) == facts["volume"] and float(price) == facts["price"]
+        except (TypeError, ValueError, OverflowError):
+            matches = False
+        if not matches:
+            self._block_async_writes("ASYNC_CALLBACK_IDENTITY_CONFLICT; outcome=UNKNOWN", pending)
+            return
+        contract = event["order_sys_id"]
+        if pending["state"] == "CONFIRMED" and contract != pending["order_sys_id"]:
+            pending["conflicting_order_sys_id"] = contract
+            self._block_async_writes("ASYNC_CONTRACT_CONFLICT; outcome=UNKNOWN", pending)
+            return
+        owner = self._async_contract_claims.get(contract)
+        if owner is not None and owner != cid:
+            pending["conflicting_order_sys_id"] = contract
+            self._block_async_writes("ASYNC_CONTRACT_OWNERSHIP_CONFLICT; outcome=UNKNOWN", pending)
+            return
+        pending["state"], pending["native_write_executed"] = "CONFIRMED", True
+        pending["order_sys_id"] = contract
+        self._async_contract_claims[contract] = cid
+        self._async_pending.pop(cid, None)
+        event["client_order_id"], event["request_id"] = cid, pending["request_id"]
+        event["async_submit_contract"] = ASYNC_SUBMIT_CONTRACT
 
     def record_execution_event(self, event_type, native_object):
         self._callback_thread()
@@ -98,11 +263,17 @@ class ShmRpcBridge:
             if type(value) in (str, int):
                 event[target] = value
         event["identity_status"] = "KNOWN" if event.get("order_sys_id") else "UNKNOWN"
+        if (self._async_claims and self._events and len(self._events) == self._events.maxlen
+                and self._events[0]["sequence"] > self._event_observed_cursor):
+            self._block_async_writes("ASYNC_EXECUTION_EVENT_GAP; outcome=UNKNOWN")
+        self._confirm_async_event(event_type, native_object, event)
         self._event_sequence += 1
         try:
             encode_payload(event, 1536)
         except (ShmCapacityError, ValueError, TypeError):
             self._lost_sequence = self._event_sequence
+            if self._async_claims:
+                self._block_async_writes("ASYNC_EXECUTION_EVENT_LOSS; outcome=UNKNOWN")
             event = dict(event_type=event_type, account_id=self.account_id,
                          identity_status="UNKNOWN", order_sys_id="", data_loss=True,
                          error="EXECUTION_EVENT_TOO_LARGE_OR_INVALID")
@@ -115,10 +286,15 @@ class ShmRpcBridge:
         if type(after) is not int or not 0 <= after <= self._event_sequence:
             raise ShmProtocolError("event cursor is invalid for this session")
         oldest = self._events[0]["sequence"] if self._events else self._event_sequence + 1
+        gap = after < oldest - 1 or after < self._lost_sequence
+        self._event_observed_cursor = max(self._event_observed_cursor, after)
+        if gap and self._async_claims:
+            self._block_async_writes("ASYNC_EXECUTION_EVENT_GAP; outcome=UNKNOWN")
         return dict(events=[dict(e) for e in self._events if e["sequence"] > after],
                     session_id=self.mailbox.session_id, native_pid=self.mailbox.server_pid,
+                    windows_session_id=self.runtime_metadata.get("windows_session_id"), environment=self.environment,
                     account_id=self.account_id, latest_sequence=self._event_sequence,
-                    oldest_sequence=oldest, gap=after < oldest - 1 or after < self._lost_sequence,
+                    oldest_sequence=oldest, gap=gap,
                     dropped_before_sequence=oldest - 1, lost_sequence=self._lost_sequence, automatic_retry=False)
 
     def _response(self, sequence, request):
@@ -257,6 +433,11 @@ class ShmRpcBridge:
 
     def _finish(self, sequence, request, response, fingerprint):
         self._replays[request["request_id"]] = (fingerprint, dict(response))
+        if request["method"] in ASYNC_WRITE_METHODS:
+            record = self._async_claims.get(request["params"].get("client_order_id"))
+            if record is not None and record["request_id"] == request["request_id"]:
+                # to_jsonable会复制字典；让未知转移更新实际缓存/待发布的响应。
+                record["response_data"] = response["data"]
         if self.persistent and request["method"] in READ_METHODS:
             self._read_replay_expiries[request["request_id"]] = (request["read_expires_at_unix"], sequence)
         # 即使发布互斥暂忙也缓存响应，下一 callback 仅重发响应不执行业务。
@@ -314,6 +495,7 @@ class ShmRpcBridge:
 
     def poll_once(self):
         self._callback_thread()
+        self._refresh_async_pending()
         self._expire_confirmed_read_replays()
         if self._pending is not None:
             sequence, request, response, fingerprint, settlement = self._pending
@@ -362,20 +544,29 @@ class ShmRpcBridge:
                 nested = nested.get("account_id", nested.get("accountID", nested.get("id")))
             if params.get("account_id", self.account_id) != self.account_id or nested != self.account_id:
                 raise ShmProtocolError("nested account mismatch")
-            if method not in READ_METHODS | WRITE_METHODS:
+            if method not in READ_METHODS | ALL_WRITE_METHODS:
                 raise ShmProtocolError("method not allowed")
             if self.handlers.account_id != self.account_id or self.handlers.allow_order_methods is not self.allow_order_methods:
                 raise ShmProtocolError("handler identity/permission changed")
-            if method in WRITE_METHODS and not self.allow_order_methods:
+            if method in ALL_WRITE_METHODS and not self.allow_order_methods:
                 raise PermissionError("orders disabled")
             expires = request.get("read_expires_at_unix")
             if self.persistent and (type(expires) not in (int, float) or expires != expires
                                             or expires <= time.time() or expires > time.time() + 60):
                 raise ShmProtocolError("request deadline expired/invalid; not executed")
+            if method in ASYNC_WRITE_METHODS:
+                validate_async_submit_params(params)
             fingerprint = json.dumps([method, params, self.account_id], sort_keys=True, allow_nan=False)
             if rid in self._replays:
                 prior_fp, prior = self._replays[rid]
                 if prior_fp != fingerprint:
+                    if method in ASYNC_WRITE_METHODS or prior.get("method") in ASYNC_WRITE_METHODS:
+                        self._block_async_writes("ASYNC_IDENTITY_CONFLICT; outcome=UNKNOWN")
+                        if method in ASYNC_WRITE_METHODS:
+                            response.update(ok=True, data=self._async_data(request, "UNKNOWN", error=self._async_write_block_reason))
+                            # 冲突请求不能覆盖原RID的历史收据或指纹。
+                            self._pending = (sequence, request, response, fingerprint, None)
+                            return self.poll_once()
                     raise ShmProtocolError("request_id conflict")
                 if self.persistent and method in READ_METHODS:
                     original_expires = self._read_replay_expiries[rid][0]
@@ -394,44 +585,68 @@ class ShmRpcBridge:
             if method == "ping":
                 result = dict(pong=True, transport="shm_rpc", account_id=self.account_id, environment=self.environment,
                               allow_order_methods=self.allow_order_methods, session_id=self.mailbox.session_id,
-                              native_pid=self.mailbox.server_pid, capabilities=sorted(READ_METHODS | (WRITE_METHODS if self.allow_order_methods else frozenset())))
+                              native_pid=self.mailbox.server_pid, capabilities=sorted(READ_METHODS | (ALL_WRITE_METHODS if self.allow_order_methods else frozenset())))
                 result.update(self.runtime_metadata)
+                result.update(async_submit_contract=ASYNC_SUBMIT_CONTRACT,
+                              writes_blocked=bool(self._async_write_block_reason),
+                              write_block_reason=self._async_write_block_reason,
+                              async_pending_count=len(self._async_pending),
+                              async_unknown_count=sum(row["state"] == "UNKNOWN" for row in self._async_pending.values()))
             elif method == "poll_execution_events":
                 result = self._poll_events(params)
             elif method == "get_trade_login_state":
                 diagnostic = getattr(self, "trade_login_diagnostic_reader", None)
                 result = diagnostic() if callable(diagnostic) else self._trade_login()
             else:
-                if method in WRITE_METHODS:
-                    login = self._trade_login()
-                    if login.get("status") != "LOGGED_IN":
-                        response.update(ok=True, data=dict(status="BLOCKED", automatic_retry=False,
-                            native_write_executed=False, order_sys_id="", result=None,
-                            error=login.get("reason") or "TRADE_LOGIN_NOT_CONFIRMED", trade_login_state=login))
+                if method in ALL_WRITE_METHODS:
+                    if self._async_write_block_reason:
+                        data = (self._async_data(request, "UNKNOWN", error=self._async_write_block_reason)
+                                if method in ASYNC_WRITE_METHODS else
+                                dict(status="UNKNOWN", automatic_retry=False, native_write_executed=False,
+                                     order_sys_id="", result=None, writes_blocked=True,
+                                     write_block_reason=self._async_write_block_reason, error=self._async_write_block_reason))
+                        response.update(ok=True, data=data)
                         self._finish(sequence, request, response, fingerprint)
                         return self.poll_once()
-                business_params = dict(params)
-                business_params["account_id"] = self.account_id
-                if method == "submit_order":
-                    business_params.setdefault("signal_id", rid)
-                    business_params.setdefault("remark", "shm:%s" % rid)
-                    validate = getattr(self.handlers.order_gateway, "validate_submit_params", None)
-                    if callable(validate):
-                        validate(business_params)
-                result = self._read_with_evidence(method, business_params) if method in READ_METHODS else self.handlers.handle(method, business_params)
-                if method in WRITE_METHODS:
-                    settlement = self.handlers.take_pending_settlement()
-                    if (method == "cancel_order" and getattr(result, "confirmation_pending", False) is True
-                            and callable(getattr(self.handlers.order_gateway, "query_cancel_confirmation", None))):
-                        settlement = dict(result=result, error="", deadline=time.monotonic() + self.handlers.order_settle_timeout_seconds)
-                    response.update(ok=True, data=self._write_result(method, result))
-                    if settlement is not None:
-                        self._pending = (sequence, request, response, fingerprint, settlement)
+                    login = self._trade_login()
+                    if login.get("status") != "LOGGED_IN":
+                        error = login.get("reason") or "TRADE_LOGIN_NOT_CONFIRMED"
+                        data = (self._async_data(request, "BLOCKED", error=error) if method in ASYNC_WRITE_METHODS else
+                                dict(status="BLOCKED", automatic_retry=False, native_write_executed=False,
+                                     order_sys_id="", result=None, error=error))
+                        data["trade_login_state"] = login
+                        response.update(ok=True, data=data)
+                        self._finish(sequence, request, response, fingerprint)
                         return self.poll_once()
-                    result = response["data"]
+                if method in ASYNC_WRITE_METHODS:
+                    result = self._submit_async(request, fingerprint)
+                else:
+                    business_params = dict(params)
+                    business_params["account_id"] = self.account_id
+                    if method == "submit_order":
+                        business_params.setdefault("signal_id", rid)
+                        business_params.setdefault("remark", "shm:%s" % rid)
+                        validate = getattr(self.handlers.order_gateway, "validate_submit_params", None)
+                        if callable(validate):
+                            validate(business_params)
+                    result = self._read_with_evidence(method, business_params) if method in READ_METHODS else self.handlers.handle(method, business_params)
+                    if method in WRITE_METHODS:
+                        settlement = self.handlers.take_pending_settlement()
+                        if (method == "cancel_order" and getattr(result, "confirmation_pending", False) is True
+                                and callable(getattr(self.handlers.order_gateway, "query_cancel_confirmation", None))):
+                            settlement = dict(result=result, error="", deadline=time.monotonic() + self.handlers.order_settle_timeout_seconds)
+                        response.update(ok=True, data=self._write_result(method, result))
+                        if settlement is not None:
+                            self._pending = (sequence, request, response, fingerprint, settlement)
+                            return self.poll_once()
+                        result = response["data"]
             response.update(ok=True, data=self._attach_source_identity(to_jsonable(result)))
         except Exception as exc:
-            if validated and method in WRITE_METHODS:
+            if validated and method in ASYNC_WRITE_METHODS:
+                error = "ASYNC_BRIDGE_UNCONFIRMED:%s; outcome=UNKNOWN" % exc.__class__.__name__
+                self._block_async_writes(error)
+                response.update(ok=True, data=self._async_data(request, "UNKNOWN", native_write_executed=None, error=error))
+            elif validated and method in WRITE_METHODS:
                 response.update(ok=True, data=dict(status="UNKNOWN", automatic_retry=False, error=str(exc), result=None, order_sys_id=""))
             else:
                 response.update(error=str(exc), server_error=type(exc).__name__)

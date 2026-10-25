@@ -9,7 +9,20 @@ from .readonly_shm import ShmBusyError, ShmProtocolError, ShmReadOnlyClient, val
 
 
 WRITE_METHODS = frozenset(("submit_order", "cancel_order"))
+ASYNC_WRITE_METHODS = frozenset(("submit_order_async",))
+ALL_WRITE_METHODS = WRITE_METHODS | ASYNC_WRITE_METHODS
+ASYNC_SUBMIT_CONTRACT = "NATIVE_CALL_RETURNED_V1"
 READ_METHODS = frozenset(("ping", "get_asset", "get_positions", "query_orders", "query_trades", "query_execution_snapshot", "poll_execution_events", "get_trade_login_state"))
+
+
+def validate_async_submit_params(params):
+    client_order_id = params.get("client_order_id")
+    if (not isinstance(client_order_id, str) or not 1 <= len(client_order_id) <= 128
+            or any(ord(char) < 33 or ord(char) > 126 for char in client_order_id)):
+        raise ShmProtocolError("bounded explicit ASCII client_order_id required")
+    if any(field in params and params[field] != client_order_id for field in ("remark", "order_remark")):
+        raise ShmProtocolError("async native remark must equal client_order_id")
+    return client_order_id
 
 
 class ShmRpcError(RuntimeError):
@@ -43,6 +56,9 @@ class ShmRpcClient:
         self.allow_order_methods, self.timeout_seconds = allow_order_methods, timeout_seconds
         self._factory = client_factory or ShmReadOnlyClient
         self._client, self._identity = None, None
+        self._async_submit_enabled = False
+        self._async_windows_session_id = None
+        self._async_write_uncertain = False
         self._closed, self._uncertain = False, False
         self._lock = threading.Lock()
 
@@ -65,11 +81,20 @@ class ShmRpcClient:
             self.close()
             raise ShmProtocolError("bridge identity mismatch")
         self._identity = (expected_session_id, expected_native_pid)
+        capabilities = result.get("capabilities")
+        self._async_submit_enabled = (
+            isinstance(capabilities, list) and all(isinstance(value, str) for value in capabilities)
+            and "submit_order_async" in capabilities
+            and result.get("async_submit_contract") == ASYNC_SUBMIT_CONTRACT
+            and type(result.get("windows_session_id")) is int and result["windows_session_id"] >= 0)
+        self._async_windows_session_id = result.get("windows_session_id") if self._async_submit_enabled else None
+        if self._async_submit_enabled and result.get("writes_blocked") is True:
+            self._async_write_uncertain = True
         return result
 
     def call(self, method, params=None, *, account_id=None, timeout_seconds=None,
              use_formula=False, request_id=None):
-        if method not in READ_METHODS | WRITE_METHODS or use_formula is not False:
+        if method not in READ_METHODS | ALL_WRITE_METHODS or use_formula is not False:
             raise ShmProtocolError("unsupported SHM RPC method/routing")
         target = self.account_id if account_id is None else account_id
         values = dict(params or {})
@@ -78,8 +103,14 @@ class ShmRpcClient:
             account = account.get("account_id", account.get("accountID", account.get("id")))
         if target != self.account_id or values.get("account_id", self.account_id) != self.account_id or account != self.account_id:
             raise ShmProtocolError("fixed account mismatch")
-        if method in WRITE_METHODS and (not self.allow_order_methods or self._identity is None):
+        if method in ALL_WRITE_METHODS and (not self.allow_order_methods or self._identity is None):
             raise ShmProtocolError("write disabled or identity not verified")
+        if method in ALL_WRITE_METHODS and self._async_write_uncertain:
+            raise ShmProtocolError("async write outcome unconfirmed; no further writes")
+        if method in ASYNC_WRITE_METHODS:
+            validate_async_submit_params(values)
+            if not self._async_submit_enabled:
+                raise ShmProtocolError("verified native async submission contract required")
         if method == "poll_execution_events" and (type(values.get("after_sequence")) is not int or values["after_sequence"] < 0):
             raise ShmProtocolError("bounded nonnegative event cursor required")
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
@@ -100,7 +131,7 @@ class ShmRpcClient:
             try:
                 response = self._client.send_request(request, timeout_seconds=timeout)
             except Exception as exc:
-                if getattr(self._client, "poisoned", False) or (method in WRITE_METHODS and not isinstance(exc, (ShmBusyError, ValueError))):
+                if getattr(self._client, "poisoned", False) or (method in ALL_WRITE_METHODS and not isinstance(exc, (ShmBusyError, ValueError))):
                     self._uncertain = True
                     return dict(status="UNKNOWN", automatic_retry=False, request_id=rid, error=str(exc))
                 raise
@@ -109,7 +140,39 @@ class ShmRpcClient:
                 raise ShmProtocolError("response environment mismatch; outcome is unconfirmed")
             if not response["ok"]:
                 raise ShmRpcError(response)
-            return response["data"]
+            data = response["data"]
+            if method in ASYNC_WRITE_METHODS:
+                valid = (isinstance(data, dict) and data.get("async_submit_contract") == ASYNC_SUBMIT_CONTRACT
+                        and data.get("request_id") == rid and data.get("client_order_id") == values["client_order_id"]
+                        and data.get("account_id") == self.account_id and data.get("environment") == self.environment
+                        and data.get("session_id") == self._identity[0]
+                        and type(data.get("native_pid")) is int and data["native_pid"] == self._identity[1]
+                        and type(data.get("windows_session_id")) is int
+                        and data["windows_session_id"] == self._async_windows_session_id)
+                valid = (valid and data.get("broker_accepted") is False and "qmt_async_seq" in data
+                         and data["qmt_async_seq"] is None and data.get("order_sys_id") == ""
+                         and data.get("automatic_retry") is False and type(data.get("writes_blocked")) is bool
+                         and isinstance(data.get("write_block_reason"), str))
+                if valid:
+                    status = data.get("status")
+                    if status == "PENDING_CONFIRMATION":
+                        valid = (data.get("receipt_type") == "NATIVE_CALL_RETURNED"
+                                 and data.get("native_write_executed") is True
+                                 and bool(data["write_block_reason"]) is data["writes_blocked"])
+                    elif status == "BLOCKED":
+                        valid = (data.get("native_write_executed") is False and data["writes_blocked"] is False
+                                 and data["write_block_reason"] == "" and data.get("receipt_type") is None)
+                    elif status == "UNKNOWN":
+                        valid = data["writes_blocked"] is True and bool(data["write_block_reason"])
+                    else:
+                        valid = False
+                if not valid:
+                    self._uncertain = True
+                    return dict(status="UNKNOWN", automatic_retry=False, request_id=rid,
+                                error="NATIVE_ASYNC_RECEIPT_UNCONFIRMED")
+                if data.get("status") == "UNKNOWN" or data["writes_blocked"]:
+                    self._async_write_uncertain = True
+            return data
         finally:
             self._lock.release()
 
