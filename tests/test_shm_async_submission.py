@@ -243,6 +243,97 @@ def test_pending_timeout_is_sticky_and_neither_new_request_nor_same_rid_resends(
     assert len(value.gateway.submits) == 1
 
 
+def test_complete_original_order_57_without_contract_is_terminal_rejection_and_releases_pending(harness):
+    value = harness(async_pending_capacity=1)
+    submit(value)
+    pending = value.bridge._async_claims["cid-a"]
+    value.bridge.record_execution_event("order", native_order(m_strOrderSysID="", m_nOrderStatus=57))
+    assert pending["state"] == "REJECTED" and not value.bridge._async_pending
+    pending["deadline"] = time.monotonic() - 1
+    assert ping(value)["writes_blocked"] is False
+    event = value.execute(lambda: value.client.poll_execution_events(0))["events"][0]["event"]
+    assert event["async_terminal_status"] == "REJECTED" and event["order_sys_id"] == ""
+    assert event["client_order_id"] == "cid-a" and event["request_id"] == "rid-a"
+    assert event["async_submit_contract"] == ASYNC_SUBMIT_CONTRACT
+    assert_pending(value, submit(value, "rid-b", "cid-b"), rid="rid-b", cid="cid-b")
+    assert len(value.gateway.submits) == 2
+
+
+@pytest.mark.parametrize("fields", [
+    ["m_strAccountID"], ["m_strInstrumentID"], ["m_strRemark"],
+    ["m_nOpType", "m_nOffsetFlag"], ["m_nVolumeTotalOriginal"], ["m_dLimitPrice"],
+])
+def test_incomplete_contractless_order_57_cannot_end_original_async_pending(harness, fields):
+    value = harness()
+    submit(value)
+    raw = native_order(m_strOrderSysID="", m_nOrderStatus=57, m_strStatusMsg="broker rejected")
+    for field in fields:
+        raw.pop(field)
+    value.bridge.record_execution_event("order", raw)
+    assert ping(value)["async_pending_count"] == 1
+    event = value.execute(lambda: value.client.poll_execution_events(0))["events"][0]["event"]
+    assert "async_terminal_status" not in event
+
+
+def test_error_text_alone_cannot_end_async_pending_and_later_conflicting_success_cannot_rewrite_rejected(harness):
+    value = harness()
+    submit(value)
+    value.bridge.record_execution_event("order_error", dict(m_strAccountID=SYNC.ACCOUNT,
+        m_strRemark="cid-a", m_strErrorMsg="rejected", m_nOrderStatus=57))
+    assert ping(value)["async_pending_count"] == 1
+    value.bridge.record_execution_event("order", native_order(m_strOrderSysID="", m_nOrderStatus=57))
+    assert value.bridge._async_claims["cid-a"]["state"] == "REJECTED"
+    value.bridge.record_execution_event("order", native_order(m_nOrderStatus=50))
+    assert value.bridge._async_claims["cid-a"]["state"] == "REJECTED"
+    assert ping(value)["writes_blocked"] is True
+
+
+def test_contractless_order_57_with_conflicting_business_facts_is_not_a_rejection_proof(harness):
+    value = harness()
+    submit(value)
+    value.bridge.record_execution_event("order", native_order(m_strOrderSysID="", m_nOrderStatus=57,
+        m_nVolumeTotalOriginal=200))
+    assert value.bridge._async_claims["cid-a"]["state"] == "UNKNOWN"
+    event = value.execute(lambda: value.client.poll_execution_events(0))["events"][0]["event"]
+    assert "async_terminal_status" not in event
+    assert ping(value)["writes_blocked"] is True
+
+
+def test_rejected_original_cid_cannot_change_its_preserved_contract(harness):
+    value = harness()
+    submit(value)
+    value.bridge.record_execution_event("order", native_order(m_strOrderSysID="contract-a", m_nOrderStatus=57))
+    value.bridge.record_execution_event("order", native_order(m_strOrderSysID="contract-b", m_nOrderStatus=57))
+    assert value.bridge._async_claims["cid-a"]["state"] == "REJECTED"
+    assert value.bridge._async_claims["cid-a"]["order_sys_id"] == "contract-a"
+    assert ping(value)["writes_blocked"] is True
+    events = value.execute(lambda: value.client.poll_execution_events(0))["events"]
+    assert "async_terminal_status" not in events[-1]["event"]
+
+
+def test_contractless_rejection_cannot_claim_another_cids_broker_contract(harness):
+    value = harness()
+    submit(value)
+    submit(value, "rid-b", "cid-b")
+    value.bridge.record_execution_event("order", native_order(m_strOrderSysID="", m_nOrderStatus=57))
+    value.bridge.record_execution_event("order", native_order("cid-b", m_strOrderSysID="contract-b", m_nOrderStatus=50))
+    value.bridge.record_execution_event("order", native_order(m_strOrderSysID="contract-b", m_nOrderStatus=57))
+    assert value.bridge._async_claims["cid-a"]["state"] == "REJECTED"
+    assert value.bridge._async_contract_claims["contract-b"] == "cid-b"
+    assert ping(value)["writes_blocked"] is True
+
+
+def test_complete_rejection_can_bind_its_first_unclaimed_late_contract_without_changing_terminal_state(harness):
+    value = harness()
+    submit(value)
+    value.bridge.record_execution_event("order", native_order(m_strOrderSysID="", m_nOrderStatus=57))
+    value.bridge.record_execution_event("order", native_order(m_strOrderSysID="contract-a", m_nOrderStatus=57))
+    assert value.bridge._async_claims["cid-a"]["state"] == "REJECTED"
+    assert value.bridge._async_claims["cid-a"]["order_sys_id"] == "contract-a"
+    assert value.bridge._async_contract_claims["contract-a"] == "cid-a"
+    assert ping(value)["writes_blocked"] is False
+
+
 def test_unconsumed_callback_gap_blocks_native_writes(harness):
     value = harness(event_capacity=1)
     submit(value)

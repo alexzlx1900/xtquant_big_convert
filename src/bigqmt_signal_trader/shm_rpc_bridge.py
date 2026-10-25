@@ -107,7 +107,7 @@ class ShmRpcBridge:
             self._async_write_block_reason = reason
         records = list(self._async_pending.values()) if record is None else [record]
         for pending in records:
-            if pending["state"] == "CONFIRMED":
+            if pending["state"] in ("CONFIRMED", "REJECTED"):
                 continue
             pending["state"], pending["error"] = "UNKNOWN", reason
             data = pending.get("response_data")
@@ -175,7 +175,7 @@ class ShmRpcBridge:
             if pending["state"] == "NATIVE_CALL_IN_PROGRESS":
                 pending["state"] = "PENDING_CONFIRMATION"
             self._refresh_async_pending()
-            if self._async_write_block_reason and pending["state"] != "CONFIRMED":
+            if self._async_write_block_reason and pending["state"] not in ("CONFIRMED", "REJECTED"):
                 self._block_async_writes(self._async_write_block_reason, pending)
             status = "UNKNOWN" if pending["state"] == "UNKNOWN" else "PENDING_CONFIRMATION"
             data = self._async_data(request, status, native_write_executed=True, error=pending["error"])
@@ -201,8 +201,9 @@ class ShmRpcBridge:
                            else ("m_nVolume", "volume", "traded_volume"))
         quantity = _event_attr(native_object, quantity_fields)
         price = event.get("price")
+        rejected = event_type == "order" and event.get("status") in (57, "57")
         if (account is None or not event.get("stock_code") or not event.get("action")
-                or quantity is None or price is None or not event.get("order_sys_id")):
+                or quantity is None or price is None or (not event.get("order_sys_id") and not rejected)):
             return
         try:
             facts = pending["facts"]
@@ -221,6 +222,35 @@ class ShmRpcBridge:
             self._block_async_writes("ASYNC_CALLBACK_IDENTITY_CONFLICT; outcome=UNKNOWN", pending)
             return
         contract = event["order_sys_id"]
+        if pending["state"] == "REJECTED":
+            if not rejected:
+                self._block_async_writes("ASYNC_REJECTED_CALLBACK_CONFLICT; outcome=UNKNOWN", pending)
+                return
+            if contract:
+                prior_contract = pending.get("order_sys_id")
+                owner = self._async_contract_claims.get(contract)
+                if prior_contract and prior_contract != contract:
+                    pending["conflicting_order_sys_id"] = contract
+                    self._block_async_writes("ASYNC_CONTRACT_CONFLICT; outcome=UNKNOWN", pending)
+                    return
+                if owner is not None and owner != cid:
+                    pending["conflicting_order_sys_id"] = contract
+                    self._block_async_writes("ASYNC_CONTRACT_OWNERSHIP_CONFLICT; outcome=UNKNOWN", pending)
+                    return
+                # 同一完整原单的首次迟到合同只补身份，拒单终态保持。
+                pending["order_sys_id"] = contract
+                self._async_contract_claims[contract] = cid
+            event.update(client_order_id=cid, request_id=pending["request_id"],
+                         async_submit_contract=ASYNC_SUBMIT_CONTRACT, async_terminal_status="REJECTED")
+            return
+        if rejected and not contract:
+            if pending["state"] == "CONFIRMED":
+                return
+            pending["state"], pending["native_write_executed"] = "REJECTED", True
+            self._async_pending.pop(cid, None)
+            event.update(client_order_id=cid, request_id=pending["request_id"],
+                         async_submit_contract=ASYNC_SUBMIT_CONTRACT, async_terminal_status="REJECTED")
+            return
         if pending["state"] == "CONFIRMED" and contract != pending["order_sys_id"]:
             pending["conflicting_order_sys_id"] = contract
             self._block_async_writes("ASYNC_CONTRACT_CONFLICT; outcome=UNKNOWN", pending)
@@ -230,12 +260,14 @@ class ShmRpcBridge:
             pending["conflicting_order_sys_id"] = contract
             self._block_async_writes("ASYNC_CONTRACT_OWNERSHIP_CONFLICT; outcome=UNKNOWN", pending)
             return
-        pending["state"], pending["native_write_executed"] = "CONFIRMED", True
+        pending["state"], pending["native_write_executed"] = "REJECTED" if rejected else "CONFIRMED", True
         pending["order_sys_id"] = contract
         self._async_contract_claims[contract] = cid
         self._async_pending.pop(cid, None)
         event["client_order_id"], event["request_id"] = cid, pending["request_id"]
         event["async_submit_contract"] = ASYNC_SUBMIT_CONTRACT
+        if rejected:
+            event["async_terminal_status"] = "REJECTED"
 
     def record_execution_event(self, event_type, native_object):
         self._callback_thread()
