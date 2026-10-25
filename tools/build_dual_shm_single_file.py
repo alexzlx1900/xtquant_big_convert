@@ -114,7 +114,7 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         raise ValueError("independent execution mailbox name required")
     if resident_identity and max(len(read_name), len(execution_name)) + 17 > len("Local\\AQP_SHM_") + 64:
         raise ValueError("resident mailbox base requires room for independent instance suffix")
-    symbol_limit = 128 if environment == "LIVE" else 64
+    symbol_limit = 1024 if environment == "LIVE" else 64
     if not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= symbol_limit or any(not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", code) for code in symbols) or len(set(symbols)) != len(symbols):
         raise ValueError("1-%d unique confirmed SH/SZ/BJ symbols required" % symbol_limit)
     read = _configure_source(READ_BUILDER.build_source(), {
@@ -314,6 +314,8 @@ def init(ContextInfo):
             account_callback_route="outer_to_execution", execution_bind_account_callbacks=False,
             max_seconds=DUAL_SHM_SETTINGS["max_seconds"], max_requests_per_source=DUAL_SHM_SETTINGS["max_requests_per_source"],
             market_rpc_enabled=read_server.market_enabled, read_capabilities=read_capabilities,
+            quote_allowed_symbol_count=len(read_server.quote_symbols),
+            quote_request_symbol_limit=read_server.quote_symbol_limit,
             execution_capabilities=execution_capabilities)
         if read_write:
             identity["async_submit_contract"] = rpc_transport.ASYNC_SUBMIT_CONTRACT

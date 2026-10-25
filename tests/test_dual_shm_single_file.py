@@ -1106,12 +1106,12 @@ def test_live_generated_reads_all_67_saved_position_symbols_in_existing_mailbox(
     h.close()
 
 
-@pytest.mark.parametrize("environment,count,allowed", [("SIM", 65, False), ("LIVE", 128, True), ("LIVE", 129, False)])
+@pytest.mark.parametrize("environment,count,allowed", [("SIM", 65, False), ("LIVE", 128, True), ("LIVE", 1025, False)])
 def test_generated_quote_symbol_capacity_is_live_specific(monkeypatch, environment, count, allowed):
     codes = ["%06d.SZ" % number for number in range(count)]
     values = live_settings(symbols=codes) if environment == "LIVE" else dict(symbols=codes)
     if not allowed:
-        with pytest.raises(ValueError, match="1-%d unique" % (128 if environment == "LIVE" else 64)):
+        with pytest.raises(ValueError, match="1-%d unique" % (1024 if environment == "LIVE" else 64)):
             BUILDER.build_source(**settings(**values))
         return
     h = Fixture(monkeypatch, **values)

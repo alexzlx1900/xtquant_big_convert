@@ -16,7 +16,7 @@ BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 BIGQMT_ENVIRONMENT = "SIM"
 READONLY_SHM_NAME = "Local\\AQP_SHM_READONLY_SIM"
 READONLY_SYMBOL = "000001.SZ"
-READONLY_SYMBOLS = None  # None 保留旧单股票配置；SIM最多64、显式LIVE最多128只。
+READONLY_SYMBOLS = None  # None 保留旧单股票配置；SIM允许名单最多64、显式LIVE最多1024只。
 READONLY_ENABLE_MARKET_RPC = False
 READONLY_MAX_REQUESTS = 180
 READONLY_MAX_SECONDS = 60
@@ -96,12 +96,13 @@ class ShmReadOnlyBridge:
             raise ValueError("configure the confirmed simulation account")
         symbols = [READONLY_SYMBOL] if READONLY_SYMBOLS is None else READONLY_SYMBOLS
         symbol_limit = 128 if BIGQMT_ENVIRONMENT == "LIVE" and READONLY_PERSISTENT_LIVE_READ_WRITE is True else 64
-        if (not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= symbol_limit
+        allowed_symbol_limit = 1024 if BIGQMT_ENVIRONMENT == "LIVE" and READONLY_PERSISTENT_LIVE_READ_WRITE is True else 64
+        if (not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= allowed_symbol_limit
                 or any(not isinstance(symbol, str) or len(symbol) != 9
                        or not all("0" <= char <= "9" for char in symbol[:6])
                        or symbol[6:] not in (".SH", ".SZ", ".BJ") for symbol in symbols)
                 or len(set(symbols)) != len(symbols)):
-            raise ValueError("configure 1-%d unique SH/SZ/BJ quote symbols" % symbol_limit)
+            raise ValueError("configure 1-%d unique SH/SZ/BJ quote symbols" % allowed_symbol_limit)
         if (type(READONLY_PERSISTENT_READONLY) is not bool or type(READONLY_PERSISTENT_MARKET_RPC) is not bool
                 or type(READONLY_PERSISTENT_LIVE_READ_WRITE) is not bool
                 or type(READONLY_ENABLE_MARKET_RPC) is not bool):
@@ -225,6 +226,8 @@ class ShmReadOnlyBridge:
                 self.seen_request_ids.add(request_id)
             if method == "ping":
                 data = {"pong": True, "account_id": self.account_id, "environment": self.environment, "allow_order_methods": False,
+                        "quote_allowed_symbol_count": len(self.quote_symbols),
+                        "quote_request_symbol_limit": self.quote_symbol_limit,
                         "rpc_revision": RPC_REVISION, "server_time": _dt.datetime.now(),
                         "transport": "shm_readonly",
                         "runtime_policy": "PERSISTENT_READONLY" if self.persistent_readonly else "BOUNDED_READONLY",
@@ -720,6 +723,8 @@ def init(ContextInfo):
     print("AQP_SHM_READONLY_READY " + json.dumps({
         "account_id": _SERVER.account_id, "environment": _SERVER.environment, "name": READONLY_SHM_NAME, "symbol": READONLY_SYMBOL,
         "symbols": list(_SERVER.quote_symbols),
+        "quote_allowed_symbol_count": len(_SERVER.quote_symbols),
+        "quote_request_symbol_limit": _SERVER.quote_symbol_limit,
         "session_id": _SERVER.mailbox.session_id, "native_pid": _SERVER.mailbox.server_pid,
         "windows_session_id": _SERVER.windows_session_id,
         "allow_order_methods": False,
