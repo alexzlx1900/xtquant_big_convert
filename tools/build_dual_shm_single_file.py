@@ -68,10 +68,11 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
                 or ntpath.normpath(native_executable) != native_executable):
             raise ValueError("resident identity requires explicit QMT executable absolute path")
         if environment == "SIM" and (
-                persistent_readonly is not True or persistent_simulation_read_write is not False
+                not ((persistent_readonly is True and persistent_simulation_read_write is False)
+                    or (persistent_readonly is False and persistent_simulation_read_write is True))
                 or enable_market_rpc is not False or runtime_launcher is not None
                 or ntpath.normcase(native_executable) != ntpath.normcase(SIM_NATIVE_EXECUTABLE)):
-            raise ValueError("SIM resident identity requires the fixed simulation executable and persistent readonly policy without launcher")
+            raise ValueError("SIM resident identity requires the fixed simulation executable and exclusive persistent policy without launcher")
     elif native_executable is not None:
         raise ValueError("native executable binding requires explicit native_pid=0 resident mode")
     if resident_identity and (not isinstance(source_identity_path, str) or not ntpath.isabs(source_identity_path)):
@@ -195,8 +196,10 @@ def _verify_identity():
                 or type(configured) is not int
                 or type(DUAL_SHM_SETTINGS["windows_session"]) is not int
                 or DUAL_SHM_SETTINGS["windows_session"] < 0
-                or DUAL_SHM_SETTINGS["persistent_readonly"] is not True
-                or DUAL_SHM_SETTINGS["persistent_simulation_read_write"] is not False
+                or not ((DUAL_SHM_SETTINGS["persistent_readonly"] is True
+                        and DUAL_SHM_SETTINGS["persistent_simulation_read_write"] is False)
+                    or (DUAL_SHM_SETTINGS["persistent_readonly"] is False
+                        and DUAL_SHM_SETTINGS["persistent_simulation_read_write"] is True))
                 or DUAL_SHM_SETTINGS["persistent_live_read_write"] is not False
                 or DUAL_SHM_SETTINGS["market_rpc_enabled"] is not False
                 or DUAL_SHM_SETTINGS["runtime_launcher"] is not None

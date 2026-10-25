@@ -238,7 +238,7 @@ def test_sim_resident_same_source_rebinds_actual_pid_and_publishes_new_private_i
     dict(native_executable=r"C:\国金证券QMT交易端\bin.x64\XtItClient.exe"),
     dict(native_executable=r"C:\Other-SIM\bin.x64\XtItClient.exe"),
     dict(persistent_readonly=False),
-    dict(persistent_readonly=False, persistent_simulation_read_write=True),
+    dict(persistent_simulation_read_write=True),
     dict(persistent_live_read_write=True),
     dict(enable_market_rpc=True),
     dict(runtime_launcher=dict(python=r"C:\Python\python.exe", script=r"C:\AQP\supervise_qmt_runtime.py", config=r"C:\AQP\runtime.json")),
@@ -290,6 +290,94 @@ def test_sim_resident_wrong_actual_executable_rejected_before_account_binding(mo
         h.start()
     assert h.context.accounts == [] and h.query_calls == []
     assert all(runtime["_SERVER"] is None for runtime in h.namespace["_RUNTIMES"].values())
+
+
+def test_sim_resident_rw_same_source_rebinds_pid_and_keeps_native_write_contract(monkeypatch, capsys):
+    identities, sources = [], []
+    for pid in (2988, 23572):
+        with mock.patch.object(os, "getpid", return_value=pid):
+            h = Fixture(monkeypatch, **sim_resident_settings(
+                persistent_readonly=False, persistent_simulation_read_write=True))
+            _, submit, cancel = _enable_fixture_simulation_orders(h)
+
+            def module_path(module, buffer, size):
+                buffer.value = BUILDER.SIM_NATIVE_EXECUTABLE
+                return len(buffer.value)
+
+            monkeypatch.setattr(ctypes.windll.kernel32, "GetModuleFileNameW", module_path, raising=False)
+            h.namespace["open"] = mock.mock_open()
+            replaced, launched = mock.Mock(), mock.Mock()
+            monkeypatch.setattr(os, "replace", replaced)
+            monkeypatch.setattr(subprocess, "Popen", launched)
+            h.start()
+            identity = json.loads(next(line.split(" ", 1)[1] for line in capsys.readouterr().out.splitlines()
+                if line.startswith("AQP_DUAL_SHM_READY ")))
+            assert identity["native_pid"] == pid and identity["windows_session"] == 1
+            assert identity["account_id"] == ACCOUNT and identity["environment"] == "SIM"
+            assert identity["runtime_policy"] == "PERSISTENT_SIMULATION_READ_WRITE"
+            assert identity["allow_order_methods"] is True and identity["market_rpc_enabled"] is False
+            assert identity["account_bound_once"] is True and identity["account_callback_route"] == "outer_to_execution"
+            assert identity["execution_bind_account_callbacks"] is False
+            assert {"submit_order", "submit_order_async", "cancel_order"} <= set(identity["execution_capabilities"])
+            assert identity["async_submit_contract"] == "NATIVE_CALL_RETURNED_V1"
+            assert identity["read_name"].startswith(h.settings["read_name"] + "_")
+            assert identity["execution_name"].startswith(h.settings["execution_name"] + "_")
+            path = h.settings["source_identity_path"]
+            replaced.assert_called_once_with(path + ".new", path)
+            launched.assert_not_called()
+            assert h.context.accounts == [ACCOUNT]
+            read_ping, execution_ping = h.call("read", "ping")["data"], h.call("execution", "ping")["data"]
+            assert read_ping["allow_order_methods"] is False and execution_ping["allow_order_methods"] is True
+            assert execution_ping["native_pid"] == pid
+            assert execution_ping["session_id"] == identity["execution_session_id"]
+            for method in ("submit_order", "submit_order_async", "cancel_order"):
+                assert h.call("read", method)["ok"] is False
+            params = dict(stock_code=CODE, action="BUY", volume=100, price=10.5, remark="resident-sim-order")
+            blocked = h.call("execution", "submit_order", params)
+            assert blocked["data"]["status"] == "BLOCKED"
+            submit.assert_not_called()
+            _fixture_native_login(h)
+            submitted = h.call("execution", "submit_order", params, request_id="resident-sim-submit")
+            assert submitted["data"]["status"] == "CONFIRMED"
+            assert h.call("execution", "submit_order", params, request_id="resident-sim-submit")["data"] == submitted["data"]
+            assert h.call("execution", "submit_order", dict(params, volume=200), request_id="resident-sim-submit")["ok"] is False
+            assert submit.call_count == 1
+            h.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge.handlers.order_settle_timeout_seconds = 0.005
+            refs = dict(order_sys_id="SIM-FIXTURE-001", user_order_id="resident-sim-order")
+            cancelled = h.call("execution", "cancel_order", refs, request_id="resident-sim-cancel")
+            assert cancelled["data"]["status"] == "UNKNOWN" and cancelled["data"]["automatic_retry"] is False
+            assert h.call("execution", "cancel_order", refs, request_id="resident-sim-cancel")["data"] == cancelled["data"]
+            cancel.assert_called_once_with("SIM-FIXTURE-001", ACCOUNT, "STOCK", h.context)
+            sources.append(h.source)
+            identities.append(identity)
+            h.close()
+    assert sources[0] == sources[1]
+    assert len({value[field] for value in identities for field in ("read_session_id", "execution_session_id")}) == 4
+
+
+@pytest.mark.parametrize("field,value", [
+    ("account_id", "8882152350"), ("environment", "LIVE"),
+    ("persistent_readonly", True), ("persistent_simulation_read_write", False),
+    ("persistent_simulation_read_write", 1), ("persistent_live_read_write", True),
+    ("market_rpc_enabled", True), ("runtime_launcher", {}),
+    ("native_executable", r"C:\国金证券QMT交易端\bin.x64\XtItClient.exe"),
+    ("source_identity_path", "source.json"), ("windows_session", 2),
+])
+def test_sim_resident_rw_rejects_changed_identity_before_native_calls(monkeypatch, field, value):
+    h = Fixture(monkeypatch, **sim_resident_settings(
+        persistent_readonly=False, persistent_simulation_read_write=True))
+
+    def module_path(module, buffer, size):
+        buffer.value = BUILDER.SIM_NATIVE_EXECUTABLE
+        return len(buffer.value)
+
+    monkeypatch.setattr(ctypes.windll.kernel32, "GetModuleFileNameW", module_path, raising=False)
+    h.namespace["DUAL_SHM_SETTINGS"][field] = value
+    with pytest.raises(RuntimeError):
+        h.start()
+    assert h.context.accounts == [] and h.query_calls == []
+    assert all(runtime["_SERVER"] is None for runtime in h.namespace["_RUNTIMES"].values())
+    h.writes.assert_not_called()
 
 
 class Fixture:
