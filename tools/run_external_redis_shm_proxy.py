@@ -272,7 +272,8 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
 
 def validate_reconciliation_plan(value, *, apply=False):
     """只接受数据文件；原 UNKNOWN 原文由预览返回，禁止猜测或自动补写。"""
-    allowed = {"request_id", "order_sys_id", "order_identity", "expected_record", "operator", "stopped_proxy_pid"}
+    allowed = {"request_id", "order_sys_id", "order_identity", "expected_record", "operator", "stopped_proxy_pid",
+               "reason", "source_transition"}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("an exact single-RID reconciliation JSON plan is required")
     RedisShmReadOnlyProxy._request_id(value)
@@ -291,6 +292,16 @@ def validate_reconciliation_plan(value, *, apply=False):
                   or not isinstance(value.get("operator"), str) or not value["operator"].strip()
                   or len(value["operator"]) > 128):
         raise ValueError("apply requires the exact previewed record and an explicit operator")
+    if "reason" in value and (not isinstance(value["reason"], str) or not value["reason"].strip()
+                              or len(value["reason"]) > 1024):
+        raise ValueError("reconciliation reason must be explicit and within 1024 characters")
+    if "source_transition" in value:
+        transition = value["source_transition"]
+        if not isinstance(transition, dict):
+            raise ValueError("explicit original/evidence source transition required")
+        RedisShmReadOnlyProxy._validate_source_transition(transition, transition.get("original_binding"))
+        if apply and "reason" not in value:
+            raise ValueError("cross-source apply requires an explicit operator reason")
     if "stopped_proxy_pid" in value:
         _integer(value["stopped_proxy_pid"], "stopped_proxy_pid", 1, 0xFFFFFFFF)
     return dict(value)
@@ -325,6 +336,15 @@ def run_reconciliation(value, plan, *, apply=False, redis_factory=None, shm_fact
     plan = validate_reconciliation_plan(plan, apply=apply)
     if config["runtime_policy"] not in WRITE_POLICIES:
         raise ValueError("reconciliation requires the existing persistent account read/write sources")
+    if "source_transition" in plan:
+        if config["environment"] != "LIVE":
+            raise ValueError("cross-source reconciliation requires the existing LIVE policy")
+        expected = dict(account_id=config["account_id"], environment=config["environment"],
+                        runtime_policy=config["runtime_policy"], allow_order_methods=config["allow_order_methods"],
+                        read_session_id=config["read_session_id"], execution_session_id=config["execution_session_id"],
+                        native_pid=config["native_pid"], windows_session_id=config["windows_session"])
+        RedisShmReadOnlyProxy._validate_source_transition(plan["source_transition"],
+            plan["source_transition"]["original_binding"], expected)
     if windows_session_id(os.getpid()) != config["windows_session"] or windows_session_id(config["native_pid"]) != config["windows_session"]:
         raise RuntimeError("consumer and native source must share the explicit Windows session")
     old_proxy_pid = _integer(plan.get("stopped_proxy_pid"), "stopped_proxy_pid", 1, 0xFFFFFFFF)
@@ -353,7 +373,8 @@ def run_reconciliation(value, plan, *, apply=False, redis_factory=None, shm_fact
             proxy._block_writes("OPERATOR_WRITE_DISABLED")
         proxy.verify_identity()
         result.update(proxy.reconcile_unknown_write(plan["request_id"], plan["order_sys_id"], plan["order_identity"],
-                      expected_record=plan.get("expected_record"), operator=plan.get("operator"), apply=apply))
+                      expected_record=plan.get("expected_record"), operator=plan.get("operator"),
+                      reason=plan.get("reason"), source_transition=plan.get("source_transition"), apply=apply))
         if not apply:
             result["apply_plan"] = dict(plan, expected_record=result["expected_record"], operator="")
     except Exception as exc:

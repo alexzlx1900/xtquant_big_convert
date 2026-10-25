@@ -302,7 +302,7 @@ def init(ContextInfo):
             if callable(read_server.history_downloader):
                 read_capabilities += ["download_history_data"]
         rpc_transport = execution["_load_embedded"]("bigqmt_signal_trader.transports.shm_rpc")
-        execution_capabilities = sorted(rpc_transport.READ_METHODS | (rpc_transport.WRITE_METHODS if read_write else frozenset()))
+        execution_capabilities = sorted(rpc_transport.READ_METHODS | (rpc_transport.ALL_WRITE_METHODS if read_write else frozenset()))
         identity = dict(
             account_id=DUAL_SHM_SETTINGS["account_id"], environment=environment, native_pid=_BOUND_NATIVE_PID,
             windows_session=DUAL_SHM_SETTINGS["windows_session"],
@@ -315,6 +315,8 @@ def init(ContextInfo):
             max_seconds=DUAL_SHM_SETTINGS["max_seconds"], max_requests_per_source=DUAL_SHM_SETTINGS["max_requests_per_source"],
             market_rpc_enabled=read_server.market_enabled, read_capabilities=read_capabilities,
             execution_capabilities=execution_capabilities)
+        if read_write:
+            identity["async_submit_contract"] = rpc_transport.ASYNC_SUBMIT_CONTRACT
         identity_path = DUAL_SHM_SETTINGS["source_identity_path"]
         if identity_path is not None:
             temporary = identity_path + ".new"

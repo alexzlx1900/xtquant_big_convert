@@ -59,6 +59,12 @@ if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
 return 1
 """
+_RECONCILE_ASYNC_WRITE = """
+if redis.call('HGET', KEYS[2], ARGV[4]) ~= ARGV[1] then return 0 end
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+return 1
+"""
 _REPLY_TEMPLATES = {
     "reply_key": "bigqmt:rpc:resp:{account_id}:{request_id}",
     "reply_list": "bigqmt:rpc:respq:{account_id}:{request_id}",
@@ -301,10 +307,14 @@ class RedisShmReadOnlyProxy:
                 raise ShmProtocolError("persistent write ledger identity is malformed")
             try:
                 fingerprint = json.loads(record["fingerprint"])
-            except ValueError:
-                fingerprint = None
-            async_record = (isinstance(fingerprint, list) and len(fingerprint) == 4
-                            and isinstance(fingerprint[2], str) and fingerprint[2] in ASYNC_WRITE_METHODS)
+            except ValueError as exc:
+                raise ShmProtocolError("persistent write fingerprint is not valid JSON") from exc
+            if (not isinstance(fingerprint, list) or len(fingerprint) != 4
+                    or type(fingerprint[0]) is not int or fingerprint[:2] != [1, self.account_id]
+                    or not isinstance(fingerprint[2], str) or fingerprint[2] not in ALL_WRITE_METHODS
+                    or not isinstance(fingerprint[3], dict)):
+                raise ShmProtocolError("persistent write fingerprint identity is malformed")
+            async_record = fingerprint[2] in ASYNC_WRITE_METHODS
             if async_record:
                 if (fingerprint[:2] != [1, self.account_id] or type(fingerprint[0]) is not int
                         or not isinstance(fingerprint[3], dict)
@@ -336,7 +346,7 @@ class RedisShmReadOnlyProxy:
                 validate_async_submit_params(dict(client_order_id=cid))
                 if cid in expected:
                     raise ShmProtocolError("persistent async CID has multiple request identities")
-                if record["state"] in ("CONFIRMED", "RECONCILED"):
+                if record["state"] == "CONFIRMED":
                     raise ShmProtocolError("async native-call receipts cannot be persisted as broker confirmations")
                 expected[cid] = record["request_id"]
         if indexed != expected:
@@ -654,16 +664,20 @@ class RedisShmReadOnlyProxy:
                 if (not isinstance(prior, dict) or prior.get("request_id") != prior_rid
                         or prior.get("client_order_id") != record["client_order_id"]):
                     raise ShmProtocolError("persistent async CID index has no exact original request")
-                conflict = prior.get("fingerprint") != fingerprint or prior.get("binding") != record["binding"]
+                reconciled = prior.get("state") == "RECONCILED"
+                if reconciled:
+                    self._validate_reconciled_record(prior)
+                conflict = (prior.get("fingerprint") != fingerprint
+                            or not reconciled and prior.get("binding") != record["binding"])
                 if conflict:
                     self._block_writes("ASYNC_IDENTITY_CONFLICT")
                 elif prior.get("state") == "SUBMITTED_PENDING":
                     self._validate_pending_record(prior)
                 elif prior.get("state") == "NOT_EXECUTED":
                     self._validate_not_executed_record(prior)
-                else:
+                elif not reconciled:
                     self._block_writes("PERSISTED_WRITE_UNCONFIRMED")
-                unknown = conflict or prior.get("state") not in ("SUBMITTED_PENDING", "NOT_EXECUTED")
+                unknown = conflict or prior.get("state") not in ("SUBMITTED_PENDING", "NOT_EXECUTED", "RECONCILED")
                 response = self._response(request, "client_order_id was already claimed; inspect the original request",
                     "ASYNC_CLIENT_ORDER_ID_CONFLICT" if conflict else "ASYNC_CLIENT_ORDER_ID_ALREADY_CLAIMED",
                     unknown=unknown)
@@ -681,8 +695,14 @@ class RedisShmReadOnlyProxy:
                     self._block_writes("WRITE_LEDGER_CAPACITY_EXHAUSTED")
                 return encoded, None
             prior = json.loads(decode_text(claimed[1]))
+            binding_matches = isinstance(prior, dict) and prior.get("binding") == record["binding"]
+            if asynchronous and isinstance(prior, dict) and prior.get("state") == "RECONCILED":
+                self._validate_reconciled_record(prior)
+                transition = prior["reconciliation"].get("source_transition")
+                evidence_binding = self._validate_source_transition(transition, prior["binding"])
+                binding_matches = evidence_binding == record["binding"]
             if (not isinstance(prior, dict) or prior.get("request_id") != request["request_id"]
-                    or prior.get("fingerprint") != fingerprint or prior.get("binding") != record["binding"]):
+                    or prior.get("fingerprint") != fingerprint or not binding_matches):
                 raise ShmProtocolError("persisted write RID has conflicting parameters or source binding")
             replay = prior.get("reconciled_response") if prior.get("state") == "RECONCILED" else prior.get("response")
             if prior.get("state") == "SUBMITTED_PENDING":
@@ -714,7 +734,41 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("write settlement identity changed; do not resend")
         return encoded
 
-    def _reconciliation_record(self, request_id, expected_record=None):
+    @staticmethod
+    def _validate_source_transition(transition, original_binding, evidence_binding=None):
+        if transition is None:
+            return original_binding
+        required = {"account_id", "environment", "runtime_policy", "allow_order_methods",
+                    "read_session_id", "execution_session_id", "native_pid", "windows_session_id"}
+        if not isinstance(transition, dict) or set(transition) != {"original_binding", "evidence_binding"}:
+            raise ShmProtocolError("explicit original/evidence source bindings are required")
+        old, new = transition["original_binding"], transition["evidence_binding"]
+        for binding in (old, new):
+            if (not isinstance(binding, dict) or set(binding) != required
+                    or not isinstance(binding.get("account_id"), str) or binding.get("environment") != "LIVE"
+                    or binding.get("runtime_policy") != "PERSISTENT_LIVE_READ_WRITE"
+                    or binding.get("allow_order_methods") is not True
+                    or type(binding.get("native_pid")) is not int or binding["native_pid"] <= 0
+                    or type(binding.get("windows_session_id")) is not int or binding["windows_session_id"] < 0
+                    or any(not isinstance(binding.get(field), str) or not binding[field]
+                           for field in ("read_session_id", "execution_session_id"))
+                    or binding["read_session_id"] == binding["execution_session_id"]):
+                raise ShmProtocolError("source transition requires two complete explicit LIVE bindings")
+            try:
+                validate_account_policy(binding["account_id"], binding["environment"], binding["runtime_policy"])
+            except ValueError as exc:
+                raise ShmProtocolError("source transition requires the original explicit LIVE account") from exc
+        changing = {"read_session_id", "execution_session_id", "native_pid"}
+        if (old != original_binding or old == new
+                or {old["read_session_id"], old["execution_session_id"]}
+                    & {new["read_session_id"], new["execution_session_id"]}
+                or any(type(old[field]) is not type(new[field]) or old[field] != new[field]
+                       for field in required - changing)
+                or (evidence_binding is not None and new != evidence_binding)):
+            raise ShmProtocolError("only explicit SID/PID changes on the original LIVE target may be reconciled")
+        return new
+
+    def _reconciliation_record(self, request_id, expected_record=None, source_transition=None):
         """只读取精确 RID；旧请求、来源、原 UNKNOWN 必须完整保留。"""
         self._request_id({"request_id": request_id})
         encoded = self.transport.redis.hget(self._write_ledger_key, request_id)
@@ -725,15 +779,27 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("write record changed since the explicit preview")
         record = json.loads(encoded)
         if (not isinstance(record, dict) or record.get("request_id") != request_id
-                or record.get("state") != "UNKNOWN" or record.get("binding") != self._write_binding()
+                or record.get("state") != "UNKNOWN" or not isinstance(record.get("binding"), dict)
                 or not isinstance(record.get("token"), str) or not record["token"]
                 or not isinstance(record.get("response"), dict)):
-            raise ShmProtocolError("only the original UNKNOWN record on the same verified sources may be reconciled")
+            raise ShmProtocolError("only the exact original UNKNOWN record may be reconciled")
         original = json.loads(record.get("fingerprint", ""))
         if (not isinstance(original, list) or len(original) != 4 or type(original[0]) is not int
                 or original[:2] != [1, self.account_id]
-                or original[2] not in ("submit_order", "cancel_order") or not isinstance(original[3], dict)):
+                or not isinstance(original[2], str) or original[2] not in ALL_WRITE_METHODS
+                or not isinstance(original[3], dict)):
             raise ShmProtocolError("single submit/cancel fingerprint required; batch recovery is unavailable")
+        if source_transition is not None:
+            if original[2] not in ASYNC_WRITE_METHODS or self.environment != "LIVE":
+                raise ShmProtocolError("cross-source reconciliation requires an explicit LIVE async submit")
+            self._validate_source_transition(source_transition, record["binding"], self._write_binding())
+        elif record["binding"] != self._write_binding():
+            raise ShmProtocolError("source changed; same verified sources required without a supported explicit original/evidence transition")
+        if original[2] in ASYNC_WRITE_METHODS:
+            self._async_record_request(record)
+            cid = validate_async_submit_params(original[3])
+            if decode_text(self.transport.redis.hget(self._async_cid_key, cid)) != request_id:
+                raise ShmProtocolError("the original async CID reservation is missing or changed")
         response = record["response"]
         if (response.get("request_id") != request_id or response.get("account_id") != self.account_id
                 or response.get("method") != original[2] or response.get("status") != "UNKNOWN"):
@@ -753,8 +819,13 @@ class RedisShmReadOnlyProxy:
                 or identity["volume"] <= 0 or type(identity["price"]) not in (int, float)
                 or not math.isfinite(identity["price"]) or identity["price"] <= 0):
             raise ShmProtocolError("invalid original order identity")
-        if method == "submit_order":
-            tag = str(params.get("remark") or params.get("order_remark") or "").strip()
+        if method in ("submit_order", "submit_order_async"):
+            if method == "submit_order_async":
+                tag = validate_async_submit_params(params)
+                if params.get("price_type", "LIMIT") not in (11, "11", "LIMIT"):
+                    raise ShmProtocolError("async reconciliation requires the original explicit limit order")
+            else:
+                tag = str(params.get("remark") or params.get("order_remark") or "").strip()
             if not tag and params.get("signal_id"):
                 tag = "bqrpc:%s" % params["signal_id"]
             expected = dict(user_order_id=tag, stock_code=params.get("stock_code"),
@@ -879,7 +950,8 @@ class RedisShmReadOnlyProxy:
         order_time = order.get("order_time")
         if (type(order_time) not in (int, float) or not math.isfinite(order_time) or order_time <= 0
                 or order_time > observed_at + 1
-                or (method == "submit_order" and order_time < claimed_at - _BROKER_PROXY_CLOCK_TOLERANCE_SECONDS)
+                or (method in ("submit_order", "submit_order_async")
+                    and order_time < claimed_at - _BROKER_PROXY_CLOCK_TOLERANCE_SECONDS)
                 or (method == "cancel_order" and order_time > claimed_at + 1)
                 or datetime.datetime.fromtimestamp(order_time, shanghai).date() !=
                     datetime.datetime.fromtimestamp(claimed_at, shanghai).date()):
@@ -904,7 +976,7 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("native deal quantities do not close the terminal order")
         return dict(order_sys_id=order_sys_id, order_identity=identity, order=copy.deepcopy(order),
                     trades=copy.deepcopy(trades), terminal_verified=True,
-                    request_result="BROKER_ORDER_FOUND" if method == "submit_order" else
+                    request_result="BROKER_ORDER_FOUND" if method in ("submit_order", "submit_order_async") else
                         ("CANCEL_CONFIRMED" if status in ("53", "54") else "ORDER_TERMINAL_CANCEL_NOT_PROVEN"),
                     business_terminal_status=status, filled_volume=filled,
                     broker_order_time_precision="seconds", clocks_assumed_identical=False,
@@ -940,8 +1012,11 @@ class RedisShmReadOnlyProxy:
     def _validate_reconciled_record(self, record):
         """启动只信完整保存事实；RECONCILED 标签或布尔值本身不解除停写。"""
         proof, original, replay = record.get("reconciliation"), record.get("response"), record.get("reconciled_response")
+        transition = proof.get("source_transition") if isinstance(proof, dict) else None
+        evidence_binding = self._validate_source_transition(transition, record["binding"])
         if (not isinstance(proof, dict) or proof.get("original_state") != "UNKNOWN"
                 or proof.get("terminal_verified") is not True or not isinstance(original, dict)
+                or record["binding"].get("account_id") != self.account_id
                 or record.get("automatic_retry") is not False
                 or not isinstance(record.get("token"), str) or not record["token"]
                 or record["binding"].get("runtime_policy") not in WRITE_POLICIES
@@ -956,7 +1031,7 @@ class RedisShmReadOnlyProxy:
                 or not math.isfinite(proof["reconciled_at_unix"])
                 or proof.get("original_claimed_at_unix") != record.get("claimed_at_unix")
                 or not isinstance(proof.get("source_binding"), dict)
-                or any(proof["source_binding"].get(field) != record["binding"].get(field)
+                or any(proof["source_binding"].get(field) != evidence_binding.get(field)
                        for field in ("read_session_id", "execution_session_id", "native_pid", "windows_session_id"))
                 or not isinstance(proof.get("evidence_request_id"), str) or not proof["evidence_request_id"]
                 or type(proof.get("evidence_sequence")) is not int or proof["evidence_sequence"] <= 0):
@@ -964,9 +1039,17 @@ class RedisShmReadOnlyProxy:
         fingerprint = json.loads(record["fingerprint"])
         if (not isinstance(fingerprint, list) or len(fingerprint) != 4
                 or type(fingerprint[0]) is not int or fingerprint[:2] != [1, self.account_id]
-                or fingerprint[2] not in ("submit_order", "cancel_order") or not isinstance(fingerprint[3], dict)
+                or not isinstance(fingerprint[2], str) or fingerprint[2] not in ALL_WRITE_METHODS
+                or not isinstance(fingerprint[3], dict)
                 or original.get("method") != fingerprint[2]):
             raise ShmProtocolError("persistent reconciliation original fingerprint is invalid")
+        if transition is not None and fingerprint[2] not in ASYNC_WRITE_METHODS:
+            raise ShmProtocolError("cross-source proof is limited to an exact LIVE async submit")
+        if fingerprint[2] in ASYNC_WRITE_METHODS:
+            self._async_record_request(record)
+            if (not isinstance(proof.get("reason"), str) or not proof["reason"].strip()
+                    or len(proof["reason"]) > 1024):
+                raise ShmProtocolError("async reconciliation requires its explicit operator reason")
         validated = self._validate_reconciliation_snapshot(fingerprint[2], fingerprint[3],
             proof.get("order_sys_id"), proof.get("order_identity"), proof.get("snapshot"),
             record.get("claimed_at_unix"), proof.get("query_started_at_unix"), proof.get("observed_at_unix"),
@@ -983,13 +1066,13 @@ class RedisShmReadOnlyProxy:
                 or replay.get("automatic_retry") is not False
                 or replay.get("data") != expected_data or replay.get("source_binding") != proof["source_binding"]
                 or replay.get("sequence") != proof["evidence_sequence"]
-                or replay.get("session_id") != record["binding"].get("execution_session_id")):
+                or replay.get("session_id") != evidence_binding.get("execution_session_id")):
             raise ShmProtocolError("persistent reconciliation replay differs from saved facts")
         self._check_response(dict(schema_version=1, request_id=record["request_id"], account_id=self.account_id,
-                                  method=fingerprint[2]), replay, record["binding"]["execution_session_id"])
+                                  method=fingerprint[2]), replay, evidence_binding["execution_session_id"])
 
     def reconcile_unknown_write(self, request_id, order_sys_id, order_identity, *,
-                                expected_record=None, operator=None, apply=False):
+                                expected_record=None, operator=None, reason=None, source_transition=None, apply=False):
         """显式单 RID 核对。默认只读预览；apply 仅 CAS 原账本，不发业务消息。
 
         终态核对不把原提交改为 CONFIRMED，也不宣称 OMS 回报已经落地。
@@ -1003,9 +1086,17 @@ class RedisShmReadOnlyProxy:
             if type(apply) is not bool or (apply and (not isinstance(expected_record, str) or not expected_record
                     or not isinstance(operator, str) or not operator.strip() or len(operator) > 128)):
                 raise ShmProtocolError("apply requires exact previewed record and explicit operator")
-            encoded, record, method, params = self._reconciliation_record(request_id, expected_record)
+            encoded, record, method, params = self._reconciliation_record(request_id, expected_record, source_transition)
+            asynchronous = method in ASYNC_WRITE_METHODS
+            if ((reason is not None and (not isinstance(reason, str) or not reason.strip() or len(reason) > 1024))
+                    or (apply and asynchronous and reason is None)):
+                raise ShmProtocolError("async apply requires an explicit operator reason within 1024 characters")
             proof = self._terminal_reconciliation_proof(method, params, order_sys_id, order_identity,
                                                         record.get("claimed_at_unix"))
+            if source_transition is not None:
+                proof["source_transition"] = copy.deepcopy(source_transition)
+            if reason is not None:
+                proof["reason"] = reason.strip()
             if decode_text(self.transport.redis.hget(self._write_ledger_key, request_id)) != encoded:
                 raise ShmProtocolError("write record changed during native evidence collection")
             preview = dict(status="RECONCILIATION_PREVIEW", request_id=request_id, account_id=self.account_id,
@@ -1028,8 +1119,14 @@ class RedisShmReadOnlyProxy:
                           source_binding=self._source_binding())
             reconciled["reconciled_response"] = replay
             replacement = json.dumps(reconciled, sort_keys=True, allow_nan=False, separators=(",", ":"))
+            if asynchronous:
+                self._block_writes("OPERATOR_WRITE_DISABLED")
             try:
-                committed = self.transport.redis.eval(_SETTLE_WRITE, 1, self._write_ledger_key, request_id, encoded, replacement)
+                if asynchronous:
+                    committed = self.transport.redis.eval(_RECONCILE_ASYNC_WRITE, 2, self._write_ledger_key,
+                        self._async_cid_key, request_id, encoded, replacement, record["client_order_id"])
+                else:
+                    committed = self.transport.redis.eval(_SETTLE_WRITE, 1, self._write_ledger_key, request_id, encoded, replacement)
             except Exception as exc:
                 self._block_writes("RECONCILIATION_COMMIT_UNCONFIRMED")
                 preview.update(status="UNKNOWN", ledger_records_written=None, automatic_retry=False,
@@ -1044,6 +1141,8 @@ class RedisShmReadOnlyProxy:
                 self._writes_blocked, self._write_block_reason = False, ""
             if self._operator_write_blocked:
                 self._block_writes("OPERATOR_WRITE_DISABLED")
+            if self._source_identity["execution"].get("writes_blocked") is True:
+                self._block_writes("NATIVE_WRITE_RESULT_UNKNOWN")
             try:
                 if decode_text(self.transport.redis.hget(self._write_ledger_key, request_id)) != replacement:
                     raise ShmProtocolError("reconciliation exact readback changed")

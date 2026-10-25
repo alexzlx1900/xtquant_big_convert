@@ -21,17 +21,21 @@ CODE = "000001.SZ"
 
 
 class NativePath:
-    def __init__(self, monkeypatch, *, callback_during_submit=False, fail_native=False):
+    def __init__(self, monkeypatch, *, callback_during_submit=False, fail_native=False,
+                 redis_provider=None, native_query=None, start_write_blocked=False):
         self.source = DUAL.Fixture(
             monkeypatch, account_id=ACCOUNT, environment="LIVE",
             persistent_live_read_write=True, hard_deadline_unix=None,
             max_seconds=0, max_requests=0, symbols=[CODE],
         )
-        self.redis = AsyncRedis()
+        self.redis = AsyncRedis() if redis_provider is None else redis_provider
         self.native_calls = []
         self.callback_during_submit = callback_during_submit
         self.fail_native = fail_native
         self.source.namespace["passorder"] = self.passorder
+        if native_query is not None:
+            self.source.namespace["get_trade_detail_data"] = (
+                lambda *args, **kwargs: native_query(self.source.query, *args, **kwargs))
         self.source.start()
         self.source.namespace["account_callback"](
             self.source.context,
@@ -42,7 +46,7 @@ class NativePath:
             RedisTransport(self.redis, account_id=ACCOUNT),
             self.source.clients["read"], self.source.clients["execution"],
             account_id=ACCOUNT, environment="LIVE", runtime_policy=POLICY,
-            allow_order_methods=True, start_write_blocked=False, live_write_authorized=True,
+            allow_order_methods=True, start_write_blocked=start_write_blocked, live_write_authorized=True,
             receive_policy="QUEUE_ONLY", expected_native_pid=os.getpid(),
             expected_windows_session_id=1, timeout_seconds=1, max_requests=0,
             expected_readonly_session_id=self.source.clients["read"].mailbox.session_id,

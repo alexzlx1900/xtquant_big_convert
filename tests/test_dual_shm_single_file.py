@@ -389,13 +389,13 @@ def test_actual_generated_two_protocols_readonly_identity_caps_and_isolation(mon
     assert ready["read_session_id"] != ready["execution_session_id"] and ready["market_rpc_enabled"] is False
     assert ready["max_requests_per_source"] == 50
     assert "subscribe_quote" not in ready["read_capabilities"]
-    assert not {"submit_order", "cancel_order"} & set(ready["execution_capabilities"])
+    assert not {"submit_order", "cancel_order", "submit_order_async"} & set(ready["execution_capabilities"])
     for key in ("read", "execution"):
         ping = h.call(key, "ping")
         assert ping["ok"] and ping["data"]["allow_order_methods"] is False
         assert ping["data"]["session_id"] == ready["read_session_id" if key == "read" else "execution_session_id"]
         assert h.call(key, "get_positions")["data"][CODE]["volume"] == 100
-        for method in ("submit_order", "cancel_order"):
+        for method in ("submit_order", "cancel_order", "submit_order_async"):
             assert h.call(key, method)["ok"] is False
     assert h.call("read", "get_full_tick", {"codes": [CODE]})["data"][CODE]["lastPrice"] == 11.47
     assert h.call("execution", "get_asset")["data"]["source_evidence"]["complete"] is True
