@@ -355,12 +355,20 @@ class ShmReadOnlyClient:
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at) or expires_at <= time.time():
             raise ValueError("read deadline must be a finite future timestamp")
         payload.update(schema_version=payload.get("schema_version", 1), session_id=self.mailbox.session_id, read_expires_at_unix=min(expires_at, time.time() + timeout_seconds))
+        read_timing = ({"shm_client_started_at_unix": time.time(),
+                        "shm_deadline_at_unix": payload["read_expires_at_unix"]}
+                       if payload.get("method") == "get_positions" else None)
         deadline = time.monotonic() + timeout_seconds
         region = self.mailbox.region
         remaining = min(deadline - time.monotonic(), payload["read_expires_at_unix"] - time.time())
         if remaining <= 0 or not region.acquire(max(1, int(math.ceil(remaining * 1000)))):
-            raise ShmTimeoutError("mutex deadline expired before publication; request not sent")
+            error = ShmTimeoutError("mutex deadline expired before publication; request not sent")
+            if read_timing is not None:
+                error.read_timing = dict(read_timing)
+            raise error
         try:
+            if read_timing is not None:
+                read_timing["shm_lock_acquired_at_unix"] = time.time()
             if time.monotonic() >= deadline or time.time() >= payload["read_expires_at_unix"]:
                 raise ShmTimeoutError("mutex deadline expired before publication; request not sent")
             header = self.mailbox._header()
@@ -378,6 +386,12 @@ class ShmReadOnlyClient:
             region.write(REQUEST_OFFSET, raw)
             header[7], header[4] = len(raw), sequence
             self.mailbox._write_header(header)
+            if read_timing is not None:
+                read_timing["shm_published_at_unix"] = time.time()
+        except Exception as exc:
+            if read_timing is not None:
+                exc.read_timing = dict(read_timing)
+            raise
         finally:
             region.release()
         try:
@@ -386,14 +400,27 @@ class ShmReadOnlyClient:
                     try:
                         header = self.mailbox._header()
                         if header[5] == sequence:
+                            if read_timing is not None:
+                                read_timing["shm_response_observed_at_unix"] = time.time()
                             if not 0 < header[8] <= RESPONSE_CAPACITY:
                                 raise ShmProtocolError("invalid response payload length")
                             response = decode_payload(region.read(RESPONSE_OFFSET, header[8]))
                             self._validate_response(payload, response)
+                            if read_timing is not None:
+                                read_timing["shm_response_validated_at_unix"] = time.time()
+                                native_timing = response.get("read_timing")
+                                if isinstance(native_timing, dict):
+                                    for field in ("native_started_at_unix", "native_finished_at_unix"):
+                                        value = native_timing.get(field)
+                                        if type(value) in (int, float) and 0 < value < 1e12:
+                                            read_timing[field] = value
                             if time.monotonic() >= deadline or time.time() >= payload["read_expires_at_unix"]:
                                 raise ShmTimeoutError("response arrived after its deadline; result unconfirmed")
                             header[6] = sequence
                             self.mailbox._write_header(header)
+                            if read_timing is not None:
+                                read_timing["shm_ack_at_unix"] = time.time()
+                                response["read_timing"] = dict(read_timing)
                             return response
                         if header[2] in (CLOSED, FAILED):
                             raise ShmProtocolError("server closed before replying")
@@ -401,8 +428,10 @@ class ShmReadOnlyClient:
                         region.release()
                 time.sleep(min(0.01, max(0, deadline - time.monotonic())))
             raise ShmTimeoutError("shared memory response timeout; result unconfirmed, do not resubmit")
-        except Exception:
+        except Exception as exc:
             self.poisoned = True
+            if read_timing is not None:
+                exc.read_timing = dict(read_timing)
             raise
 
     def _validate_response(self, request, response):

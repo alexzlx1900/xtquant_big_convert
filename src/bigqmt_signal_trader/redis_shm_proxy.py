@@ -35,6 +35,11 @@ PURE_READ_METHODS = EXECUTION_METHODS | QUOTE_METHODS | frozenset(("get_local_da
 RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 WRITE_POLICIES = frozenset(("PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 RECEIVE_POLICIES = frozenset(("QUEUE_AND_PUBSUB", "QUEUE_ONLY"))
+POSITION_READ_TIMING_FIELDS = (
+    "native_started_at_unix", "native_finished_at_unix", "shm_client_started_at_unix",
+    "shm_deadline_at_unix", "shm_lock_acquired_at_unix", "shm_published_at_unix",
+    "shm_response_observed_at_unix", "shm_response_validated_at_unix", "shm_ack_at_unix",
+)
 # 柜台订单秒精度时钟与代理本机时钟不同；1258真实样本偏差为-3.049735秒。
 _BROKER_PROXY_CLOCK_TOLERANCE_SECONDS = 5.0
 _CLAIM_WRITE = """
@@ -195,6 +200,13 @@ class RedisShmReadOnlyProxy:
             error_at_unix=time.time(), **self._request_context)
         if not self._first_error:
             self._first_error = copy.deepcopy(self._last_error)
+
+    @staticmethod
+    def _position_read_timing(value):
+        if not isinstance(value, dict):
+            return {}
+        return {key: value[key] for key in POSITION_READ_TIMING_FIELDS
+                if type(value.get(key)) in (int, float) and 0 < value[key] < 1e12}
 
     def diagnostic_snapshot(self):
         """有界运行证据，不包含请求参数、Redis凭据或任何重发入口。"""
@@ -1192,6 +1204,10 @@ class RedisShmReadOnlyProxy:
             request = copy.deepcopy(request)
             self._request_context = {key: request[key][:128] for key in ("request_id", "method")
                                      if isinstance(request.get(key), str)}
+            read_timing = ({"proxy_received_at_unix": time.time()}
+                           if request.get("method") == "get_positions" else None)
+            if read_timing is not None:
+                self._request_context["read_timing"] = read_timing
             self._operation_phase = "REQUEST_VALIDATE"
             # 先拒绝无法安全寻址的请求；不写任意 custom 回复键。
             reply = self._reply_request(request)
@@ -1266,12 +1282,17 @@ class RedisShmReadOnlyProxy:
                         if remaining <= 0:
                             raise ShmProtocolError("read deadline expired before forwarding")
                         self._operation_phase = "SHM_FORWARD"
+                        if read_timing is not None:
+                            read_timing["proxy_shm_call_at_unix"] = time.time()
                         response = (prior_write if prior_write is not None else
                                     client.send_request(forwarded, timeout_seconds=remaining))
                         self._operation_phase = "SHM_RESPONSE_VALIDATE"
                         if prior_write is None:
                             self._check_response(forwarded, response, self._sessions[route])
                         response = copy.deepcopy(response)
+                        if read_timing is not None:
+                            read_timing.update(self._position_read_timing(response.get("read_timing")))
+                            response["read_timing"] = dict(read_timing)
                         binding = self._source_binding()
                         if binding is not None:
                             response["source_binding"] = binding
@@ -1327,8 +1348,12 @@ class RedisShmReadOnlyProxy:
                                 response["data"] = wrapped["asset"]
                                 response["source_evidence"] = wrapped["source_evidence"]
                     except Exception as exc:
+                        if read_timing is not None:
+                            read_timing.update(self._position_read_timing(getattr(exc, "read_timing", None)))
                         self._record_error(exc)
                         response = self._response(request, exc, "SHM_RESULT_UNCONFIRMED", unknown=True)
+                        if read_timing is not None:
+                            response["read_timing"] = dict(read_timing)
                         self._seal("SHM_RESULT_UNCONFIRMED")
                     if reservation is not None:
                         try:
