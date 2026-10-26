@@ -282,8 +282,20 @@ class ShmReadOnlyBridge:
                         or any(not isinstance(code, str) for code in codes)
                         or len(set(codes)) != len(codes)):
                     raise ReadOnlyRequestError("INVALID_PARAMS", "codes must contain 1-%d unique symbols" % self.quote_symbol_limit)
-                if any(code not in self.quote_symbols for code in codes):
-                    raise ReadOnlyRequestError("SYMBOL_DENIED", "quote symbol is outside the configured allowlist")
+                denied = [code for code in codes if code not in self.quote_symbols]
+                if (denied and self.environment == "LIVE" and READONLY_PERSISTENT_LIVE_READ_WRITE
+                        and all(self._history_symbol(code) for code in denied)):
+                    # 当前正持仓按次核验，不缓存或永久扩大静态名单，也不开放其他账户。
+                    positions = self.positions.get_positions_with_evidence(self.account_id)
+                    if not positions["source_evidence"]["complete"]:
+                        raise ReadOnlyRequestError(positions["source_evidence"]["error_code"] or "POSITION_INCOMPLETE",
+                                                   "current positions cannot be verified for quote access")
+                    held = {code for code, position in positions["positions"].items()
+                            if type(position.volume) is int and position.volume > 0}
+                    denied = [code for code in denied if code not in held]
+                if denied:
+                    raise ReadOnlyRequestError("SYMBOL_DENIED", "quote symbols are outside the configured allowlist and current positions: " + ",".join(denied),
+                                               data={"denied_symbols": denied})
                 data = self.context.get_full_tick(codes)
                 if not isinstance(data, dict):
                     raise ReadOnlyRequestError("QMT_QUOTE_UNAVAILABLE", "native quotes are not an object")

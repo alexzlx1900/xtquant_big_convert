@@ -83,7 +83,8 @@ def test_large_universe_does_not_allow_oversized_unlisted_duplicate_or_invalid_r
         harness.start()
         response = harness.call("read", "get_ticks", params)
         assert response["ok"] is False and response["server_error"] in ("INVALID_PARAMS", "SYMBOL_DENIED")
-        assert harness.quote_calls == [] and harness.query_calls == []
+        assert harness.quote_calls == []
+        assert harness.query_calls == ([(harness.account, "STOCK", "POSITION", "")] if params == {"codes": ["999999.BJ"]} else [])
     finally:
         harness.close()
 
