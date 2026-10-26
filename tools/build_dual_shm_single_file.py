@@ -317,7 +317,8 @@ def init(ContextInfo):
             account_callback_route="outer_to_execution", execution_bind_account_callbacks=False,
             max_seconds=DUAL_SHM_SETTINGS["max_seconds"], max_requests_per_source=DUAL_SHM_SETTINGS["max_requests_per_source"],
             market_rpc_enabled=read_server.market_enabled, read_capabilities=read_capabilities,
-            quote_allowed_symbol_count=len(read_server.quote_symbols),
+            quote_initial_symbol_count=len(read_server.initial_quote_symbols),
+            quote_symbol_scope=read_server.quote_symbol_scope,
             quote_request_symbol_limit=read_server.quote_symbol_limit,
             execution_capabilities=execution_capabilities)
         if read_write:

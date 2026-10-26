@@ -54,37 +54,37 @@ def drive(harness, operation):
 
 
 @pytest.mark.parametrize("method", ["get_ticks", "get_full_tick"])
-def test_live_400_named_universe_reads_exactly_four_native_batches_of_100(monkeypatch, method):
-    codes = named_symbols(400)
-    harness = QuoteFixture(monkeypatch, codes)
+def test_live_400_members_and_benchmark_outside_initial_symbols_read_in_bounded_batches(monkeypatch, method):
+    codes = named_symbols(400) + ["000300.SH"]
+    harness = QuoteFixture(monkeypatch, ["600000.SH"])
     try:
         harness.start()
         combined = {}
-        for offset in range(0, 400, 100):
+        for offset in range(0, len(codes), 100):
             batch = codes[offset:offset + 100]
             response = harness.call("read", method, {"codes": batch})
             assert response["ok"] is True and response["environment"] == "LIVE"
             assert response["data"] == native_quotes(batch)
             combined.update(response["data"])
-        assert harness.quote_calls == [codes[offset:offset + 100] for offset in range(0, 400, 100)]
-        assert set(combined) == set(codes) and len(combined) == 400
+        assert harness.quote_calls == [codes[offset:offset + 100] for offset in range(0, len(codes), 100)]
+        assert set(combined) == set(codes) and len(combined) == 401
         assert harness.query_calls == []
     finally:
         harness.close()
 
 
 @pytest.mark.parametrize("params", [
-    {"codes": named_symbols(129)}, {"codes": []}, {"codes": ["999999.BJ"]},
+    {"codes": named_symbols(129)}, {"codes": []},
     {"codes": ["300000.SZ", "300000.SZ"]}, {"codes": [None]}, {"codes": ["*.SZ"]},
 ])
-def test_large_universe_does_not_allow_oversized_unlisted_duplicate_or_invalid_requests(monkeypatch, params):
+def test_large_universe_rejects_oversized_duplicate_or_invalid_requests(monkeypatch, params):
     harness = QuoteFixture(monkeypatch, named_symbols(400))
     try:
         harness.start()
         response = harness.call("read", "get_ticks", params)
-        assert response["ok"] is False and response["server_error"] in ("INVALID_PARAMS", "SYMBOL_DENIED")
+        assert response["ok"] is False and response["server_error"] == "INVALID_PARAMS"
         assert harness.quote_calls == []
-        assert harness.query_calls == ([(harness.account, "STOCK", "POSITION", "")] if params == {"codes": ["999999.BJ"]} else [])
+        assert harness.query_calls == []
     finally:
         harness.close()
 
@@ -141,7 +141,9 @@ def test_ping_and_both_ready_metadata_report_actual_universe_count_and_request_l
         dual = json.loads(next(line.split(" ", 1)[1] for line in lines if line.startswith("AQP_DUAL_SHM_READY ")))
         ping = harness.call("read", "ping")["data"]
         for value in (single, dual, ping):
-            assert value["quote_allowed_symbol_count"] == 400
+            assert value["quote_initial_symbol_count"] == 400
+            assert value["quote_symbol_scope"] == "EXPLICIT_REQUEST_SYMBOLS"
+            assert "quote_allowed_symbol_count" not in value
             assert value["quote_request_symbol_limit"] == 128
         assert single["symbols"] == codes
         assert single["rpc_revision"] == ping["rpc_revision"]
@@ -249,7 +251,8 @@ def test_sim_universe_and_high_level_wrapper_remain_capped_at_64(monkeypatch):
             client.call("get_ticks", {"codes": codes + ["999999.BJ"]})
         assert harness.quote_calls == [codes]
         ping = harness.call("read", "ping")["data"]
-        assert ping["quote_allowed_symbol_count"] == ping["quote_request_symbol_limit"] == 64
+        assert ping["quote_initial_symbol_count"] == ping["quote_request_symbol_limit"] == 64
+        assert ping["quote_symbol_scope"] == "EXPLICIT_REQUEST_SYMBOLS"
     finally:
         if client is not None:
             client.close()

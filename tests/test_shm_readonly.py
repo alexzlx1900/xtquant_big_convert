@@ -280,8 +280,10 @@ class RequestBoundaryTest(BridgeFixture):
         self.assertEqual(self.process("get_positions")["data"]["000001.SZ"]["market_value"], 0.0)
 
     def test_quote_symbol_and_original_time_are_preserved(self):
-        self.assertEqual(self.process("get_full_tick", params={"codes": ["600000.SH"]})["server_error"], "SYMBOL_DENIED")
-        self.assertEqual(self.context.calls, [])
+        outside = self.process("get_full_tick", params={"codes": ["600000.SH"]})
+        self.assertTrue(outside["ok"])
+        self.assertEqual(outside["data"]["600000.SH"]["time"], 1791874801000)
+        self.assertEqual(self.context.calls, [["600000.SH"]])
         for method in ("get_full_tick", "get_ticks"):
             response = self.process(method, params={"codes": ["000001.SZ"]})
             self.assertTrue(response["ok"])
@@ -329,8 +331,8 @@ class MultiSymbolQuoteTest(BridgeFixture):
                        {"codes": ["000001.SZ"], "subscribe": True}):
             with self.subTest(params=params):
                 self.assertEqual(self.process("get_ticks", params=params)["server_error"], "INVALID_PARAMS")
-        result = self.process("get_ticks", params={"codes": ["000001.SZ", "600001.SH"]})
-        self.assertEqual(result["server_error"], "SYMBOL_DENIED")
+        for code in ("*.SH", "bad.SZ", "000001.XX", "SH000001", "600001.SH "):
+            self.assertEqual(self.process("get_ticks", params={"codes": [code]})["server_error"], "INVALID_PARAMS")
         self.assertEqual(self.context.calls, [])
 
     def test_missing_symbol_preserves_partial_result_as_failure(self):

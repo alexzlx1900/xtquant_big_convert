@@ -98,7 +98,7 @@ def source(monkeypatch):
 
 @pytest.mark.parametrize("contract,code", [
     (capture(symbols=["%06d.SZ" % number for number in range(129)]), "000000.SZ"),
-    (capture(symbols=[A, A]), A), (capture(symbols=[A, "999999.BJ"]), A),
+    (capture(symbols=[A, A]), A), (capture(symbols=[A, "bad.BJ"]), A),
     (capture(trade_date="20260230"), A), (capture(end_time="20261022135800"), A),
     (capture(end_time="20261022135900"), A),
     (capture(start_time="20261021135900"), A), (capture(), "999999.BJ"),

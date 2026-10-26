@@ -16,7 +16,7 @@ BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 BIGQMT_ENVIRONMENT = "SIM"
 READONLY_SHM_NAME = "Local\\AQP_SHM_READONLY_SIM"
 READONLY_SYMBOL = "000001.SZ"
-READONLY_SYMBOLS = None  # None 保留旧单股票配置；SIM允许名单最多64、显式LIVE最多1024只。
+READONLY_SYMBOLS = None  # 兼容初始代码元数据，不是行情准入名单；请求可读取集合外的合法代码。
 READONLY_ENABLE_MARKET_RPC = False
 READONLY_MAX_REQUESTS = 180
 READONLY_MAX_SECONDS = 60
@@ -99,13 +99,13 @@ class ShmReadOnlyBridge:
             raise ValueError("configure the confirmed simulation account")
         symbols = [READONLY_SYMBOL] if READONLY_SYMBOLS is None else READONLY_SYMBOLS
         symbol_limit = 128 if BIGQMT_ENVIRONMENT == "LIVE" and READONLY_PERSISTENT_LIVE_READ_WRITE is True else 64
-        allowed_symbol_limit = 1024 if BIGQMT_ENVIRONMENT == "LIVE" and READONLY_PERSISTENT_LIVE_READ_WRITE is True else 64
-        if (not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= allowed_symbol_limit
+        initial_symbol_limit = 1024 if BIGQMT_ENVIRONMENT == "LIVE" and READONLY_PERSISTENT_LIVE_READ_WRITE is True else 64
+        if (not isinstance(symbols, (list, tuple)) or not 1 <= len(symbols) <= initial_symbol_limit
                 or any(not isinstance(symbol, str) or len(symbol) != 9
                        or not all("0" <= char <= "9" for char in symbol[:6])
                        or symbol[6:] not in (".SH", ".SZ", ".BJ") for symbol in symbols)
                 or len(set(symbols)) != len(symbols)):
-            raise ValueError("configure 1-%d unique SH/SZ/BJ quote symbols" % allowed_symbol_limit)
+            raise ValueError("configure 1-%d unique initial SH/SZ/BJ symbols" % initial_symbol_limit)
         if (type(READONLY_PERSISTENT_READONLY) is not bool or type(READONLY_PERSISTENT_MARKET_RPC) is not bool
                 or type(READONLY_PERSISTENT_LIVE_READ_WRITE) is not bool
                 or type(READONLY_ENABLE_MARKET_RPC) is not bool):
@@ -134,7 +134,8 @@ class ShmReadOnlyBridge:
         self.context = context
         self.account_id = BIGQMT_ACCOUNT_ID
         self.environment = BIGQMT_ENVIRONMENT
-        self.quote_symbols = tuple(symbols)
+        self.initial_quote_symbols = tuple(symbols)
+        self.quote_symbol_scope = "EXPLICIT_REQUEST_SYMBOLS"
         self.quote_symbol_limit = symbol_limit
         self.callback_thread_id = threading.get_ident()
         self.windows_session_id = None
@@ -233,7 +234,8 @@ class ShmReadOnlyBridge:
                 self.seen_request_ids.add(request_id)
             if method == "ping":
                 data = {"pong": True, "account_id": self.account_id, "environment": self.environment, "allow_order_methods": False,
-                        "quote_allowed_symbol_count": len(self.quote_symbols),
+                        "quote_initial_symbol_count": len(self.initial_quote_symbols),
+                        "quote_symbol_scope": self.quote_symbol_scope,
                         "quote_request_symbol_limit": self.quote_symbol_limit,
                         "rpc_revision": RPC_REVISION, "server_time": _dt.datetime.now(),
                         "transport": "shm_readonly",
@@ -279,23 +281,9 @@ class ShmReadOnlyBridge:
                 if isinstance(codes, str):
                     codes = [codes]
                 if (not isinstance(codes, list) or not 1 <= len(codes) <= self.quote_symbol_limit
-                        or any(not isinstance(code, str) for code in codes)
+                        or any(not self._history_symbol(code) for code in codes)
                         or len(set(codes)) != len(codes)):
                     raise ReadOnlyRequestError("INVALID_PARAMS", "codes must contain 1-%d unique symbols" % self.quote_symbol_limit)
-                denied = [code for code in codes if code not in self.quote_symbols]
-                if (denied and self.environment == "LIVE" and READONLY_PERSISTENT_LIVE_READ_WRITE
-                        and all(self._history_symbol(code) for code in denied)):
-                    # 当前正持仓按次核验，不缓存或永久扩大静态名单，也不开放其他账户。
-                    positions = self.positions.get_positions_with_evidence(self.account_id)
-                    if not positions["source_evidence"]["complete"]:
-                        raise ReadOnlyRequestError(positions["source_evidence"]["error_code"] or "POSITION_INCOMPLETE",
-                                                   "current positions cannot be verified for quote access")
-                    held = {code for code, position in positions["positions"].items()
-                            if type(position.volume) is int and position.volume > 0}
-                    denied = [code for code in denied if code not in held]
-                if denied:
-                    raise ReadOnlyRequestError("SYMBOL_DENIED", "quote symbols are outside the configured allowlist and current positions: " + ",".join(denied),
-                                               data={"denied_symbols": denied})
                 data = self.context.get_full_tick(codes)
                 if not isinstance(data, dict):
                     raise ReadOnlyRequestError("QMT_QUOTE_UNAVAILABLE", "native quotes are not an object")
@@ -612,8 +600,6 @@ class ShmReadOnlyBridge:
                 _dt.datetime.strptime(value, "%Y%m%d%H%M%S")
         except ValueError:
             raise ReadOnlyRequestError("INVALID_PARAMS", "capture date/time is invalid")
-        if any(symbol not in self.quote_symbols for symbol in symbols):
-            raise ReadOnlyRequestError("SYMBOL_DENIED", "the complete capture must belong to the configured allowlist")
         return dict(capture_id=identity, trade_date=day, start_time=start, end_time=end, symbols=sorted(symbols))
 
     @staticmethod
@@ -745,11 +731,11 @@ class ShmReadOnlyBridge:
             if self.capture_subscriptions:
                 raise ReadOnlyRequestError("CAPTURE_CONFLICT", "retained scoped records require a new explicit capture")
             if (set(params) - {"account_id", "code", "period", "result_type", "dividend_type"}
-                    or params.get("code") not in self.quote_symbols
+                    or not self._history_symbol(params.get("code"))
                     or params.get("period", "tick") not in ("tick", "1m", "5m", "15m", "30m", "60m", "1d")
                     or params.get("result_type", "dict") != "dict"
                     or params.get("dividend_type", "none") != "none"):
-                raise ReadOnlyRequestError("INVALID_PARAMS", "subscription requires allowlisted symbol, supported period and dict/none")
+                raise ReadOnlyRequestError("INVALID_PARAMS", "subscription requires a valid SH/SZ/BJ symbol, supported period and dict/none")
             if self.subscription is not None:
                 raise ReadOnlyRequestError("SUBSCRIPTION_ACTIVE", "only one subscription is permitted")
             if not callable(getattr(self.context, "subscribe_quote", None)) or not callable(getattr(self.context, "unsubscribe_quote", None)):
@@ -944,8 +930,9 @@ def init(ContextInfo):
         raise
     print("AQP_SHM_READONLY_READY " + json.dumps({
         "account_id": _SERVER.account_id, "environment": _SERVER.environment, "name": READONLY_SHM_NAME, "symbol": READONLY_SYMBOL,
-        "symbols": list(_SERVER.quote_symbols),
-        "quote_allowed_symbol_count": len(_SERVER.quote_symbols),
+        "symbols": list(_SERVER.initial_quote_symbols),
+        "quote_initial_symbol_count": len(_SERVER.initial_quote_symbols),
+        "quote_symbol_scope": _SERVER.quote_symbol_scope,
         "quote_request_symbol_limit": _SERVER.quote_symbol_limit,
         "session_id": _SERVER.mailbox.session_id, "native_pid": _SERVER.mailbox.server_pid,
         "windows_session_id": _SERVER.windows_session_id,

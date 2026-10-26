@@ -1216,7 +1216,7 @@ def test_live_large_whitelist_still_rejects_empty_duplicate_and_invalid_symbols(
         BUILDER.build_source(**settings(**live_settings(symbols=codes)))
 
 
-def test_sim_generated_request_limit_remains_64_and_live_still_enforces_exact_whitelist(monkeypatch):
+def test_sim_generated_request_limit_remains_64_and_live_reads_outside_initial_symbols(monkeypatch):
     sim_codes = ["%06d.SZ" % number for number in range(64)]
     sim = Fixture(monkeypatch, symbols=sim_codes)
     sim.start()
@@ -1224,5 +1224,5 @@ def test_sim_generated_request_limit_remains_64_and_live_still_enforces_exact_wh
     sim.close()
     live = Fixture(monkeypatch, **live_settings(symbols=LIVE_SAVED_POSITION_SYMBOLS_20261020))
     live.start()
-    assert live.call("read", "get_ticks", {"codes": ["999999.SZ"]})["server_error"] == "SYMBOL_DENIED"
+    assert live.call("read", "get_ticks", {"codes": ["999999.SZ"]})["ok"] is True
     live.close()
