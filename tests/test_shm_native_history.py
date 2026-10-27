@@ -123,8 +123,12 @@ class NativeHistoryTests(FIXTURE.BridgeFixture):
         self.context.get_market_data_ex.assert_called_once_with(FIELDS, ["000002.SZ"],
             period="5m", start_time="", end_time="", count=500,
             dividend_type="none", fill_data=True, subscribe=False)
-        # 历史代码范围不改变原快照白名单。
-        self.assertFalse(self.process("get_ticks", params={"codes": ["000002.SZ"]})["ok"])
+        # 快照与历史均按请求合法代码读取，初始代码集合仅是元数据。
+        snapshot = self.process("get_ticks", params={"codes": ["000002.SZ"]})
+        self.assertTrue(snapshot["ok"], snapshot)
+        self.assertEqual(set(snapshot["data"]), {"000002.SZ"})
+        self.assertEqual(self.process("get_ticks", params={"codes": ["000002.XX"]})["server_error"],
+                         "INVALID_PARAMS")
 
     def test_cross_day_daily_preserves_all_native_rows(self):
         data = frame("1d")

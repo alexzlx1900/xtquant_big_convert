@@ -9,7 +9,9 @@ import uuid
 from .readonly_shm import ShmBusyError, ShmProtocolError, ShmReadOnlyClient, validate_name
 
 
-MARKET_RPC_METHODS = frozenset(("get_local_data", "get_market_data_ex", "download_history_data", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"))
+MARKET_RPC_METHODS = frozenset(("get_local_data", "get_market_data_ex", "download_history_data",
+    "get_market_data_ex_batch", "download_history_data_batch", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"))
+MINUTE_BATCH_CONTRACT = "SCOPED_MINUTE_HISTORY_BATCH_V1"
 
 
 READONLY_RPC_METHODS = frozenset((
@@ -107,6 +109,33 @@ class ShmReadOnlyRpcClient:
 
     @staticmethod
     def _market_params(method, values):
+        if method in ("get_market_data_ex_batch", "download_history_data_batch"):
+            download = method == "download_history_data_batch"
+            allowed = {"account_id", "symbols", "period", "start_time", "end_time"}
+            allowed |= {"incrementally"} if download else {"count", "dividend_type", "fill_data", "subscribe"}
+            symbols, start, end = values.get("symbols"), values.get("start_time"), values.get("end_time")
+            length = 8 if download else 14
+            if (set(values) - allowed or not isinstance(symbols, list) or not 1 <= len(symbols) <= 50
+                    or any(not isinstance(code, str) for code in symbols)
+                    or len(set(symbols)) != len(symbols) or values.get("period") != "1m"
+                    or any(not isinstance(v, str) or len(v) != length or not all("0" <= c <= "9" for c in v) for v in (start, end))
+                    or start > end or start[:8] != end[:8]):
+                raise ShmProtocolError("minute batch requires 1-50 explicit symbols and one 1m day")
+            for code in symbols:
+                ShmReadOnlyRpcClient._quote_params({"code": code})
+            try:
+                for value in (start, end):
+                    _dt.datetime.strptime(value, "%Y%m%d" if download else "%Y%m%d%H%M%S")
+            except ValueError:
+                raise ShmProtocolError("minute batch date/time is invalid")
+            if download:
+                if type(values.get("incrementally")) not in (bool, type(None)):
+                    raise ShmProtocolError("batch incrementally must be boolean or null")
+            elif (type(values.get("count")) is not int or not 1 <= values["count"] <= 301
+                  or values.get("dividend_type") != "none" or values.get("fill_data") is not False
+                  or values.get("subscribe") is not False):
+                raise ShmProtocolError("batch history requires count 1-301 and none/False/False")
+            return dict(values)
         allowed = {
             "get_local_data": {"account_id", "code", "period", "start_time", "end_time", "count", "divid_type"},
             "get_market_data_ex": {"account_id", "code", "period", "start_time", "end_time", "count", "dividend_type", "fill_data", "subscribe"},
@@ -187,6 +216,8 @@ class ShmReadOnlyRpcClient:
             raise ShmProtocolError("bridge capabilities are malformed")
         self._verified_identity = (expected_session_id, expected_native_pid)
         self._capabilities = frozenset(capabilities)
+        self._minute_batch_contract = result.get("minute_history_batch_contract")
+        self._minute_batch_max_symbols = result.get("minute_history_batch_max_symbols")
         return result
 
     def call(self, method, params=None, *, account_id=None, timeout_seconds=None,
@@ -209,6 +240,9 @@ class ShmReadOnlyRpcClient:
             values = self._market_params(method, values)
             if self._verified_identity is None or method not in self._capabilities:
                 raise ShmProtocolError("explicit identity handshake and advertised capability required")
+            if method.endswith("_batch") and (getattr(self, "_minute_batch_contract", None) != MINUTE_BATCH_CONTRACT
+                    or getattr(self, "_minute_batch_max_symbols", None) != 50):
+                raise ShmProtocolError("explicit minute batch contract required")
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         self._validate_timeout(timeout)
         if not self._lock.acquire(False):

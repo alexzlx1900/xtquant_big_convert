@@ -19,7 +19,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutErr
 from .adapters.redis_common import decode_text
 from .redis_rpc import decode_rpc_request_payload
 from .transports.readonly_shm import ShmProtocolError
-from .transports.readonly_shm_client import MARKET_RPC_METHODS, ShmReadOnlyRpcClient
+from .transports.readonly_shm_client import MARKET_RPC_METHODS, MINUTE_BATCH_CONTRACT, ShmReadOnlyRpcClient
 from .transports.redis_transport import _is_redis_timeout
 from .transports.shm_rpc import (
     ALL_WRITE_METHODS, ASYNC_SUBMIT_CONTRACT, ASYNC_WRITE_METHODS, WRITE_METHODS, validate_async_submit_params,
@@ -31,7 +31,7 @@ EXECUTION_METHODS = frozenset((
     "query_execution_snapshot", "get_trade_login_state", "poll_execution_events",
 ))
 QUOTE_METHODS = frozenset(("get_ticks", "get_full_tick"))
-PURE_READ_METHODS = EXECUTION_METHODS | QUOTE_METHODS | frozenset(("get_local_data", "get_market_data_ex"))
+PURE_READ_METHODS = EXECUTION_METHODS | QUOTE_METHODS | frozenset(("get_local_data", "get_market_data_ex", "get_market_data_ex_batch"))
 RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 WRITE_POLICIES = frozenset(("PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 RECEIVE_POLICIES = frozenset(("QUEUE_AND_PUBSUB", "QUEUE_ONLY"))
@@ -549,6 +549,11 @@ class RedisShmReadOnlyProxy:
             ShmReadOnlyRpcClient._quote_params(params, max_symbols=128 if self.environment == "LIVE" else 64)
         if method in MARKET_RPC_METHODS:
             ShmReadOnlyRpcClient._market_params(method, params)
+            if method in {"get_market_data_ex_batch", "download_history_data_batch"}:
+                source = self._source_identity.get("readonly", {})
+                if (source.get("minute_history_batch_contract") != MINUTE_BATCH_CONTRACT
+                        or source.get("minute_history_batch_max_symbols") != 50):
+                    raise ShmProtocolError("explicit verified minute batch contract required")
         if method == "get_asset" and type(params.get("include_source_evidence", False)) is not bool:
             raise ShmProtocolError("include_source_evidence must be boolean")
         if method == "poll_execution_events" and (type(params.get("after_sequence")) is not int or params["after_sequence"] < 0):
@@ -1251,11 +1256,14 @@ class RedisShmReadOnlyProxy:
                     expires = request.get("read_expires_at_unix", now + self.timeout_seconds)
                     if type(expires) not in (int, float) or not math.isfinite(expires) or expires <= now:
                         raise ShmProtocolError("read request is expired or has an invalid deadline")
-                    # 正式缓存历史入口可显式申请最多 15 秒；消费前已耗时
+                    # 读取最多 15 秒、显式下载批次最多 60 秒；消费前已耗时
                     # 仍由调用方原始绝对截止扣除，其他方法保留原预算。
-                    request_budget = (15.0 if request["method"] == "get_market_data_ex"
-                                      and "read_expires_at_unix" in request
-                                      else self.timeout_seconds)
+                    request_budget = self.timeout_seconds
+                    if "read_expires_at_unix" in request:
+                        if request["method"] in {"get_market_data_ex", "get_market_data_ex_batch"}:
+                            request_budget = 15.0
+                        elif request["method"] == "download_history_data_batch":
+                            request_budget = 60.0
                     deadline = min(expires, now + request_budget)
                     if self.deadline_unix is not None:
                         deadline = min(deadline, self.deadline_unix)

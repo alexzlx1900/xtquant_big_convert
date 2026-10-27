@@ -27,6 +27,8 @@ RPC_REVISION = "shm-readonly-single-file-v2"
 QUOTE_SUBSCRIPTION_CONTRACT = "SCOPED_TICK_CAPTURE_V1"
 QUOTE_SUBSCRIPTION_LIMIT = 128
 HISTORY_PAYLOAD_LIMIT_BYTES = 8 * 1024 * 1024 - 16384
+MINUTE_BATCH_CONTRACT = "SCOPED_MINUTE_HISTORY_BATCH_V1"
+MINUTE_BATCH_MAX_SYMBOLS = 50
 _EMBEDDED_SOURCES = {}  # BUILD_READONLY_EMBEDDED
 _MODULE_CACHE = {}
 _ORIGINAL_IMPORT = builtins.__import__
@@ -213,9 +215,11 @@ class ShmReadOnlyBridge:
             allowed_methods = ("ping", "get_positions", "get_full_tick", "get_ticks", "get_asset", "query_orders", "query_trades")
             if self.market_enabled:
                 allowed_methods += ("get_local_data", "get_market_data_ex", "subscribe_quote", "poll_quote_events", "unsubscribe_quote")
+                if callable(getattr(self.context, "get_market_data_ex", None)):
+                    allowed_methods += ("get_market_data_ex_batch",)
                 if callable(self.history_downloader):
-                    allowed_methods += ("download_history_data",)
-            if method == "download_history_data" and self.market_enabled and not callable(self.history_downloader):
+                    allowed_methods += ("download_history_data", "download_history_data_batch")
+            if method in ("download_history_data", "download_history_data_batch") and self.market_enabled and not callable(self.history_downloader):
                 raise ReadOnlyRequestError("CAPABILITY_MISSING", "native download_history_data is not injected")
             if method not in allowed_methods:
                 raise ReadOnlyRequestError("METHOD_DENIED", "method is outside the readonly allowlist")
@@ -250,8 +254,11 @@ class ShmReadOnlyBridge:
                             ("get_all_subscription", "subscribe_quote", "unsubscribe_quote", "get_market_data_ex")) else [],
                         "session_id": self.mailbox.session_id, "native_pid": self.mailbox.server_pid, "capabilities": list(allowed_methods)}
                 data.update(self.quote_subscription_metadata())
-            elif method in ("get_local_data", "get_market_data_ex", "download_history_data", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"):
-                data = self.market_request(method, params)
+                if self.market_enabled:
+                    data.update(minute_history_batch_contract=MINUTE_BATCH_CONTRACT,
+                                minute_history_batch_max_symbols=MINUTE_BATCH_MAX_SYMBOLS)
+            elif method in ("get_local_data", "get_market_data_ex", "download_history_data", "get_market_data_ex_batch", "download_history_data_batch", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"):
+                data = self.market_request(method, params, deadline=expires_at)
                 data.update(account_id=self.account_id, session_id=self.mailbox.session_id,
                             native_pid=self.mailbox.server_pid, windows_session_id=self.windows_session_id)
             elif method == "get_positions":
@@ -338,7 +345,8 @@ class ShmReadOnlyBridge:
                     })
                     raise ReadOnlyRequestError("QMT_QUOTE_UNAVAILABLE", "native quote batch is incomplete or invalid")
             if time.time() >= expires_at:
-                raise ReadOnlyRequestError("READ_EXPIRED_DURING_EXECUTION", "read finished after its deadline; result is unconfirmed")
+                raise ReadOnlyRequestError("READ_EXPIRED_DURING_EXECUTION", "read finished after its deadline; result is unconfirmed",
+                                           data=data if method == "download_history_data_batch" else None)
             response.update(ok=True, data=self.serializer(data))
         except Exception as exc:
             if isinstance(exc, ReadOnlyRequestError) and exc.data is not None:
@@ -349,6 +357,21 @@ class ShmReadOnlyBridge:
             response["data"]["source_evidence"].update(session_id=self.mailbox.session_id,
                 native_pid=self.mailbox.server_pid, windows_session_id=self.windows_session_id,
                 environment=self.environment)
+        if method in ("get_market_data_ex_batch", "download_history_data_batch") and isinstance(response["data"], dict):
+            for item in response["data"].get("results", {}).values():
+                item.update(account_id=self.account_id, session_id=self.mailbox.session_id,
+                            native_pid=self.mailbox.server_pid, windows_session_id=self.windows_session_id,
+                            environment=self.environment)
+                if isinstance(item.get("source_evidence"), dict):
+                    item["source_evidence"].update(session_id=self.mailbox.session_id,
+                        native_pid=self.mailbox.server_pid, windows_session_id=self.windows_session_id,
+                        environment=self.environment)
+                    if method == "download_history_data_batch":
+                        item["source_evidence"]["account_id"] = self.account_id
+            # 身份字段和外层信封也计入批次上限，不能靠预留字节估算最终大小。
+            if len(json.dumps(response, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")) > HISTORY_PAYLOAD_LIMIT_BYTES:
+                response.update(ok=False, data=None, error="minute batch exceeds bounded 8MiB response; no rows were truncated",
+                                server_error="HISTORY_PAYLOAD_TOO_LARGE")
         self.request_count += 1
         print("AQP_SHM_READONLY_RPC " + json.dumps({
             "request_id": response["request_id"], "method": response["method"], "sequence": response["sequence"],
@@ -381,7 +404,7 @@ class ShmReadOnlyBridge:
             raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history index is not a valid timestamp")
         return text
 
-    def _history_request(self, method, params):
+    def _history_request(self, method, params, native_result=None, native_result_provided=False):
         allowed = {"account_id", "code", "period", "start_time", "end_time", "count", "divid_type"}
         if method == "get_market_data_ex":
             allowed = {"account_id", "code", "period", "start_time", "end_time", "count", "dividend_type", "fill_data", "subscribe"}
@@ -416,8 +439,9 @@ class ShmReadOnlyBridge:
             return result
         if method == "get_market_data_ex":
             fields = [] if period == "tick" else ["open", "high", "low", "close", "volume", "amount"]
-            raw = native(fields, [code], period=period, start_time=start, end_time=end, count=count,
-                         dividend_type="none", fill_data=params["fill_data"], subscribe=False)
+            raw = native_result if native_result_provided else native(
+                fields, [code], period=period, start_time=start, end_time=end, count=count,
+                dividend_type="none", fill_data=params["fill_data"], subscribe=False)
             if raw is not None:
                 if not isinstance(raw, dict) or set(raw) - {code}:
                     raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native history escaped the requested symbol")
@@ -489,6 +513,85 @@ class ShmReadOnlyBridge:
                 result["source_evidence"]["unavailable_last_price_count"] = unavailable_last_price_count
         if len(json.dumps(result, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")) > HISTORY_PAYLOAD_LIMIT_BYTES:
             raise ReadOnlyRequestError("HISTORY_PAYLOAD_TOO_LARGE", "native history exceeds bounded 8MiB response; request a smaller explicit window/count, no rows were truncated")
+        return result
+
+    def _minute_batch_params(self, params, download=False):
+        allowed = {"account_id", "symbols", "period", "start_time", "end_time"}
+        allowed |= {"incrementally"} if download else {"count", "dividend_type", "fill_data", "subscribe"}
+        symbols, start, end = params.get("symbols"), params.get("start_time"), params.get("end_time")
+        length = 8 if download else 14
+        if (set(params) - allowed or not isinstance(symbols, list)
+                or not 1 <= len(symbols) <= MINUTE_BATCH_MAX_SYMBOLS
+                or any(not self._history_symbol(code) for code in symbols)
+                or len(set(symbols)) != len(symbols) or params.get("period") != "1m"
+                or any(not isinstance(v, str) or len(v) != length or not all("0" <= c <= "9" for c in v) for v in (start, end))
+                or start > end or start[:8] != end[:8]):
+            raise ReadOnlyRequestError("INVALID_PARAMS", "minute batch requires 1-50 explicit unique symbols and one bounded 1m day")
+        try:
+            for value in (start, end):
+                _dt.datetime.strptime(value, "%Y%m%d" if download else "%Y%m%d%H%M%S")
+        except ValueError:
+            raise ReadOnlyRequestError("INVALID_PARAMS", "minute batch date/time is invalid")
+        if download:
+            if type(params.get("incrementally")) not in (bool, type(None)):
+                raise ReadOnlyRequestError("INVALID_PARAMS", "incrementally must be boolean or null")
+        elif (type(params.get("count")) is not int or not 1 <= params["count"] <= 301
+              or params.get("dividend_type") != "none" or params.get("fill_data") is not False
+              or params.get("subscribe") is not False):
+            raise ReadOnlyRequestError("INVALID_PARAMS", "minute batch requires count 1-301, none/False/False")
+        return list(symbols)
+
+    def _history_batch_request(self, params):
+        symbols = self._minute_batch_params(params)
+        native = getattr(self.context, "get_market_data_ex", None)
+        if not callable(native):
+            raise ReadOnlyRequestError("CAPABILITY_MISSING", "native batch history is unavailable")
+        raw = native(["open", "high", "low", "close", "volume", "amount"], symbols,
+                     period="1m", start_time=params["start_time"], end_time=params["end_time"],
+                     count=params["count"], dividend_type="none", fill_data=False, subscribe=False)
+        if raw is not None and (not isinstance(raw, dict) or set(raw) - set(symbols)):
+            raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native batch escaped its symbol whitelist")
+        results = {}
+        for code in symbols:
+            single = {key: value for key, value in params.items() if key != "symbols"}
+            single["code"] = code
+            results[code] = self._history_request("get_market_data_ex", single,
+                native_result=None if raw is None else ({code: raw[code]} if code in raw else {}),
+                native_result_provided=True)
+        result = {"status": "OK" if all(item["status"] in ("OK", "EMPTY") for item in results.values()) else "UNAVAILABLE",
+                  "contract": MINUTE_BATCH_CONTRACT, "symbols": symbols, "period": "1m", "results": results,
+                  "source_evidence": {"native_method": "get_market_data_ex", "native_call_count": 1,
+                                      "requested_symbols": symbols, "start_time": params["start_time"],
+                                      "end_time": params["end_time"], "count": params["count"],
+                                      "dividend_type": "none", "fill_data": False, "subscribe": False}}
+        return result
+
+    def _download_batch_request(self, params, deadline):
+        symbols = self._minute_batch_params(params, download=True)
+        result = {"status": "REQUESTED", "contract": MINUTE_BATCH_CONTRACT, "symbols": symbols,
+                  "period": "1m", "completion_confirmed": False, "readback_required": True,
+                  "automatic_retry": False,
+                  "results": {code: {"code": code, "status": "NOT_ATTEMPTED"} for code in symbols},
+                  "source_evidence": {"native_method": "download_history_data", "start_time": params["start_time"],
+                                      "end_time": params["end_time"], "incrementally": params.get("incrementally")}}
+        for code in symbols:
+            if deadline is not None and time.time() >= deadline:
+                result["status"] = "UNKNOWN"
+                break
+            single = {key: value for key, value in params.items() if key != "symbols"}
+            single["code"] = code
+            try:
+                result["results"][code] = self._download_request(single)
+            except Exception as exc:
+                rejected = isinstance(exc, ReadOnlyRequestError) and exc.code == "NATIVE_DOWNLOAD_REJECTED"
+                result["results"][code] = {"code": code, "status": "REJECTED" if rejected else "UNKNOWN",
+                                           "reason": str(exc)[:500], "automatic_retry": False}
+                result["status"] = "PARTIAL" if rejected else "UNKNOWN"
+                break
+            if deadline is not None and time.time() >= deadline:
+                result["results"][code]["status"] = "UNKNOWN"
+                result["status"] = "UNKNOWN"
+                break
         return result
 
     def _download_request(self, params):
@@ -718,7 +821,11 @@ class ShmReadOnlyBridge:
         subscription["cancel_result"] = result
         return dict(result)
 
-    def market_request(self, method, params):
+    def market_request(self, method, params, deadline=None):
+        if method == "get_market_data_ex_batch":
+            return self._history_batch_request(params)
+        if method == "download_history_data_batch":
+            return self._download_batch_request(params, deadline)
         if method in ("get_local_data", "get_market_data_ex"):
             return self._history_request(method, params)
         if method == "download_history_data":
