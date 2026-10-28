@@ -355,9 +355,14 @@ class ShmReadOnlyClient:
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at) or expires_at <= time.time():
             raise ValueError("read deadline must be a finite future timestamp")
         payload.update(schema_version=payload.get("schema_version", 1), session_id=self.mailbox.session_id, read_expires_at_unix=min(expires_at, time.time() + timeout_seconds))
+        event_poll = payload.get("method") == "poll_execution_events"
+        started_monotonic = time.monotonic() if event_poll else None
         read_timing = ({"shm_client_started_at_unix": time.time(),
                         "shm_deadline_at_unix": payload["read_expires_at_unix"]}
-                       if payload.get("method") == "get_positions" else None)
+                       if payload.get("method") == "get_positions" or event_poll else None)
+        if event_poll:
+            read_timing.update(shm_client_started_at_monotonic=started_monotonic,
+                               shm_client_started_at_monotonic_after=time.monotonic())
         deadline = time.monotonic() + timeout_seconds
         region = self.mailbox.region
         remaining = min(deadline - time.monotonic(), payload["read_expires_at_unix"] - time.time())
@@ -387,7 +392,11 @@ class ShmReadOnlyClient:
             header[7], header[4] = len(raw), sequence
             self.mailbox._write_header(header)
             if read_timing is not None:
+                if event_poll:
+                    read_timing["shm_published_at_monotonic"] = time.monotonic()
                 read_timing["shm_published_at_unix"] = time.time()
+                if event_poll:
+                    read_timing["shm_published_at_monotonic_after"] = time.monotonic()
         except Exception as exc:
             if read_timing is not None:
                 exc.read_timing = dict(read_timing)
@@ -401,7 +410,11 @@ class ShmReadOnlyClient:
                         header = self.mailbox._header()
                         if header[5] == sequence:
                             if read_timing is not None:
+                                if event_poll:
+                                    read_timing["shm_response_observed_at_monotonic"] = time.monotonic()
                                 read_timing["shm_response_observed_at_unix"] = time.time()
+                                if event_poll:
+                                    read_timing["shm_response_observed_at_monotonic_after"] = time.monotonic()
                             if not 0 < header[8] <= RESPONSE_CAPACITY:
                                 raise ShmProtocolError("invalid response payload length")
                             response = decode_payload(region.read(RESPONSE_OFFSET, header[8]))
@@ -410,7 +423,11 @@ class ShmReadOnlyClient:
                                 read_timing["shm_response_validated_at_unix"] = time.time()
                                 native_timing = response.get("read_timing")
                                 if isinstance(native_timing, dict):
-                                    for field in ("native_started_at_unix", "native_finished_at_unix"):
+                                    fields = ("native_started_at_unix", "native_finished_at_unix")
+                                    if event_poll:
+                                        fields += ("native_started_at_monotonic", "native_started_at_monotonic_after",
+                                                   "native_finished_at_monotonic", "native_finished_at_monotonic_after")
+                                    for field in fields:
                                         value = native_timing.get(field)
                                         if type(value) in (int, float) and 0 < value < 1e12:
                                             read_timing[field] = value
@@ -431,6 +448,10 @@ class ShmReadOnlyClient:
         except Exception as exc:
             self.poisoned = True
             if read_timing is not None:
+                if event_poll:
+                    read_timing["shm_failed_at_monotonic"] = time.monotonic()
+                    read_timing["shm_failed_at_unix"] = time.time()
+                    read_timing["shm_failed_at_monotonic_after"] = time.monotonic()
                 exc.read_timing = dict(read_timing)
             raise
 

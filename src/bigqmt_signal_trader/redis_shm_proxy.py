@@ -40,6 +40,14 @@ POSITION_READ_TIMING_FIELDS = (
     "shm_deadline_at_unix", "shm_lock_acquired_at_unix", "shm_published_at_unix",
     "shm_response_observed_at_unix", "shm_response_validated_at_unix", "shm_ack_at_unix",
 )
+EVENT_POLL_TIMING_FIELDS = POSITION_READ_TIMING_FIELDS + (
+    "native_started_at_monotonic", "native_started_at_monotonic_after",
+    "native_finished_at_monotonic", "native_finished_at_monotonic_after",
+    "shm_client_started_at_monotonic", "shm_client_started_at_monotonic_after",
+    "shm_published_at_monotonic", "shm_published_at_monotonic_after",
+    "shm_response_observed_at_monotonic", "shm_response_observed_at_monotonic_after",
+    "shm_failed_at_unix", "shm_failed_at_monotonic", "shm_failed_at_monotonic_after",
+)
 # 柜台订单秒精度时钟与代理本机时钟不同；1258真实样本偏差为-3.049735秒。
 _BROKER_PROXY_CLOCK_TOLERANCE_SECONDS = 5.0
 _CLAIM_WRITE = """
@@ -202,10 +210,11 @@ class RedisShmReadOnlyProxy:
             self._first_error = copy.deepcopy(self._last_error)
 
     @staticmethod
-    def _position_read_timing(value):
+    def _read_timing(value, event_poll=False):
         if not isinstance(value, dict):
             return {}
-        return {key: value[key] for key in POSITION_READ_TIMING_FIELDS
+        fields = EVENT_POLL_TIMING_FIELDS if event_poll else POSITION_READ_TIMING_FIELDS
+        return {key: value[key] for key in fields
                 if type(value.get(key)) in (int, float) and 0 < value[key] < 1e12}
 
     def diagnostic_snapshot(self):
@@ -1209,8 +1218,13 @@ class RedisShmReadOnlyProxy:
             request = copy.deepcopy(request)
             self._request_context = {key: request[key][:128] for key in ("request_id", "method")
                                      if isinstance(request.get(key), str)}
+            event_poll = request.get("method") == "poll_execution_events"
+            received_monotonic = time.monotonic() if event_poll else None
             read_timing = ({"proxy_received_at_unix": time.time()}
-                           if request.get("method") == "get_positions" else None)
+                           if request.get("method") == "get_positions" or event_poll else None)
+            if event_poll:
+                read_timing.update(proxy_received_at_monotonic=received_monotonic,
+                                   proxy_received_at_monotonic_after=time.monotonic())
             if read_timing is not None:
                 self._request_context["read_timing"] = read_timing
             self._operation_phase = "REQUEST_VALIDATE"
@@ -1291,7 +1305,11 @@ class RedisShmReadOnlyProxy:
                             raise ShmProtocolError("read deadline expired before forwarding")
                         self._operation_phase = "SHM_FORWARD"
                         if read_timing is not None:
+                            if event_poll:
+                                read_timing["proxy_shm_call_at_monotonic"] = time.monotonic()
                             read_timing["proxy_shm_call_at_unix"] = time.time()
+                            if event_poll:
+                                read_timing["proxy_shm_call_at_monotonic_after"] = time.monotonic()
                         response = (prior_write if prior_write is not None else
                                     client.send_request(forwarded, timeout_seconds=remaining))
                         self._operation_phase = "SHM_RESPONSE_VALIDATE"
@@ -1299,7 +1317,7 @@ class RedisShmReadOnlyProxy:
                             self._check_response(forwarded, response, self._sessions[route])
                         response = copy.deepcopy(response)
                         if read_timing is not None:
-                            read_timing.update(self._position_read_timing(response.get("read_timing")))
+                            read_timing.update(self._read_timing(response.get("read_timing"), event_poll))
                             response["read_timing"] = dict(read_timing)
                         binding = self._source_binding()
                         if binding is not None:
@@ -1357,7 +1375,7 @@ class RedisShmReadOnlyProxy:
                                 response["source_evidence"] = wrapped["source_evidence"]
                     except Exception as exc:
                         if read_timing is not None:
-                            read_timing.update(self._position_read_timing(getattr(exc, "read_timing", None)))
+                            read_timing.update(self._read_timing(getattr(exc, "read_timing", None), event_poll))
                         self._record_error(exc)
                         response = self._response(request, exc, "SHM_RESULT_UNCONFIRMED", unknown=True)
                         if read_timing is not None:

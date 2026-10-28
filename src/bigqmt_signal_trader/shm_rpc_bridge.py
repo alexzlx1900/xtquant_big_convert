@@ -330,12 +330,17 @@ class ShmRpcBridge:
                     dropped_before_sequence=oldest - 1, lost_sequence=self._lost_sequence, automatic_retry=False)
 
     def _response(self, sequence, request):
+        event_poll = request.get("method") == "poll_execution_events"
+        started_monotonic = time.monotonic() if event_poll else None
         response = dict(schema_version=1, sequence=sequence, session_id=self.mailbox.session_id,
                     request_id=request.get("request_id"), account_id=self.account_id, environment=self.environment,
                     method=request.get("method"), ok=False, data=None, error="", server_error="",
                     handled_at=datetime.datetime.utcnow().isoformat())
-        if request.get("method") == "get_positions":
+        if request.get("method") in ("get_positions", "poll_execution_events"):
             response["read_timing"] = {"native_started_at_unix": time.time()}
+            if event_poll:
+                response["read_timing"].update(native_started_at_monotonic=started_monotonic,
+                                               native_started_at_monotonic_after=time.monotonic())
         return response
 
     def _write_result(self, method, result, error=""):
@@ -685,9 +690,13 @@ class ShmRpcBridge:
                 response.update(ok=True, data=dict(status="UNKNOWN", automatic_retry=False, error=str(exc), result=None, order_sys_id=""))
             else:
                 response.update(error=str(exc), server_error=type(exc).__name__)
-        if method == "get_positions" and "native_finished_at_unix" not in response.get("read_timing", {}):
+        if method in ("get_positions", "poll_execution_events") and "native_finished_at_unix" not in response.get("read_timing", {}):
             # 业务处理及结果归一化完成，尚未编码发布；缓存不得刷新原生处理时刻。
+            finished_monotonic = time.monotonic() if method == "poll_execution_events" else None
             response.setdefault("read_timing", {})["native_finished_at_unix"] = time.time()
+            if method == "poll_execution_events":
+                response["read_timing"].update(native_finished_at_monotonic=finished_monotonic,
+                                               native_finished_at_monotonic_after=time.monotonic())
         if validated:
             self._finish(sequence, request, response, fingerprint)
         else:
