@@ -48,11 +48,37 @@ def gateway_modules(monkeypatch):
     )
 
 
+class FixtureSupervisorWriteGate:
+    """本地线程模型，不能作为 Windows 句柄或生产授权的证据。"""
+
+    def __init__(self):
+        self.held = False
+
+    def acquire(self):
+        assert not self.held
+        self.held = True
+
+    def check(self):
+        return None
+
+    def read_epoch(self):
+        assert self.held
+        return 1
+
+    def release(self):
+        assert self.held
+        self.held = False
+
+    def close(self):
+        assert not self.held
+
+
 class Harness:
     def __init__(self, monkeypatch, gateway, *, allow_writes=True, unknown_submit=False,
                  live=False, start_write_blocked=None, live_write_authorized=False, symbols=None,
                  order_submit_mode="SYNC", redis_factory=MemoryRedis,
-                 receive_policy="QUEUE_AND_PUBSUB"):
+                 receive_policy="QUEUE_AND_PUBSUB", execution_cursor_guard_target=None,
+                 test_supervisor_gate=False):
         self.allow_writes, self.unknown_submit = allow_writes, unknown_submit
         self.account = "8882152350" if live else ACCOUNT
         self.environment = "LIVE" if live else "SIM"
@@ -65,6 +91,8 @@ class Harness:
             account_id=self.account, environment=self.environment,
             persistent_readonly=not allow_writes, persistent_live_read_write=live,
             persistent_simulation_read_write=allow_writes and not live,
+            execution_event_guard=execution_cursor_guard_target is not None,
+            read_fault_isolation=execution_cursor_guard_target is not None,
             enable_market_rpc=allow_writes,
             symbols=[CODE] if symbols is None else symbols,
         )
@@ -86,7 +114,12 @@ class Harness:
             CODE: {"20261015100100": dict(open=11.4, high=11.5, low=11.3, close=11.42,
                                        volume=100, amount=1142.0)}
         }
-        self.source.start()
+        self.source.start(enable_fixture_write_gate=test_supervisor_gate)
+        if test_supervisor_gate:
+            # 仅限本地模型；真实生成源码默认不会声明可信运行门就绪。
+            self.source.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge.runtime_metadata.update(
+                supervisor_gate_epoch_contract="SUPERVISOR_GATE_EPOCH_V1",
+                native_write_runtime_guard_attached=True, native_callback_threading_verified=True)
         self.source.namespace["account_callback"](
             self.source.context,
             SimpleNamespace(m_strAccountID=self.account, m_strStatus="登录成功", m_nBrokerType=2,
@@ -104,7 +137,12 @@ class Harness:
             allow_order_methods=allow_writes,
             runtime_policy=self.policy,
             receive_policy=receive_policy,
+            execution_cursor_guard_target=execution_cursor_guard_target,
+            supervisor_write_gate=FixtureSupervisorWriteGate() if test_supervisor_gate else None,
         )
+        if test_supervisor_gate:
+            # 仅贯通本地模型，不能作为真实进程/内核 ATTACH 验收。
+            self.proxy._supervisor_attach_verified = True
         self.pool = ThreadPoolExecutor(1)
         self.stop = threading.Event()
         self.pump = None
@@ -136,6 +174,8 @@ class Harness:
                 redis_config={}, timeout_seconds=1.0,
                 transport=RedisTransport(self.redis, account_id=self.account),
                 expected_source_binding=self.source_binding,
+                gateway_id=(execution_cursor_guard_target or {}).get("gateway_id"),
+                profile_id=(execution_cursor_guard_target or {}).get("profile_id"),
             )
 
         self.read = gateway.readonly.BigQmtReadOnlyAdapter("qmt-local-test", self.profile, client_factory=client_factory)

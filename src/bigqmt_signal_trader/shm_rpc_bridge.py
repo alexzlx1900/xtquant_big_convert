@@ -11,9 +11,25 @@ from collections import deque
 from .code_utils import normalize_stock_code
 from .exec_events import _attr as _event_attr, normalize_order_event, normalize_trade_event, normalize_order_error_event, normalize_cancel_error_event
 from .redis_rpc import to_jsonable
-from .transports.readonly_shm import ReadOnlyMailbox, ShmProtocolError, encode_payload, ShmCapacityError
+from .transports.readonly_shm import ReadOnlyMailbox, ShmProtocolError, encode_payload
 from .transports.shm_rpc import (ALL_WRITE_METHODS, ASYNC_SUBMIT_CONTRACT, ASYNC_WRITE_METHODS,
                                  READ_METHODS, WRITE_METHODS, validate_async_submit_params)
+
+
+EXECUTION_EVENT_GUARD_CONTRACT = "EXECUTION_CURSOR_WRITE_GATE_V1"
+EXECUTION_EVENT_NO_WRITE_CONTRACT = "EXECUTION_CURSOR_NO_WRITE_V1"
+SUPERVISOR_GATE_EPOCH_CONTRACT = "SUPERVISOR_GATE_EPOCH_V1"
+SUPERVISOR_GATE_NO_WRITE_CONTRACT = "SUPERVISOR_GATE_NO_WRITE_V1"
+
+
+class ExecutionEventGuardRejected(ShmProtocolError):
+    pass
+
+
+class SupervisorGateEpochRejected(ShmProtocolError):
+    def __init__(self, current_epoch=None):
+        self.current_epoch = current_epoch
+        super(SupervisorGateEpochRejected, self).__init__("SUPERVISOR_GATE_EPOCH_MISMATCH")
 
 
 class ShmRpcBridge:
@@ -21,7 +37,8 @@ class ShmRpcBridge:
                  region=None, event_capacity=64, replay_capacity=1024, trade_login_reader=None,
                  persistent_readonly=False, persistent_simulation_read_write=False,
                  environment="SIM", persistent_live_read_write=False,
-                 async_pending_capacity=64, async_confirmation_timeout_seconds=30):
+                 async_pending_capacity=64, async_confirmation_timeout_seconds=30,
+                 execution_event_guard_required=False):
         if not isinstance(account_id, str) or not account_id or handlers.account_id != account_id:
             raise ValueError("handler fixed account mismatch")
         if type(allow_order_methods) is not bool or handlers.allow_order_methods is not allow_order_methods:
@@ -45,6 +62,8 @@ class ShmRpcBridge:
             raise ValueError("bounded capacities required")
         if type(async_pending_capacity) is not int or not 1 <= async_pending_capacity <= 128:
             raise ValueError("async pending capacity must be within [1,128]")
+        if type(execution_event_guard_required) is not bool:
+            raise ValueError("execution event guard selection must be boolean")
         if (type(async_confirmation_timeout_seconds) not in (int, float)
                 or not math.isfinite(async_confirmation_timeout_seconds)
                 or not 0 < async_confirmation_timeout_seconds <= 300):
@@ -59,17 +78,32 @@ class ShmRpcBridge:
         self._events, self._event_sequence = deque(maxlen=event_capacity), 0
         self._lost_sequence = 0
         self._event_observed_cursor = 0
+        self._event_cursor_observed = False
+        self._off_thread_event_loss = threading.Event()
+        self._read_publication_lock = threading.Lock()
+        self._off_thread_event_loss_recorded = False
         self._replays, self._replay_capacity = {}, replay_capacity
         self.persistent_readonly = persistent_readonly
         self.persistent_simulation_read_write = persistent_simulation_read_write
         self.persistent_live_read_write = persistent_live_read_write
         self.persistent = persistent_readonly or persistent_simulation_read_write or persistent_live_read_write
         self.runtime_metadata = {}
+        self.read_rotation_evidence_reader = None
+        self.read_rotation_control = None
+        self.read_rotation_control_status_reader = None
+        self.read_rotation_capability_control = None
+        self.read_rotation_capability_status_reader = None
+        self.supervisor_attach_control = None
+        self.supervisor_attach_status_reader = None
         self._async_pending, self._async_claims, self._async_contract_claims = {}, {}, {}
         self._async_pending_capacity = async_pending_capacity
         self._async_confirmation_timeout_seconds = async_confirmation_timeout_seconds
         self._async_write_block_reason = ""
         self._read_replay_expiries = {}
+        self._active_write_event_guard = None
+        self._active_supervisor_gate_epoch = None
+        self.execution_event_guard_required = execution_event_guard_required
+        self.native_write_runtime_guard = None
         self._pending = None
         self.mailbox = ReadOnlyMailbox(name, create=True, region=region)
         try:
@@ -101,6 +135,83 @@ class ShmRpcBridge:
         if status == "PENDING_CONFIRMATION":
             data["receipt_type"] = "NATIVE_CALL_RETURNED"
         return self._attach_source_identity(data)
+
+    def _check_execution_event_guard(self, guard):
+        self._callback_thread()
+        if not self.execution_event_guard_required:
+            return
+        if self._off_thread_event_loss.is_set():
+            self._flush_off_thread_event_loss()
+        oldest = self._events[0]["sequence"] if self._events else self._event_sequence + 1
+        if (not isinstance(guard, dict) or set(guard) != {"contract", "execution_session_id", "native_pid", "sequence"}
+                or guard.get("contract") != EXECUTION_EVENT_GUARD_CONTRACT
+                or guard.get("execution_session_id") != self.mailbox.session_id
+                or type(guard.get("native_pid")) is not int or guard["native_pid"] != self.mailbox.server_pid
+                or type(guard.get("sequence")) is not int or guard["sequence"] < 0
+                or not self._event_cursor_observed or guard["sequence"] != self._event_sequence
+                or guard["sequence"] > self._event_observed_cursor
+                or guard["sequence"] < oldest - 1 or self._lost_sequence != 0
+                or self._off_thread_event_loss.is_set()):
+            raise ExecutionEventGuardRejected("EXECUTION_EVENT_CURSOR_NOT_CURRENT")
+
+    def check_native_write_guard(self):
+        self._check_execution_event_guard(self._active_write_event_guard)
+
+    def check_native_supervisor_gate_epoch(self, lease):
+        expected = self._active_supervisor_gate_epoch
+        if (not isinstance(expected, dict) or set(expected) != {"contract", "epoch"}
+                or expected.get("contract") != SUPERVISOR_GATE_EPOCH_CONTRACT
+                or type(expected.get("epoch")) is not int or not 1 <= expected["epoch"] <= 0xFFFFFFFFFFFFFFFF):
+            raise SupervisorGateEpochRejected()
+        try:
+            current = lease.read_epoch()
+        except Exception:
+            current = None
+        if type(current) is not int or not 1 <= current <= 0xFFFFFFFFFFFFFFFF:
+            raise SupervisorGateEpochRejected()
+        if current != expected["epoch"]:
+            raise SupervisorGateEpochRejected(current)
+
+    def _execution_guard_blocked(self, request):
+        data = (self._async_data(request, "BLOCKED", error="EXECUTION_EVENT_CURSOR_NOT_CURRENT")
+                if request.get("method") in ASYNC_WRITE_METHODS else
+                dict(status="BLOCKED", request_id=request.get("request_id"), account_id=self.account_id,
+                     environment=self.environment, session_id=self.mailbox.session_id,
+                     native_pid=self.mailbox.server_pid, windows_session_id=self.runtime_metadata.get("windows_session_id"),
+                     native_write_executed=False, automatic_retry=False, order_sys_id="", result=None,
+                     writes_blocked=bool(self._async_write_block_reason), write_block_reason=self._async_write_block_reason,
+                     error="EXECUTION_EVENT_CURSOR_NOT_CURRENT"))
+        data.update(no_write_contract=EXECUTION_EVENT_NO_WRITE_CONTRACT,
+                    execution_event_guard=(request.get("params") or {}).get("execution_event_guard"),
+                    native_event_sequence=self._event_sequence, native_lost_sequence=self._lost_sequence)
+        return data
+
+    def _runtime_guard_blocked(self, request):
+        error = "SUPERVISOR_WRITE_GATE_UNAVAILABLE"
+        self._block_async_writes(error)
+        data = (self._async_data(request, "BLOCKED", error=error) if request.get("method") in ASYNC_WRITE_METHODS else
+                dict(status="BLOCKED", request_id=request.get("request_id"), account_id=self.account_id,
+                     environment=self.environment, session_id=self.mailbox.session_id,
+                     native_pid=self.mailbox.server_pid, windows_session_id=self.runtime_metadata.get("windows_session_id"),
+                     native_write_executed=False, automatic_retry=False, order_sys_id="", result=None,
+                     writes_blocked=True, write_block_reason=self._async_write_block_reason, error=error))
+        return data
+
+    def _supervisor_epoch_blocked(self, request, current_epoch):
+        error = "SUPERVISOR_GATE_EPOCH_MISMATCH" if current_epoch is not None else "SUPERVISOR_GATE_EPOCH_UNVERIFIED"
+        if current_epoch is None:
+            self._block_async_writes(error)
+        data = (self._async_data(request, "BLOCKED", error=error) if request.get("method") in ASYNC_WRITE_METHODS else
+                dict(status="BLOCKED", request_id=request.get("request_id"), account_id=self.account_id,
+                     environment=self.environment, session_id=self.mailbox.session_id,
+                     native_pid=self.mailbox.server_pid, windows_session_id=self.runtime_metadata.get("windows_session_id"),
+                     native_write_executed=False, automatic_retry=False, order_sys_id="", result=None,
+                     writes_blocked=bool(self._async_write_block_reason), write_block_reason=self._async_write_block_reason,
+                     error=error))
+        data.update(no_write_contract=SUPERVISOR_GATE_NO_WRITE_CONTRACT,
+                    supervisor_gate_epoch=(request.get("params") or {}).get("supervisor_gate_epoch"),
+                    native_supervisor_gate_epoch=current_epoch)
+        return data
 
     def _block_async_writes(self, reason, record=None):
         if not self._async_write_block_reason:
@@ -153,6 +264,8 @@ class ShmRpcBridge:
         try:
             facts = self._async_order_facts(params)
             business_params = dict(params, account_id=self.account_id, remark=cid, wait_settlement=False)
+            business_params.pop("execution_event_guard", None)
+            business_params.pop("supervisor_gate_epoch", None)
             business_params.setdefault("signal_id", rid)
             validate = getattr(self.handlers.order_gateway, "validate_submit_params", None)
             if callable(validate):
@@ -179,6 +292,14 @@ class ShmRpcBridge:
                 self._block_async_writes(self._async_write_block_reason, pending)
             status = "UNKNOWN" if pending["state"] == "UNKNOWN" else "PENDING_CONFIRMATION"
             data = self._async_data(request, status, native_write_executed=True, error=pending["error"])
+        except ExecutionEventGuardRejected:
+            pending["state"], pending["native_write_executed"] = "NOT_EXECUTED", False
+            self._async_pending.pop(cid, None)
+            data = self._execution_guard_blocked(request)
+        except SupervisorGateEpochRejected as exc:
+            pending["state"], pending["native_write_executed"] = "NOT_EXECUTED", False
+            self._async_pending.pop(cid, None)
+            data = self._supervisor_epoch_blocked(request, exc.current_epoch)
         except Exception as exc:
             error = "NATIVE_ASYNC_CALL_UNCONFIRMED:%s; outcome=UNKNOWN" % exc.__class__.__name__
             self._block_async_writes(error, pending)
@@ -195,6 +316,9 @@ class ShmRpcBridge:
             return
         pending = self._async_claims.get(cid)
         if pending is None or pending["state"] == "UNKNOWN":
+            return
+        if pending["state"] == "NOT_EXECUTED":
+            self._block_async_writes("ASYNC_BLOCKED_CID_EVENT_CONFLICT; outcome=UNKNOWN")
             return
         account = _event_attr(native_object, ("m_strAccountID", "account_id"))
         quantity_fields = (("m_nVolumeTotalOriginal", "order_volume", "volume") if event_type == "order"
@@ -269,49 +393,103 @@ class ShmRpcBridge:
         if rejected:
             event["async_terminal_status"] = "REJECTED"
 
+    def _append_execution_event(self, sequence, event):
+        if (self._events and len(self._events) == self._events.maxlen
+                and self._events[0]["sequence"] > self._event_observed_cursor):
+            self._lost_sequence = max(self._lost_sequence, self._events[0]["sequence"])
+            self._block_async_writes("EXECUTION_EVENT_GAP; outcome=UNKNOWN")
+        self._events.append(dict(sequence=sequence, session_id=self.mailbox.session_id,
+                                 account_id=self.account_id, event=event))
+
+    def flag_off_thread_execution_event(self):
+        # 只与响应头提交短暂串行；原生调用及监督器 pipe 等待均不持此锁。
+        with self._read_publication_lock:
+            self._off_thread_event_loss.set()
+
+    def _flush_off_thread_event_loss(self):
+        if self._off_thread_event_loss.is_set() and not self._off_thread_event_loss_recorded:
+            self._off_thread_event_loss_recorded = True
+            self.record_execution_event_loss("UNKNOWN", "EXECUTION_CALLBACK_WRONG_THREAD")
+
+    def record_execution_event_loss(self, event_type, reason, sequence=None):
+        if self.execution_event_guard_required and threading.get_ident() != self._thread:
+            self.flag_off_thread_execution_event()
+            return None
+        self._callback_thread()
+        if sequence is None:
+            self._event_sequence += 1
+            sequence = self._event_sequence
+        self._lost_sequence = max(self._lost_sequence, sequence)
+        self._block_async_writes("EXECUTION_EVENT_LOSS; outcome=UNKNOWN")
+        self._append_execution_event(sequence, dict(event_type="data_loss", source_event_type=event_type,
+            account_id=self.account_id, identity_status="UNKNOWN", data_loss=True,
+            error=str(reason or "EXECUTION_EVENT_INVALID")))
+        return sequence
+
     def record_execution_event(self, event_type, native_object):
+        if self.execution_event_guard_required and threading.get_ident() != self._thread:
+            self.flag_off_thread_execution_event()
+            return None
         self._callback_thread()
         normalizers = {"order": normalize_order_event, "trade": normalize_trade_event,
                        "order_error": normalize_order_error_event, "cancel_error": normalize_cancel_error_event}
         if event_type not in normalizers:
             raise ShmProtocolError("unknown execution event type")
-        event = to_jsonable(normalizers[event_type](native_object, self.account_id))
-        if event.get("account_id") != self.account_id:
-            raise ShmProtocolError("event account mismatch")
-        # 归一化旧兼容逻辑会回退到order_id；本桥必须只信显式合同字段。
-        contract = ""
-        for field in ("m_strOrderSysID", "order_sys_id", "order_sysid"):
-            value = native_object.get(field) if isinstance(native_object, dict) else getattr(native_object, field, None)
-            if type(value) not in (str, int):
-                continue
-            text = str(value).strip()
-            if text and text.upper() not in ("0", "-1", "0.0", "-1.0", "NONE", "NULL", "UNKNOWN"):
-                contract = text
-                break
-        event["order_sys_id"] = contract
-        # 请求标识、native局部订单ID及序号只保留归属证据，不能填合同号。
-        for source, target in (("request_id", "request_id"), ("order_id", "native_order_id"), ("seq", "native_sequence")):
-            value = native_object.get(source) if isinstance(native_object, dict) else getattr(native_object, source, None)
-            if type(value) in (str, int):
-                event[target] = value
-        event["identity_status"] = "KNOWN" if event.get("order_sys_id") else "UNKNOWN"
-        if (self._async_claims and self._events and len(self._events) == self._events.maxlen
-                and self._events[0]["sequence"] > self._event_observed_cursor):
-            self._block_async_writes("ASYNC_EXECUTION_EVENT_GAP; outcome=UNKNOWN")
-        self._confirm_async_event(event_type, native_object, event)
-        self._event_sequence += 1
+        sequence = None
+        if self.execution_event_guard_required:
+            self._event_sequence += 1
+            sequence = self._event_sequence
+        try:
+            event = to_jsonable(normalizers[event_type](native_object, self.account_id))
+            if event.get("account_id") != self.account_id:
+                raise ShmProtocolError("event account mismatch")
+            # 归一化旧兼容逻辑会回退到order_id；本桥必须只信显式合同字段。
+            contract = ""
+            for field in ("m_strOrderSysID", "order_sys_id", "order_sysid"):
+                value = native_object.get(field) if isinstance(native_object, dict) else getattr(native_object, field, None)
+                if type(value) not in (str, int):
+                    continue
+                text = str(value).strip()
+                if text and text.upper() not in ("0", "-1", "0.0", "-1.0", "NONE", "NULL", "UNKNOWN"):
+                    contract = text
+                    break
+            event["order_sys_id"] = contract
+            for source, target in (("request_id", "request_id"), ("order_id", "native_order_id"), ("seq", "native_sequence")):
+                value = native_object.get(source) if isinstance(native_object, dict) else getattr(native_object, source, None)
+                if type(value) in (str, int):
+                    event[target] = value
+            event["identity_status"] = "KNOWN" if event.get("order_sys_id") else "UNKNOWN"
+            if (not self.execution_event_guard_required and self._async_claims and self._events
+                    and len(self._events) == self._events.maxlen
+                    and self._events[0]["sequence"] > self._event_observed_cursor):
+                self._block_async_writes("ASYNC_EXECUTION_EVENT_GAP; outcome=UNKNOWN")
+            self._confirm_async_event(event_type, native_object, event)
+        except Exception as exc:
+            if self.execution_event_guard_required:
+                return self.record_execution_event_loss(event_type, "EXECUTION_EVENT_INVALID:%s" % type(exc).__name__, sequence)
+            raise
+        if not self.execution_event_guard_required:
+            self._event_sequence += 1
+            sequence = self._event_sequence
         try:
             encode_payload(event, 1536)
-        except (ShmCapacityError, ValueError, TypeError):
-            self._lost_sequence = self._event_sequence
+        except Exception as exc:
+            if self.execution_event_guard_required:
+                return self.record_execution_event_loss(event_type, "EXECUTION_EVENT_INVALID:%s" % type(exc).__name__, sequence)
+            if not isinstance(exc, (ValueError, TypeError)):
+                raise
+            self._lost_sequence = sequence
             if self._async_claims:
                 self._block_async_writes("ASYNC_EXECUTION_EVENT_LOSS; outcome=UNKNOWN")
             event = dict(event_type=event_type, account_id=self.account_id,
                          identity_status="UNKNOWN", order_sys_id="", data_loss=True,
                          error="EXECUTION_EVENT_TOO_LARGE_OR_INVALID")
-        self._events.append(dict(sequence=self._event_sequence, session_id=self.mailbox.session_id,
-                                 account_id=self.account_id, event=event))
-        return self._event_sequence
+        if self.execution_event_guard_required:
+            self._append_execution_event(sequence, event)
+        else:
+            self._events.append(dict(sequence=sequence, session_id=self.mailbox.session_id,
+                                     account_id=self.account_id, event=event))
+        return sequence
 
     def _poll_events(self, params):
         after = params.get("after_sequence")
@@ -320,8 +498,10 @@ class ShmRpcBridge:
         oldest = self._events[0]["sequence"] if self._events else self._event_sequence + 1
         gap = after < oldest - 1 or after < self._lost_sequence
         self._event_observed_cursor = max(self._event_observed_cursor, after)
-        if gap and self._async_claims:
-            self._block_async_writes("ASYNC_EXECUTION_EVENT_GAP; outcome=UNKNOWN")
+        self._event_cursor_observed = True
+        if gap and (self.execution_event_guard_required or self._async_claims):
+            reason = "EXECUTION_EVENT_GAP" if self.execution_event_guard_required else "ASYNC_EXECUTION_EVENT_GAP"
+            self._block_async_writes(reason + "; outcome=UNKNOWN")
         return dict(events=[dict(e) for e in self._events if e["sequence"] > after],
                     session_id=self.mailbox.session_id, native_pid=self.mailbox.server_pid,
                     windows_session_id=self.runtime_metadata.get("windows_session_id"), environment=self.environment,
@@ -409,6 +589,9 @@ class ShmRpcBridge:
                        native_pid=self.mailbox.server_pid, source="NONE", raw_status=None,
                        event_observed_at_utc=None, age_seconds=None, fresh=False,
                        positive_contract_verified=False, reason="TRADE_LOGIN_SOURCE_UNAVAILABLE")
+        if self.execution_event_guard_required and (self._off_thread_event_loss.is_set() or self._lost_sequence):
+            unknown["reason"] = "NATIVE_CALLBACK_CONTINUITY_UNVERIFIED"
+            return unknown
         if not callable(self.trade_login_reader):
             return unknown
         try:
@@ -535,6 +718,8 @@ class ShmRpcBridge:
 
     def poll_once(self):
         self._callback_thread()
+        if self.execution_event_guard_required:
+            self._flush_off_thread_event_loss()
         self._refresh_async_pending()
         self._expire_confirmed_read_replays()
         if self._pending is not None:
@@ -627,6 +812,36 @@ class ShmRpcBridge:
                               allow_order_methods=self.allow_order_methods, session_id=self.mailbox.session_id,
                               native_pid=self.mailbox.server_pid, capabilities=sorted(READ_METHODS | (ALL_WRITE_METHODS if self.allow_order_methods else frozenset())))
                 result.update(self.runtime_metadata)
+                if callable(self.read_rotation_evidence_reader):
+                    try:
+                        result["read_rotation_evidence"] = self.read_rotation_evidence_reader()
+                    except Exception:
+                        result["read_rotation_evidence"] = None
+                if "read_rotation" in params:
+                    if set(params) != {"read_rotation"} or not callable(self.read_rotation_control):
+                        raise ShmProtocolError("read rotation control is unavailable")
+                    result["read_rotation_control"] = self.read_rotation_control(params["read_rotation"])
+                if "read_rotation_control_status" in params:
+                    if set(params) != {"read_rotation_control_status"} or not callable(self.read_rotation_control_status_reader):
+                        raise ShmProtocolError("read rotation control status is unavailable")
+                    result["read_rotation_control_status"] = self.read_rotation_control_status_reader(params["read_rotation_control_status"])
+                if "read_rotation_capability" in params:
+                    if set(params) != {"read_rotation_capability"} or not callable(self.read_rotation_capability_control):
+                        raise ShmProtocolError("read rotation capability is unavailable")
+                    result["read_rotation_capability"] = self.read_rotation_capability_control(params["read_rotation_capability"])
+                if "read_rotation_capability_status" in params:
+                    if set(params) != {"read_rotation_capability_status"} or not callable(self.read_rotation_capability_status_reader):
+                        raise ShmProtocolError("read rotation capability status is unavailable")
+                    result["read_rotation_capability_status"] = self.read_rotation_capability_status_reader(params["read_rotation_capability_status"])
+                if "supervisor_attach" in params:
+                    if set(params) != {"supervisor_attach"} or not callable(self.supervisor_attach_control):
+                        raise ShmProtocolError("supervisor attachment is unavailable")
+                    result["supervisor_attach"] = self.supervisor_attach_control(params["supervisor_attach"])
+                    result.update(self.runtime_metadata)
+                if "supervisor_attach_status" in params:
+                    if set(params) != {"supervisor_attach_status"} or not callable(self.supervisor_attach_status_reader):
+                        raise ShmProtocolError("supervisor attachment status is unavailable")
+                    result["supervisor_attach_status"] = self.supervisor_attach_status_reader(params["supervisor_attach_status"])
                 result.update(async_submit_contract=ASYNC_SUBMIT_CONTRACT,
                               writes_blocked=bool(self._async_write_block_reason),
                               write_block_reason=self._async_write_block_reason,
@@ -636,9 +851,23 @@ class ShmRpcBridge:
                 result = self._poll_events(params)
             elif method == "get_trade_login_state":
                 diagnostic = getattr(self, "trade_login_diagnostic_reader", None)
-                result = diagnostic() if callable(diagnostic) else self._trade_login()
+                if self.execution_event_guard_required and (self._off_thread_event_loss.is_set() or self._lost_sequence):
+                    result = self._trade_login()
+                else:
+                    result = diagnostic() if callable(diagnostic) else self._trade_login()
             else:
                 if method in ALL_WRITE_METHODS:
+                    self._check_execution_event_guard(params.get("execution_event_guard"))
+                    if (self.execution_event_guard_required and
+                            (self.runtime_metadata.get("native_write_runtime_guard_ready") is not True
+                             or self.runtime_metadata.get("native_write_runtime_guard_attached") is not True
+                             or self.runtime_metadata.get("native_callback_threading_verified") is not True
+                             or self.runtime_metadata.get("supervisor_write_gate_contract") != "INHERITED_SUPERVISOR_GATE_V1"
+                             or self.runtime_metadata.get("supervisor_gate_epoch_contract") != "SUPERVISOR_GATE_EPOCH_V1"
+                             or not callable(self.native_write_runtime_guard))):
+                        response.update(ok=True, data=self._runtime_guard_blocked(request))
+                        self._finish(sequence, request, response, fingerprint)
+                        return self.poll_once()
                     if self._async_write_block_reason:
                         data = (self._async_data(request, "UNKNOWN", error=self._async_write_block_reason)
                                 if method in ASYNC_WRITE_METHODS else
@@ -658,10 +887,21 @@ class ShmRpcBridge:
                         response.update(ok=True, data=data)
                         self._finish(sequence, request, response, fingerprint)
                         return self.poll_once()
+                    if self._active_write_event_guard is not None:
+                        raise ExecutionEventGuardRejected("EXECUTION_EVENT_CURSOR_NOT_CURRENT")
+                    self._check_execution_event_guard(params.get("execution_event_guard"))
                 if method in ASYNC_WRITE_METHODS:
-                    result = self._submit_async(request, fingerprint)
+                    self._active_write_event_guard = params.get("execution_event_guard")
+                    self._active_supervisor_gate_epoch = params.get("supervisor_gate_epoch")
+                    try:
+                        result = self._submit_async(request, fingerprint)
+                    finally:
+                        self._active_write_event_guard = None
+                        self._active_supervisor_gate_epoch = None
                 else:
                     business_params = dict(params)
+                    business_params.pop("execution_event_guard", None)
+                    business_params.pop("supervisor_gate_epoch", None)
                     business_params["account_id"] = self.account_id
                     if method == "submit_order":
                         business_params.setdefault("signal_id", rid)
@@ -669,7 +909,16 @@ class ShmRpcBridge:
                         validate = getattr(self.handlers.order_gateway, "validate_submit_params", None)
                         if callable(validate):
                             validate(business_params)
-                    result = self._read_with_evidence(method, business_params) if method in READ_METHODS else self.handlers.handle(method, business_params)
+                    if method in READ_METHODS:
+                        result = self._read_with_evidence(method, business_params)
+                    else:
+                        self._active_write_event_guard = params.get("execution_event_guard")
+                        self._active_supervisor_gate_epoch = params.get("supervisor_gate_epoch")
+                        try:
+                            result = self.handlers.handle(method, business_params)
+                        finally:
+                            self._active_write_event_guard = None
+                            self._active_supervisor_gate_epoch = None
                     if method in WRITE_METHODS:
                         settlement = self.handlers.take_pending_settlement()
                         if (method == "cancel_order" and getattr(result, "confirmation_pending", False) is True
@@ -681,6 +930,10 @@ class ShmRpcBridge:
                             return self.poll_once()
                         result = response["data"]
             response.update(ok=True, data=self._attach_source_identity(to_jsonable(result)))
+        except ExecutionEventGuardRejected:
+            response.update(ok=True, data=self._execution_guard_blocked(request))
+        except SupervisorGateEpochRejected as exc:
+            response.update(ok=True, data=self._supervisor_epoch_blocked(request, exc.current_epoch))
         except Exception as exc:
             if validated and method in ASYNC_WRITE_METHODS:
                 error = "ASYNC_BRIDGE_UNCONFIRMED:%s; outcome=UNKNOWN" % exc.__class__.__name__

@@ -73,9 +73,74 @@ class MemoryRedis:
 
     def eval(self, script, numkeys, key, *args):
         """原子Hash容量门与CAS；匹配Redis语义，不模拟代理业务路由。"""
-        assert numkeys == 1
+        assert numkeys in (1, 2)
         with self.lock:
+            if "ROTATION_CLOSE_CLAIM_V1" in script or "ROTATION_CLOSE_SETTLE_V1" in script:
+                close_key, rid, raw, pending, *remaining = args
+                values, close = self.hashes.get(key, {}), self.hashes.get(close_key, {})
+                if key not in self.hashes or key in self.ttls or values.get(rid) != raw:
+                    return 0
+                if "ROTATION_CLOSE_CLAIM_V1" in script:
+                    history = json.loads(remaining[0])
+                    if (close_key in self.ttls or rid in close or len(values) != len(history)
+                            or len(close) != sum(item[2] is not False for item in history)
+                            or any(values.get(item[0]) != item[1] or
+                                   (item[2] is False and item[0] in close) or
+                                   (item[2] is not False and close.get(item[0]) != item[2]) for item in history)):
+                        return 0
+                    self.hashes.setdefault(close_key, {})[rid] = pending
+                    return 1
+                if close_key not in self.hashes or close_key in self.ttls or close.get(rid) != pending:
+                    return 0
+                close[rid] = remaining[0]
+                return 1
+            if "ROTATION_DEPENDENCIES_VERIFY_V1" in script:
+                close_key, serialized, *options = args
+                values, close = self.hashes.get(key, {}), self.hashes.get(close_key, {})
+                if key not in self.hashes or key in self.ttls:
+                    return 0
+                dependencies = json.loads(serialized)
+                if (options == ["FULL"] and (len(values) != len(dependencies)
+                        or len(close) != sum(item[2] is not False for item in dependencies))):
+                    return 0
+                for transition, raw, closed_raw in dependencies:
+                    if (values.get(transition) != raw or
+                            (closed_raw is False and transition in close) or
+                            (closed_raw is not False and
+                             (close_key not in self.hashes or close_key in self.ttls or close.get(transition) != closed_raw))):
+                        return 0
+                return 1
+            if "ROTATION_HISTORY_CLAIM_V1" in script:
+                close_key, rid, capacity, encoded, serialized = args
+                values, close = self.hashes.get(key, {}), self.hashes.get(close_key, {})
+                history = json.loads(serialized)
+                if (len(values) != len(history) or len(close) != len(history)
+                        or history and (key in self.ttls or close_key in self.ttls)
+                        or any(values.get(item[0]) != item[1] or close.get(item[0]) != item[2] for item in history)):
+                    return [-2, ""]
+                if rid in values:
+                    return [0, ""]
+                if len(history) >= int(capacity):
+                    return [-1, ""]
+                self.hashes.setdefault(key, {})[rid] = encoded
+                return [1, encoded]
             values = self.hashes.setdefault(key, {})
+            if numkeys == 2:
+                cid_key, rid, old_or_capacity, encoded, cid = args
+                cid_values = self.hashes.setdefault(cid_key, {})
+                if "HLEN" in script:
+                    if rid in values:
+                        return [0, values[rid]]
+                    if cid in cid_values:
+                        return [-2, cid_values[cid]]
+                    if len(values) >= int(old_or_capacity):
+                        return [-1, ""]
+                    values[rid], cid_values[cid] = encoded, rid
+                    return [1, encoded]
+                if cid_values.get(cid) != rid or values.get(rid) != old_or_capacity:
+                    return 0
+                values[rid] = encoded
+                return 1
             if "HLEN" in script:
                 rid, capacity, record = args
                 if rid in values:
@@ -89,6 +154,12 @@ class MemoryRedis:
                 return 0
             values[rid] = new
             return 1
+
+    def ttl(self, key):
+        with self.lock:
+            if key in self.ttls:
+                return self.ttls[key]
+            return -1 if key in self.hashes or key in self.values or key in self.lists else -2
 
     def setex(self, key, ttl, value):
         with self.lock:
@@ -157,6 +228,7 @@ class Harness:
             account_id=ACCOUNT, expected_readonly_session_id=self.source.clients["read"].mailbox.session_id,
             expected_execution_session_id=self.source.clients["execution"].mailbox.session_id,
             expected_native_pid=os.getpid(), timeout_seconds=timeout,
+            execution_cursor_guard_target={"gateway_id": "qmt-vm-001", "profile_id": "sim-bigqmt"},
             deadline_unix=time.time() + 30,
         )
         self.execute(self.proxy.verify_identity)
@@ -253,11 +325,19 @@ def test_actual_native_timeout_is_unknown_sticky_and_late_expired_query_does_not
         # 不运行QMT callback，真实写入内存邮箱后超时。
         response = h.proxy.process_raw(encode_rpc_request_payload(request))
         assert response["status"] == "UNKNOWN" and not response["ok"]
-        assert response["automatic_retry"] is False and h.proxy.stopped
-        with pytest.raises(Exception, match="stopped"):
-            h.proxy.process_request(request)
+        assert response["automatic_retry"] is False and not h.proxy.stopped
+        assert h.proxy.identity_snapshot()["execution_source_state"] == "RESULT_UNKNOWN"
+        assert h.proxy.identity_snapshot()["writes_blocked"] is True
+        assert h.proxy.process_request(request) == response
         h.drain()
         assert len(h.source.query_calls) == before
-        assert h.proxy.processed_count == 1
+        quote = dict(schema_version=1, request_id="other-read", account_id=ACCOUNT,
+                     method="get_ticks", params={"code": CODE})
+        result = h.execute(h.proxy.process_request, quote)
+        assert result["ok"] and result["account_id"] == ACCOUNT
+        assert result["session_id"] == h.source.clients["read"].mailbox.session_id
+        assert result["source_binding"]["execution_session_id"] == h.source.clients["execution"].mailbox.session_id
+        assert not h.redis.hashes and len(h.source.query_calls) == before
+        assert h.proxy.processed_count == 2
     finally:
         h.close()

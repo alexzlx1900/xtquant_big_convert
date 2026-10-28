@@ -52,6 +52,313 @@ def test_invalid_or_expanded_configuration_is_rejected_before_runtime(change):
         RUNNER.validate_config(config(**change))
 
 
+def test_target_config_requires_exact_vm_profile_and_keeps_same_account_legacy_by_default():
+    sim = {"gateway_id": "qmt-vm-001", "profile_id": "sim-bigqmt"}
+    live = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+    assert RUNNER.validate_config(config(execution_cursor_guard_target=sim))["execution_cursor_guard_target"] == sim
+    legacy = RUNNER.validate_config(config(gateway_id="qmt-win-001"))
+    assert legacy["execution_cursor_guard_target"] is None
+    live_value = config(account_id="8882152350", environment="LIVE", runtime_policy="PERSISTENT_LIVE_READ_WRITE",
+                        allow_order_methods=True, source_deadline_unix=None, max_requests=0, max_seconds=0,
+                        execution_cursor_guard_target=live)
+    assert RUNNER.validate_config(live_value)["execution_cursor_guard_target"] == live
+    for target in ({"gateway_id": "qmt-win-001", "profile_id": "sim-bigqmt"}, live,
+                   {"gateway_id": "qmt-vm-001", "profile_id": "sim-bigqmt", "extra": True}):
+        with pytest.raises(ValueError, match="exact authorized VM target"):
+            RUNNER.validate_config(config(execution_cursor_guard_target=target))
+    with pytest.raises(ValueError, match="conflicts with explicit runner"):
+        RUNNER.validate_config(config(execution_cursor_guard_target=sim, gateway_id="qmt-win-001"))
+
+
+def rotation_driver_fixture(*, target=None, account="8882152350", environment="LIVE", previous=False):
+    request = dict(request_id="old-read", session_id="old-sid", sequence=3, read_expires_at_unix=time.time() - 1)
+    raw = json.dumps(request).encode("ascii")
+    region = SimpleNamespace(acquire=lambda milliseconds: True, release=lambda: None,
+                             read=lambda offset, length: raw[:length])
+    mailbox = SimpleNamespace(closed=False, region=region, _header=lambda: [0, 0, 0, 0, 3, 3, 2, len(raw)])
+    proxy = SimpleNamespace(
+        stopped=False, execution_cursor_guard_target=target or {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"},
+        account_id=account, environment=environment, _supervisor_rotation_channel=object(), _supervisor_write_gate=object(),
+        _route_faults={"readonly": dict(state="RESULT_UNKNOWN", publication_state="UNKNOWN", previous_unconfirmed=previous,
+                                        sequence=3, trigger_request_id="old-read"), "execution": None},
+        _clients={"readonly": SimpleNamespace(mailbox=mailbox)}, _sessions={"readonly": "old-sid"},
+        _read_rotation_blocked=False, _read_rotation_stage=None, _rotation_capability_attempted=False,
+        _rotation_capability=None, _last_execution_identity_success_at=None,
+        _source_identity={"execution": {"read_rotation_authorization_ready": True}})
+    calls = []
+
+    def attest():
+        calls.append("CAPABILITY")
+        proxy._rotation_capability_attempted = True
+        proxy._rotation_capability = {"verified_at": time.monotonic()}
+        return {"status": "VERIFIED", "native_rotation_ready": True}
+
+    def prepare():
+        calls.append("PREPARE")
+        proxy._read_rotation_stage = "COMMITTED"
+        return {"status": "COMMITTED"}
+
+    def activate():
+        calls.append("ACTIVATE")
+        proxy._read_rotation_stage = "ACTIVATED"
+        return {"status": "ACTIVATED"}
+
+    def accept():
+        calls.append("ACCEPT")
+        proxy._read_rotation_stage = "GATEWAY_VERIFIED"
+        return {"status": "READ_ROTATION_ACCEPTED"}
+
+    def close():
+        calls.append("CLOSE")
+        proxy._read_rotation_stage = None
+        proxy._route_faults["readonly"] = None
+        return {"status": "ROTATION_CLOSED"}
+
+    proxy.attest_read_rotation_capability, proxy.prepare_readonly_rotation = attest, prepare
+    proxy.activate_readonly_rotation, proxy.accept_gateway_rotation, proxy.close_readonly_rotation = activate, accept, close
+    return proxy, calls
+
+
+def _driver_step(driver):
+    driver.next_observation = 0
+    driver.step()
+
+
+def test_live_rotation_driver_advances_only_complete_original_read_and_keeps_one_shot_phases():
+    proxy, calls = rotation_driver_fixture()
+    driver = RUNNER.ReadonlyRotationDriver(proxy)
+    for _ in range(5):
+        _driver_step(driver)
+    assert calls == ["CAPABILITY", "PREPARE", "ACTIVATE", "ACCEPT", "CLOSE"]
+    assert driver.stage == "IDLE" and not driver.blocked
+
+
+@pytest.mark.parametrize("outcome", ["two_generations", "prepare_unknown"])
+def test_candidate_loop_schedules_rotation_and_never_retries_unknown(monkeypatch, capsys, outcome):
+    """调用真实运行入口和调度器；原生、Redis、监督器均为无网络替身。"""
+    proxy, calls = rotation_driver_fixture()
+    value = config(account_id="8882152350", environment="LIVE", runtime_policy="PERSISTENT_LIVE_READ_WRITE",
+                   allow_order_methods=True, source_deadline_unix=None, max_requests=0, max_seconds=0,
+                   execution_cursor_guard_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"})
+    stop = threading.Event()
+    provider = SimpleNamespace(connection_pool=SimpleNamespace(disconnect=mock.Mock()))
+    clients = [SimpleNamespace(close=mock.Mock()), SimpleNamespace(close=mock.Mock())]
+    gate, channel = SimpleNamespace(close=mock.Mock()), SimpleNamespace(close=mock.Mock())
+    monotonic = [time.monotonic()]
+
+    def tick():
+        monotonic[0] += 0.3
+        return monotonic[0]
+
+    monkeypatch.setattr(RUNNER, "time", SimpleNamespace(time=time.time, monotonic=tick, sleep=lambda seconds: None))
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    monkeypatch.setattr(RUNNER.InheritedSupervisorWriteGate, "from_environment", lambda: gate)
+    monkeypatch.setattr(RUNNER.InheritedRotationChannel, "from_environment", lambda: channel)
+    monkeypatch.setattr(RUNNER, "RedisShmReadOnlyProxy", lambda **kwargs: proxy)
+    proxy.verified, proxy.stop_reason, proxy.processed_count = True, "", 0
+    proxy.attach_native_supervisor = mock.Mock()
+    proxy.verify_identity = mock.Mock()
+    proxy._block_writes = mock.Mock()
+    proxy.identity_snapshot = lambda: dict(writes_blocked=True, write_ready=False, write_block_reason="OPERATOR_WRITE_DISABLED")
+    proxy.diagnostic_snapshot = lambda: dict(first_error=None, last_error=None)
+    proxy.close = mock.Mock()
+    poll_count, original_ids = [], []
+
+    def poll():
+        poll_count.append(1)
+        if len(poll_count) > 20:
+            stop.set()
+        return None
+
+    proxy.poll_once = poll
+    original_attest, original_close = proxy.attest_read_rotation_capability, proxy.close_readonly_rotation
+
+    def attest():
+        original_ids.append(proxy._route_faults["readonly"]["trigger_request_id"])
+        result = original_attest()
+        proxy._rotation_capability["verified_at"] = RUNNER.time.monotonic()
+        return result
+
+    def close_generation():
+        result = original_close()
+        if len(original_ids) == 2:
+            stop.set()
+        else:
+            request = dict(request_id="second-read", session_id="second-sid", sequence=7,
+                           read_expires_at_unix=time.time() - 1)
+            raw = json.dumps(request).encode("ascii")
+            mailbox = proxy._clients["readonly"].mailbox
+            mailbox.region.read = lambda offset, length: raw[:length]
+            mailbox._header = lambda: [0, 0, 0, 0, 7, 7, 6, len(raw)]
+            proxy._sessions["readonly"] = "second-sid"
+            proxy._route_faults["readonly"] = dict(state="RESULT_UNKNOWN", publication_state="UNKNOWN",
+                previous_unconfirmed=False, sequence=7, trigger_request_id="second-read")
+            proxy._rotation_capability_attempted = False
+        return result
+
+    proxy.attest_read_rotation_capability, proxy.close_readonly_rotation = attest, close_generation
+    if outcome == "prepare_unknown":
+        def fail_prepare():
+            calls.append("PREPARE")
+            proxy._read_rotation_blocked = True
+            raise TimeoutError("fixture outcome unknown")
+        proxy.prepare_readonly_rotation = fail_prepare
+
+    result = RUNNER.run_candidate(value, lambda target: provider, mock.Mock(side_effect=clients),
+                                  stop_event=stop, ready_observer=lambda proof: None)
+    assert result["status"] == "STOP_REQUESTED" and result["resources_closed"]
+    assert result["write_block_reason"] == "OPERATOR_WRITE_DISABLED" and result["write_ready"] is False
+    assert proxy.attach_native_supervisor.call_count == proxy.verify_identity.call_count == 1
+    assert provider.connection_pool.disconnect.call_count == 1 and all(client.close.call_count == 1 for client in clients)
+    if outcome == "two_generations":
+        assert original_ids == ["old-read", "second-read"]
+        assert calls == ["CAPABILITY", "PREPARE", "ACTIVATE", "ACCEPT", "CLOSE"] * 2
+    else:
+        assert original_ids == ["old-read"] and calls == ["CAPABILITY", "PREPARE"]
+        assert capsys.readouterr().out.count('"event": "READ_ROTATION_DRIVER_BLOCKED"') == 1
+
+
+@pytest.mark.parametrize("previous", [None, True])
+def test_live_rotation_driver_requires_explicit_previous_ack_evidence(previous):
+    proxy, calls = rotation_driver_fixture(previous=previous)
+    driver = RUNNER.ReadonlyRotationDriver(proxy)
+    _driver_step(driver)
+    assert not calls and not driver.blocked
+
+
+def test_live_rotation_driver_rejects_missing_prior_ack_and_nonadjacent_ack():
+    proxy, calls = rotation_driver_fixture()
+    driver = RUNNER.ReadonlyRotationDriver(proxy)
+    proxy._route_faults["readonly"].pop("previous_unconfirmed")
+    _driver_step(driver)
+    proxy._route_faults["readonly"]["previous_unconfirmed"] = False
+    mailbox = proxy._clients["readonly"].mailbox
+    header = mailbox._header()
+    mailbox._header = lambda: [*header[:6], 1, *header[7:]]
+    _driver_step(driver)
+    assert not calls and not driver.blocked
+
+
+@pytest.mark.parametrize("target,account,environment", [
+    ({"gateway_id": "qmt-win-001", "profile_id": "live-stock"}, "8882152350", "LIVE"),
+    ({"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}, "55013746", "SIM"),
+])
+def test_rotation_driver_does_not_change_other_instances(target, account, environment):
+    proxy, calls = rotation_driver_fixture(target=target, account=account, environment=environment)
+    _driver_step(RUNNER.ReadonlyRotationDriver(proxy))
+    assert not calls
+
+
+@pytest.mark.parametrize("stage", ["capability_unknown", "prepare_unknown", "activation_unknown", "accept_unknown", "close_unknown"])
+def test_rotation_driver_never_repeats_a_phase_with_unknown_outcome(stage):
+    proxy, calls = rotation_driver_fixture()
+    driver = RUNNER.ReadonlyRotationDriver(proxy)
+    def fail(name):
+        calls.append(name)
+        if name == "CAPABILITY":
+            proxy._rotation_capability_attempted = True
+        if name == "PREPARE":
+            proxy._read_rotation_stage, proxy._read_rotation_blocked = "PREPARE_PENDING", True
+        if name == "ACTIVATE":
+            proxy._read_rotation_stage = "ACTIVATE_PENDING"
+        raise TimeoutError("injected outcome unknown")
+    field, name = {"capability_unknown": ("attest_read_rotation_capability", "CAPABILITY"),
+                   "prepare_unknown": ("prepare_readonly_rotation", "PREPARE"),
+                   "activation_unknown": ("activate_readonly_rotation", "ACTIVATE"),
+                   "accept_unknown": ("accept_gateway_rotation", "ACCEPT"),
+                   "close_unknown": ("close_readonly_rotation", "CLOSE")}[stage]
+    setattr(proxy, field, lambda: fail(name))
+    for _ in range(8):
+        _driver_step(driver)
+    assert driver.blocked and calls.count(name) == 1
+
+
+def test_rotation_driver_waits_for_native_positive_capability_then_stops_after_proof_expires():
+    proxy, calls = rotation_driver_fixture()
+    proxy._source_identity["execution"]["read_rotation_authorization_ready"] = False
+    original = proxy.attest_read_rotation_capability
+    proxy.attest_read_rotation_capability = lambda: dict(original(), native_rotation_ready=False)
+    driver = RUNNER.ReadonlyRotationDriver(proxy)
+    _driver_step(driver)
+    assert calls == ["CAPABILITY"] and not driver.blocked
+    proxy._rotation_capability["verified_at"] -= 21
+    _driver_step(driver)
+    _driver_step(driver)
+    assert driver.blocked and calls == ["CAPABILITY"]
+
+
+def test_rotation_driver_cannot_use_pre_challenge_native_capability_ping():
+    proxy, calls = rotation_driver_fixture()
+    proxy._last_execution_identity_success_at = time.monotonic() - 1
+    original = proxy.attest_read_rotation_capability
+    proxy.attest_read_rotation_capability = lambda: dict(original(), native_rotation_ready=False)
+    driver = RUNNER.ReadonlyRotationDriver(proxy)
+    _driver_step(driver)
+    assert calls == ["CAPABILITY"] and not driver.blocked
+    proxy._last_execution_identity_success_at = time.monotonic()
+    _driver_step(driver)
+    assert calls == ["CAPABILITY", "PREPARE"]
+
+
+@pytest.mark.parametrize("published_or_claimed", [False, True])
+def test_rotation_driver_only_reobserves_busy_before_prepare_publication(published_or_claimed):
+    proxy, calls = rotation_driver_fixture()
+    driver = RUNNER.ReadonlyRotationDriver(proxy)
+    def busy():
+        calls.append("PREPARE")
+        if published_or_claimed:
+            proxy._route_faults["execution"] = {"state": "RESULT_UNKNOWN"}
+        raise RUNNER.ShmBusyError("fixture local mailbox contention")
+    proxy.prepare_readonly_rotation = busy
+    _driver_step(driver)
+    assert driver.blocked is published_or_claimed
+    _driver_step(driver)
+    assert calls.count("PREPARE") == (1 if published_or_claimed else 2)
+
+
+def test_private_rotation_channel_poisoned_on_unknown_and_closes_once():
+    class Pipe:
+        def __init__(self):
+            self.messages = []
+
+        def write(self, value):
+            self.messages.append(value)
+
+        def read(self):
+            raise TimeoutError("fixture reply unknown")
+
+    kernel, pipe = SimpleNamespace(close=mock.Mock()), Pipe()
+    channel = RUNNER.InheritedRotationChannel(11, 12, kernel, pipe)
+    with pytest.raises(TimeoutError):
+        channel.register({"stage": "PREPARE"})
+    with pytest.raises(RuntimeError, match="transport unavailable"):
+        channel.register({"stage": "PREPARE"})
+    assert pipe.messages == [{"stage": "PREPARE"}]
+    channel.close()
+    channel.close()
+    assert kernel.close.call_args_list == [mock.call(11), mock.call(12)]
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_private_rotation_inherited_pipe_requires_exact_types_and_rights(monkeypatch, valid):
+    monkeypatch.setattr(RUNNER, "os", SimpleNamespace(name="nt", environ={
+        "AQP_ROTATION_REPLY_READ_HANDLE": "11", "AQP_ROTATION_REQUEST_WRITE_HANDLE": "12"}))
+    monkeypatch.setattr(RUNNER, "_inspect_supervisor_handle_metadata", lambda handles: [
+        ("File", 0x00100001), ("File", 0x00100002 if valid else 0x00100003)])
+    kernel = SimpleNamespace(close=mock.Mock())
+    monkeypatch.setattr(RUNNER, "WindowsPipeKernel", lambda: kernel)
+    monkeypatch.setattr(RUNNER, "BoundedSynchronousPipeIO", lambda actual: actual)
+    monkeypatch.setattr(RUNNER, "FramedControlPipe", lambda *args, **kwargs: SimpleNamespace())
+    if not valid:
+        with pytest.raises(RuntimeError, match="handle identity invalid"):
+            RUNNER.InheritedRotationChannel.from_environment()
+        kernel.close.assert_not_called()
+    else:
+        channel = RUNNER.InheritedRotationChannel.from_environment()
+        channel.close()
+        assert kernel.close.call_args_list == [mock.call(11), mock.call(12)]
+
+
 def test_default_cli_dry_run_never_constructs_connections_or_prints_credentials(tmp_path, monkeypatch, capsys):
     path = tmp_path / "candidate.json"
     path.write_text(json.dumps(config()))
@@ -242,7 +549,8 @@ def test_explicit_redis_constructor_ignores_url_env_and_disables_library_retry(m
         client.connection_pool.disconnect()
 
 
-def test_runner_processes_one_original_request_through_generated_source_and_closes(monkeypatch):
+@pytest.mark.parametrize("target", [None, {"gateway_id": "qmt-vm-001", "profile_id": "sim-bigqmt"}])
+def test_runner_processes_one_original_request_through_generated_source_and_closes(monkeypatch, target):
     source = PIPELINE.DUAL.Fixture(monkeypatch)
     source.start()
     provider = PIPELINE.MemoryRedis()
@@ -253,9 +561,12 @@ def test_runner_processes_one_original_request_through_generated_source_and_clos
     value = config(native_pid=os.getpid(), max_requests=1, timeout_seconds=1.0,
                    read_name=source.settings["read_name"], execution_name=source.settings["execution_name"],
                    read_session_id=source.clients["read"].mailbox.session_id,
-                   execution_session_id=source.clients["execution"].mailbox.session_id)
+                   execution_session_id=source.clients["execution"].mailbox.session_id,
+                   execution_cursor_guard_target=target,
+                   gateway_id="qmt-vm-001" if target else "qmt-win-001", profile_id="sim-bigqmt")
     monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
     clients = []
+    ready = []
 
     def factory(name, account):
         key = "read" if name == value["read_name"] else "execution"
@@ -265,7 +576,8 @@ def test_runner_processes_one_original_request_through_generated_source_and_clos
 
     try:
         with ThreadPoolExecutor(1) as executor:
-            future = executor.submit(RUNNER.run_candidate, value, lambda target: provider, factory)
+            future = executor.submit(RUNNER.run_candidate, value, lambda target: provider, factory,
+                                     ready_observer=ready.append)
             until = time.monotonic() + 3
             while not future.done() and time.monotonic() < until:
                 source.namespace["aqp_shm_readonly_adjust"](source.context)
@@ -273,6 +585,9 @@ def test_runner_processes_one_original_request_through_generated_source_and_clos
                 time.sleep(0.001)
             result = future.result(timeout=0.2)
         assert result["status"] == "BOUNDED_STOP"
+        assert len(ready) == 1
+        assert ready[0].get("execution_cursor_guard_target") == target
+        assert ("read_source_state" in ready[0]) is (target is not None)
         assert result["identity_verified"] and result["processed_requests"] == result["received_requests"] == 1
         assert result["resources_closed"] and not result["full_duration_acceptance_proved"]
         response = json.loads(provider.values["bigqmt:rpc:resp:55013746:runner-original"])

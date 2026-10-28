@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from bigqmt_signal_trader.redis_rpc import encode_rpc_request_payload
 from bigqmt_signal_trader.redis_shm_proxy import EXECUTION_METHODS, QUOTE_METHODS, RedisShmReadOnlyProxy
 from bigqmt_signal_trader.transports.readonly_shm_client import MARKET_RPC_METHODS
-from bigqmt_signal_trader.transports.shm_rpc import WRITE_METHODS
+from bigqmt_signal_trader.transports.shm_rpc import ALL_WRITE_METHODS, WRITE_METHODS
 from bigqmt_signal_trader.transports.readonly_shm import ShmProtocolError, ShmTimeoutError
 from bigqmt_signal_trader.transports.redis_transport import RedisTransport
 
@@ -76,7 +76,72 @@ class FakeRedis:
         self.fail_eval = None
         self.ledger_lock = threading.Lock()
 
-    def eval(self, script, key_count, key, rid, old_or_capacity, encoded):
+    def eval(self, script, key_count, *args):
+        if "ROTATION_CLOSE_CLAIM_V1" in script or "ROTATION_CLOSE_SETTLE_V1" in script:
+            assert key_count == 2
+            key, close_key, rid, raw, pending, *remaining = args
+            operation = "claim" if "ROTATION_CLOSE_CLAIM_V1" in script else "settle"
+            self._record("eval", operation, close_key, rid)
+            if self.fail_eval == operation:
+                raise RuntimeError("injected ledger failure")
+            with self.ledger_lock:
+                values, close = self.hashes.get(key, {}), self.hashes.get(close_key, {})
+                if self.ttl(key) != -1 or values.get(rid) != raw:
+                    return 0
+                if operation == "claim":
+                    history = json.loads(remaining[0])
+                    if (self.ttl(close_key) not in (-1, -2) or rid in close or len(values) != len(history)
+                            or len(close) != sum(item[2] is not False for item in history)
+                            or any(values.get(item[0]) != item[1] or
+                                   (item[2] is False and item[0] in close) or
+                                   (item[2] is not False and close.get(item[0]) != item[2]) for item in history)):
+                        return 0
+                    self.hashes.setdefault(close_key, {})[rid] = pending
+                    return 1
+                if self.ttl(close_key) != -1 or close.get(rid) != pending:
+                    return 0
+                close[rid] = remaining[0]
+                return 1
+        if "ROTATION_DEPENDENCIES_VERIFY_V1" in script:
+            assert key_count == 2
+            key, close_key, serialized, *options = args
+            self._record("eval", "verify", key)
+            with self.ledger_lock:
+                values, close = self.hashes.get(key, {}), self.hashes.get(close_key, {})
+                if self.ttl(key) != -1:
+                    return 0
+                dependencies = json.loads(serialized)
+                if (options == ["FULL"] and (len(values) != len(dependencies)
+                        or len(close) != sum(item[2] is not False for item in dependencies))):
+                    return 0
+                for transition, raw, closed_raw in dependencies:
+                    if (values.get(transition) != raw or
+                            (closed_raw is False and transition in close) or
+                            (closed_raw is not False and
+                             (self.ttl(close_key) != -1 or close.get(transition) != closed_raw))):
+                        return 0
+                return 1
+        if "ROTATION_HISTORY_CLAIM_V1" in script:
+            assert key_count == 2
+            key, close_key, rid, capacity, encoded, serialized = args
+            self._record("eval", "claim", key, rid)
+            if self.fail_eval == "claim":
+                raise RuntimeError("injected ledger failure")
+            with self.ledger_lock:
+                values, close = self.hashes.get(key, {}), self.hashes.get(close_key, {})
+                history = json.loads(serialized)
+                if (len(values) != len(history) or len(close) != len(history)
+                        or history and (self.ttl(key) != -1 or self.ttl(close_key) != -1)
+                        or any(values.get(item[0]) != item[1] or close.get(item[0]) != item[2] for item in history)):
+                    return [-2, ""]
+                if rid in values:
+                    return [0, ""]
+                if len(history) >= int(capacity):
+                    return [-1, ""]
+                self.hashes.setdefault(key, {})[rid] = encoded
+                return [1, encoded]
+        assert key_count == 1
+        key, rid, old_or_capacity, encoded = args
         operation = "claim" if "HLEN" in script else "settle"
         self._record("eval", operation, key, rid)
         if self.fail_eval == operation:
@@ -102,6 +167,10 @@ class FakeRedis:
     def hget(self, key, rid):
         self._record("hget", key, rid)
         return self.hashes.get(key, {}).get(rid)
+
+    def ttl(self, key):
+        self._record("ttl", key)
+        return -1 if key in self.hashes else -2
 
     def _record(self, operation, *args):
         self.operations.append((operation,) + args)
@@ -138,6 +207,31 @@ class FakeRedis:
         self.closed = True
 
 
+class FakeSupervisorWriteGate:
+    def __init__(self):
+        self.held = False
+        self.closed = False
+        self.epoch = 1
+
+    def acquire(self):
+        assert not self.held
+        self.held = True
+
+    def check(self):
+        return None
+
+    def release(self):
+        assert self.held
+        self.held = False
+
+    def read_epoch(self):
+        assert self.held
+        return self.epoch
+
+    def close(self):
+        self.closed = True
+
+
 class FakeRawClient:
     def __init__(self, route):
         self.route = route
@@ -155,14 +249,18 @@ class FakeRawClient:
         self.runtime_policy = "BOUNDED"
         self.additional_capabilities = frozenset()
 
-    def send_request(self, request, timeout_seconds):
+    def send_request(self, request, timeout_seconds, *, after_publication=None):
         self.calls.append((copy.deepcopy(request), timeout_seconds))
         if self.entered is not None:
             self.entered.set()
             if not self.release.wait(2):
                 raise RuntimeError("test did not release bounded request")
         if self.failure is not None:
+            if after_publication is not None and getattr(self.failure, "publication_state", None) != "NOT_SENT":
+                after_publication()
             raise self.failure
+        if after_publication is not None:
+            after_publication()
         if request["method"] == "ping":
             data = dict(pong=True, account_id=ACCOUNT, allow_order_methods=self.allow_order_methods,
                         session_id=self.mailbox.session_id, native_pid=2852,
@@ -174,6 +272,13 @@ class FakeRawClient:
                                             | (WRITE_METHODS if self.allow_order_methods else frozenset())))
             if self.route == "execution":
                 data["transport"] = "shm_rpc"
+                if self.allow_order_methods:
+                    data["execution_event_guard_contract"] = "EXECUTION_CURSOR_WRITE_GATE_V1"
+                    data["supervisor_write_gate_contract"] = "INHERITED_SUPERVISOR_GATE_V1"
+                    data["native_write_runtime_guard_attached"] = True
+                    data["native_callback_threading_verified"] = True
+                    data["native_write_runtime_guard_ready"] = True
+                    data["supervisor_gate_epoch_contract"] = "SUPERVISOR_GATE_EPOCH_V1"
         elif self.result is not None:
             data = copy.deepcopy(self.result)
         elif request["method"] == "get_asset":
@@ -195,8 +300,13 @@ class FakeRawClient:
 
 
 def request(method="get_positions", rid="request-1", params=None):
+    values = {} if params is None else copy.deepcopy(params)
+    if method in ALL_WRITE_METHODS:
+        values.setdefault("execution_event_guard", dict(contract="EXECUTION_CURSOR_WRITE_GATE_V1",
+                          execution_session_id="execution-sid", native_pid=2852, sequence=0))
+        values.setdefault("supervisor_gate_epoch", dict(contract="SUPERVISOR_GATE_EPOCH_V1", epoch=1))
     value = dict(schema_version=1, request_id=rid, account_id=ACCOUNT, method=method,
-                params={} if params is None else params,
+                params=values,
                 reply_key="bigqmt:rpc:resp:%s:%s" % (ACCOUNT, rid),
                 reply_list="bigqmt:rpc:respq:%s:%s" % (ACCOUNT, rid),
                 reply_channel="bigqmt:rpc:resp:%s:%s" % (ACCOUNT, rid), ttl_seconds=9)
@@ -206,9 +316,16 @@ def request(method="get_positions", rid="request-1", params=None):
     return value
 
 
+def empty_execution_events():
+    return dict(events=[], account_id=ACCOUNT, environment="SIM", session_id="execution-sid",
+                native_pid=2852, windows_session_id=1, latest_sequence=0, oldest_sequence=1,
+                dropped_before_sequence=0, lost_sequence=0, gap=False, automatic_retry=False)
+
+
 class RedisShmReadOnlyProxyTest(unittest.TestCase):
     def make_proxy(self, *, verify=True, capacity=1000, deadline=None, redis=None,
-                   policy="BOUNDED", read_capacity=1000, write_capacity=1000, market=False, timeout=5):
+                   policy="BOUNDED", read_capacity=1000, write_capacity=1000, market=False, timeout=5, target=True,
+                   include_gate=True):
         redis = redis or FakeRedis()
         transport = RedisTransport(redis, account_id=ACCOUNT)
         readonly, execution = FakeRawClient("readonly"), FakeRawClient("execution")
@@ -224,8 +341,12 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
             expected_execution_session_id="execution-sid", expected_native_pid=2852,
             timeout_seconds=timeout, max_requests=capacity, deadline_unix=deadline,
             runtime_policy=policy, allow_order_methods=execution.allow_order_methods,
+            execution_cursor_guard_target=({"gateway_id": "qmt-vm-001", "profile_id": "sim-bigqmt"} if target else None),
+            supervisor_write_gate=FakeSupervisorWriteGate() if target and include_gate else None,
             read_cache_capacity=read_capacity, write_ledger_capacity=write_capacity)
         if verify:
+            # 单元模型仅模拟已通过的 supervisor ATTACH，不代表真实 Windows 验收。
+            proxy._supervisor_attach_verified = target and include_gate
             proxy.verify_identity()
         return proxy, redis, readonly, execution
 
@@ -371,6 +492,9 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
             params = {"code": "000001.SZ"} if method in QUOTE_METHODS else {}
             if method == "poll_execution_events":
                 params["after_sequence"] = 0
+                execution.result = empty_execution_events()
+            else:
+                execution.result = None
             self.assertTrue(proxy.process_request(request(method, rid="r%d" % index, params=params))["ok"])
         self.assertEqual([call[0]["method"] for call in readonly.calls[1:]], sorted(QUOTE_METHODS))
         self.assertEqual([call[0]["method"] for call in execution.calls[1:]], sorted(EXECUTION_METHODS))
@@ -539,7 +663,7 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
                     self.assertEqual(len(execution.calls), 1)
                     self.assertFalse(any(operation[0] == "eval" for operation in redis.operations))
 
-    def test_cached_history_late_response_remains_unknown_and_seals_without_resend(self):
+    def test_cached_history_late_response_remains_unknown_without_resend(self):
         params = dict(code="000001.SZ", period="1m", start_time="20261016090000",
                       end_time="20261016150000", count=2, fill_data=False, subscribe=False)
         clock = [1000.0]
@@ -559,10 +683,10 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
             self.assertFalse(response["ok"])
             self.assertEqual(response["status"], "UNKNOWN")
             self.assertFalse(response["automatic_retry"])
-            self.assertTrue(proxy.stopped)
+            self.assertFalse(proxy.stopped)
+            self.assertEqual(proxy.identity_snapshot()["read_source_state"], "RESULT_UNKNOWN")
             self.assertEqual(readonly.calls[-1][1], 15.0)
-            with self.assertRaises(ShmProtocolError):
-                proxy.process_request(value)
+            self.assertEqual(proxy.process_request(value), response)
             self.assertEqual(len(readonly.calls), 2)
 
     def test_confirmed_duplicate_replies_from_cache_and_conflict_does_not_pollute(self):
@@ -595,15 +719,13 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         self.assertFalse(response["ok"])
         self.assertEqual(response["status"], "UNKNOWN")
         self.assertFalse(response["automatic_retry"])
-        self.assertTrue(proxy.stopped)
-        operations = len(redis.operations)
-        with self.assertRaises(ShmProtocolError):
-            proxy.process_request(original)
-        self.assertEqual(len(redis.operations), operations)
+        self.assertFalse(proxy.stopped)
+        self.assertEqual(proxy.identity_snapshot()["execution_source_state"], "RESULT_UNKNOWN")
+        self.assertEqual(proxy.process_request(original), response)
         self.assertEqual(len(execution.calls), 2)
         self.assertEqual(proxy.get_cached_response(original["request_id"]), response)
 
-    def test_changed_sid_pid_poison_and_false_response_identity_seal_proxy(self):
+    def test_changed_sid_pid_poison_and_false_response_identity_restrict_execution(self):
         for change in ("sid", "pid", "poison", "response-account", "response-rid"):
             with self.subTest(change=change):
                 proxy, _, _, execution = self.make_proxy()
@@ -618,25 +740,31 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
                 else:
                     execution.change_response = {"request_id": "other"}
                 response = proxy.process_request(request())
-                self.assertEqual(response["status"], "UNKNOWN")
-                self.assertTrue(proxy.stopped)
+                self.assertEqual(response["status"], "REJECTED" if change in ("sid", "pid", "poison") else "UNKNOWN")
+                self.assertEqual(proxy.stopped, change != "poison")
+                self.assertEqual(proxy.identity_snapshot()["execution_source_state"],
+                                 "RESULT_UNKNOWN" if change == "poison" else "IDENTITY_OR_PROTOCOL_ERROR")
 
-    def test_unused_quote_lane_changed_sid_stops_execution_lane_without_forward(self):
+    def test_unused_quote_lane_changed_sid_does_not_stop_execution_read(self):
         proxy, _, readonly, execution = self.make_proxy()
         readonly.mailbox.session_id = "new-readonly-sid"
         response = proxy.process_request(request())
-        self.assertEqual(response["status"], "UNKNOWN")
-        self.assertTrue(proxy.stopped)
-        self.assertEqual(len(execution.calls), 1)
+        self.assertTrue(response["ok"])
+        self.assertFalse(proxy.stopped)
+        self.assertEqual(len(execution.calls), 2)
+        quote = proxy.process_request(request("get_ticks", rid="quote", params={"code": "000001.SZ"}))
+        self.assertEqual(quote["status"], "REJECTED")
+        self.assertEqual(proxy.identity_snapshot()["read_source_state"], "IDENTITY_OR_PROTOCOL_ERROR")
 
-    def test_changed_sid_on_duplicate_seals_and_preserves_confirmed_local_cache(self):
+    def test_changed_execution_sid_on_duplicate_preserves_confirmed_local_cache(self):
         proxy, _, readonly, execution = self.make_proxy()
         original = request()
         confirmed = proxy.process_request(original)
-        readonly.mailbox.session_id = "new-readonly-sid"
+        execution.mailbox.session_id = "new-execution-sid"
         response = proxy.process_request(original)
         self.assertEqual(response["status"], "UNKNOWN")
         self.assertTrue(proxy.stopped)
+        self.assertEqual(proxy.identity_snapshot()["execution_source_state"], "IDENTITY_OR_PROTOCOL_ERROR")
         self.assertEqual(proxy.get_cached_response(original["request_id"]), confirmed)
         self.assertEqual(len(execution.calls), 2)
 
@@ -777,12 +905,15 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
                     redis.setex = mock.Mock(side_effect=RedisTimeoutError("publish uncertain"))
                     with self.assertRaises(RedisTimeoutError):
                         proxy.poll_once()
-                self.assertTrue(proxy.stopped)
+                self.assertEqual(proxy.stopped, phase == "REDIS_RESPONSE_PUBLISH")
                 self.assertEqual(len(execution.calls), 2)
                 self.assertEqual(proxy.diagnostic_snapshot()["last_error"]["error_phase"], phase)
                 self.assertEqual(proxy.diagnostic_snapshot()["idle_receive_timeouts"], 0)
-                with self.assertRaises(ShmProtocolError):
-                    proxy.poll_once()
+                if phase == "SHM_FORWARD":
+                    self.assertFalse(proxy.process_request(request("submit_order", rid="other-write"))["ok"])
+                else:
+                    with self.assertRaises(ShmProtocolError):
+                        proxy.poll_once()
                 self.assertEqual(len(execution.calls), 2)
 
     def test_concurrent_poll_is_rejected_before_consuming_queue(self):
@@ -990,7 +1121,7 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         execution.result = [{"symbol": "000001.SZ", "volume": 100}]
         self.assertTrue(proxy.process_request(request("get_positions", rid="positions-after-login"))["ok"])
 
-    def test_unknown_login_with_untrusted_identity_still_seals_channel(self):
+    def test_unknown_login_with_untrusted_identity_blocks_writes(self):
         for changes in ({"account_id": "other"}, {"session_id": "old-sid"},
                         {"native_pid": True}, {"source": "other"},
                         {"positive_contract_verified": True}):
@@ -1004,9 +1135,10 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
                 response = proxy.process_request(request("get_trade_login_state"))
                 self.assertFalse(response["ok"])
                 self.assertEqual(response["server_error"], "SHM_RESULT_UNKNOWN")
-                self.assertTrue(proxy.stopped)
+                self.assertFalse(proxy.stopped)
+                self.assertFalse(proxy.identity_snapshot()["write_ready"])
 
-    def test_unrelated_unknown_read_still_seals_channel(self):
+    def test_confirmed_business_unknown_blocks_writes_without_sealing_channel(self):
         proxy, _, _, execution = self.make_proxy(policy="PERSISTENT_SIMULATION_READ_WRITE")
         execution.result = dict(status="UNKNOWN", account_id=ACCOUNT,
                                 session_id="execution-sid", native_pid=2852,
@@ -1014,7 +1146,9 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         response = proxy.process_request(request("get_positions"))
         self.assertFalse(response["ok"])
         self.assertEqual(response["server_error"], "SHM_RESULT_UNKNOWN")
-        self.assertTrue(proxy.stopped)
+        self.assertFalse(proxy.stopped)
+        self.assertFalse(proxy.identity_snapshot()["write_ready"])
+        self.assertEqual(proxy.identity_snapshot()["execution_source_state"], "HEALTHY")
 
     def test_native_write_unknown_blocks_new_writes_but_read_queries_and_events_continue(self):
         proxy, redis, _, execution = self.make_proxy(policy="PERSISTENT_SIMULATION_READ_WRITE")
@@ -1027,6 +1161,7 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         self.assertFalse(proxy.identity_snapshot()["write_ready"])
         execution.result = [{"order_sys_id": "native-1", "status": "CANCELED"}]
         self.assertTrue(proxy.process_request(request("query_orders", rid="read-after-unknown"))["ok"])
+        execution.result = empty_execution_events()
         self.assertTrue(proxy.process_request(request("poll_execution_events", rid="events-after-unknown",
                                                       params={"after_sequence": 0}))["ok"])
         count = len(execution.calls)
@@ -1044,7 +1179,8 @@ class RedisShmReadOnlyProxyTest(unittest.TestCase):
         execution.failure = ShmTimeoutError("write may have run")
         original = request("submit_order")
         self.assertEqual(proxy.process_request(original)["status"], "UNKNOWN")
-        self.assertTrue(proxy.stopped)
+        self.assertFalse(proxy.stopped)
+        self.assertFalse(proxy.identity_snapshot()["write_ready"])
         restarted, _, _, fresh_execution = self.make_proxy(redis=redis, policy="PERSISTENT_SIMULATION_READ_WRITE")
         self.assertEqual(restarted.process_request(original)["status"], "UNKNOWN")
         self.assertEqual(len(fresh_execution.calls), 1)

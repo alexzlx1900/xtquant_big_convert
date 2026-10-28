@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 
 try:
@@ -24,14 +25,186 @@ except ImportError:
     NoBackoff = None
     Retry = None
 
+try:
+    from qmt_runtime_guard import BoundedSynchronousPipeIO, FramedControlPipe, WindowsPipeKernel
+except ImportError:
+    BoundedSynchronousPipeIO = FramedControlPipe = WindowsPipeKernel = None
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 os.environ.setdefault("BIGQMT_LOG_ENABLED", "0")
 
-from bigqmt_signal_trader.redis_shm_proxy import RECEIVE_POLICIES, RUNTIME_POLICIES, WRITE_POLICIES, RedisShmReadOnlyProxy, validate_account_policy
-from bigqmt_signal_trader.transports.readonly_shm import ShmReadOnlyClient, validate_name
+from bigqmt_signal_trader.redis_shm_proxy import (
+    RECEIVE_POLICIES, RUNTIME_POLICIES, WRITE_POLICIES, InheritedSupervisorWriteGate, RedisShmReadOnlyProxy,
+    _inspect_supervisor_handle_metadata, validate_account_policy, validate_execution_cursor_guard_target,
+)
+from bigqmt_signal_trader.transports.readonly_shm import (
+    REQUEST_CAPACITY, REQUEST_OFFSET, ShmBusyError, ShmProtocolError, ShmReadOnlyClient, decode_payload, validate_name,
+)
 from bigqmt_signal_trader.transports.redis_transport import RedisTransport
+
+
+class InheritedRotationChannel:
+    """监督器继承的私有单向管道；未知后永久污染，不重复注册。"""
+
+    def __init__(self, reader, writer, kernel, pipe):
+        self.reader, self.writer, self.kernel, self.pipe = reader, writer, kernel, pipe
+        self.lock, self.closed, self.poisoned = threading.Lock(), False, False
+
+    @classmethod
+    def from_environment(cls):
+        if (os.name != "nt" or any(item is None for item in
+                (BoundedSynchronousPipeIO, FramedControlPipe, WindowsPipeKernel))):
+            raise RuntimeError("private supervisor rotation transport unavailable")
+        raw = [os.environ.get("AQP_ROTATION_REPLY_READ_HANDLE"),
+               os.environ.get("AQP_ROTATION_REQUEST_WRITE_HANDLE")]
+        if any(not isinstance(value, str) or not value or not value.isascii() or not value.isdecimal() for value in raw):
+            raise RuntimeError("private supervisor rotation handles unavailable")
+        reader, writer = [int(value) for value in raw]
+        if (reader <= 0 or writer <= 0 or reader == writer
+                or max(reader, writer) >= 1 << (8 * ctypes.sizeof(ctypes.c_void_p))
+                or tuple(_inspect_supervisor_handle_metadata((reader, writer))) !=
+                   (("File", 0x00100001), ("File", 0x00100002))):
+            raise RuntimeError("private supervisor rotation handle identity invalid")
+        kernel = WindowsPipeKernel()
+        pipe = FramedControlPipe(BoundedSynchronousPipeIO(kernel), reader, writer, timeout_seconds=5)
+        return cls(reader, writer, kernel, pipe)
+
+    def register(self, message):
+        with self.lock:
+            if self.closed or self.poisoned:
+                raise RuntimeError("private supervisor rotation transport unavailable")
+            try:
+                self.pipe.write(message)
+                return self.pipe.read()
+            except BaseException:
+                self.poisoned = True
+                raise
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        errors = []
+        for handle in (self.reader, self.writer):
+            try:
+                self.kernel.close(handle)
+            except Exception:
+                errors.append(handle)
+        if errors:
+            raise RuntimeError("private supervisor rotation handles did not close")
+
+
+class ReadonlyRotationDriver:
+    """仅推进当前受监督来源的一次只读换代；任何未知操作均粘滞停止。"""
+
+    def __init__(self, proxy):
+        self.proxy = proxy
+        self.stage = "IDLE"
+        self.blocked = False
+        self.error_type = None
+        self.next_observation = 0.0
+
+    def _old_frame_ready(self):
+        proxy = self.proxy
+        fault = proxy._route_faults["readonly"]
+        if (not isinstance(fault, dict) or fault.get("state") != "RESULT_UNKNOWN"
+                or fault.get("publication_state") != "UNKNOWN" or fault.get("previous_unconfirmed") is not False
+                or type(fault.get("sequence")) is not int or fault["sequence"] <= 0
+                or not isinstance(fault.get("trigger_request_id"), str)):
+            return False
+        mailbox = proxy._clients["readonly"].mailbox
+        if mailbox.closed or not mailbox.region.acquire(0):
+            return False
+        try:
+            header = mailbox._header()
+            sequence = fault["sequence"]
+            if header[4:7] != [sequence, sequence, sequence - 1]:
+                return False
+            if not 0 < header[7] <= REQUEST_CAPACITY:
+                raise ShmProtocolError("original readonly request length is invalid")
+            request = decode_payload(mailbox.region.read(REQUEST_OFFSET, header[7]))
+            deadline = request.get("read_expires_at_unix") if isinstance(request, dict) else None
+            if (not isinstance(request, dict) or request.get("request_id") != fault["trigger_request_id"]
+                    or request.get("session_id") != proxy._sessions["readonly"]
+                    or request.get("sequence") != sequence or type(deadline) not in (int, float)
+                    or not math.isfinite(deadline) or deadline <= 0):
+                raise ShmProtocolError("original readonly request identity is invalid")
+            return deadline <= time.time()
+        finally:
+            mailbox.region.release()
+
+    def step(self):
+        proxy = self.proxy
+        now = time.monotonic()
+        if (self.blocked or proxy.stopped or now < self.next_observation
+                or proxy.execution_cursor_guard_target != {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+                or proxy.account_id != "8882152350" or proxy.environment != "LIVE"
+                or proxy._supervisor_rotation_channel is None or proxy._supervisor_write_gate is None):
+            return
+        self.next_observation = now + 0.25
+        try:
+            if self.stage == "IDLE":
+                if proxy._read_rotation_blocked or not self._old_frame_ready():
+                    return
+                result = proxy.attest_read_rotation_capability()
+                if result is None:  # 监督器明确未登记，本次没有发原生 challenge。
+                    return
+                if result.get("status") != "VERIFIED":
+                    raise ShmProtocolError("rotation capability was not independently verified")
+                self.stage = "CAPABILITY"
+                self.native_ready = result.get("native_rotation_ready") is True
+            if self.stage == "CAPABILITY":
+                proof = proxy._rotation_capability
+                if (not isinstance(proof, dict) or not 0 <= time.monotonic() - proof.get("verified_at", float("-inf")) <= 20):
+                    raise ShmProtocolError("rotation capability expired; do not repeat the challenge")
+                if not self.native_ready:
+                    # A cached ping from before this challenge, or a later non-ping
+                    # execution operation, is not fresh capability evidence.
+                    observed_at = proxy._last_execution_identity_success_at
+                    if (type(observed_at) not in (int, float) or observed_at < proof["verified_at"]
+                            or proxy._source_identity.get("execution", {}).get("read_rotation_authorization_ready") is not True):
+                        return
+                self.native_ready = True
+                proxy.prepare_readonly_rotation()
+                self.stage = "COMMITTED"
+                return
+            if self.stage == "COMMITTED":
+                result = proxy.activate_readonly_rotation()
+                if result is not None:
+                    if result.get("status") != "ACTIVATED":
+                        raise ShmProtocolError("rotation activation is unconfirmed")
+                    self.stage = "ACTIVATED"
+                return
+            if self.stage == "ACTIVATED":
+                result = proxy.accept_gateway_rotation()
+                if result is not None:
+                    if result.get("status") != "READ_ROTATION_ACCEPTED":
+                        raise ShmProtocolError("rotation read gate delivery is unconfirmed")
+                    self.stage = "GATEWAY_VERIFIED"
+                return
+            if self.stage == "GATEWAY_VERIFIED":
+                result = proxy.close_readonly_rotation()
+                if result is not None:
+                    if result.get("status") != "ROTATION_CLOSED":
+                        raise ShmProtocolError("rotation retirement is unconfirmed")
+                    self.stage = "IDLE"
+                return
+        except ShmBusyError as exc:
+            # 仅本地尚无状态变更的锁竞争可再次观察；任何已发阶段/管道不明都停止。
+            local_busy = (not proxy._route_faults["execution"] and
+                (self.stage == "IDLE" and not proxy._rotation_capability_attempted
+                 or self.stage == "CAPABILITY" and proxy._read_rotation_stage is None and not proxy._read_rotation_blocked
+                 or self.stage == "COMMITTED" and proxy._read_rotation_stage == "COMMITTED"
+                 or self.stage in ("ACTIVATED", "GATEWAY_VERIFIED") and str(exc) in (
+                    "cannot accept rotation while Redis polling is active", "cannot accept rotation while another proxy operation is active",
+                    "cannot close rotation while Redis polling is active", "cannot close rotation while another proxy operation is active")))
+            if local_busy:
+                return
+            self.blocked, self.error_type = True, type(exc).__name__
+        except Exception as exc:
+            self.blocked, self.error_type = True, type(exc).__name__
 
 
 def _integer(value, name, minimum, maximum):
@@ -60,6 +233,12 @@ def validate_config(value, now_unix=None):
     result = dict(value)
     result["environment"] = environment
     result["runtime_policy"] = policy
+    result["execution_cursor_guard_target"] = validate_execution_cursor_guard_target(
+        value.get("execution_cursor_guard_target"), value["account_id"], environment)
+    if result["execution_cursor_guard_target"] is not None:
+        for field in ("gateway_id", "profile_id"):
+            if field in value and value[field] != result["execution_cursor_guard_target"][field]:
+                raise ValueError("execution cursor guard conflicts with explicit runner %s" % field)
     result["receive_policy"] = value.get("receive_policy", "QUEUE_AND_PUBSUB")
     if not isinstance(result["receive_policy"], str) or result["receive_policy"] not in RECEIVE_POLICIES:
         raise ValueError("explicit supported receive_policy required")
@@ -156,7 +335,8 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         if remaining <= 2 * config["timeout_seconds"] + 2:
             raise RuntimeError("insufficient source/runner margin for two handshakes and exit; no connections created")
         parent_deadline = min(config["source_deadline_unix"], time.time() + config["max_seconds"])
-    redis_client, proxy, clients = None, None, []
+    redis_client, proxy, clients, supervisor_gate, rotation_channel = None, None, [], None, None
+    rotation_driver = None
     errors = []
     result = dict(status="FAILED", account_id=config["account_id"], environment=config["environment"], automatic_retry=False,
                   allow_order_methods=config["allow_order_methods"], runtime_policy=config["runtime_policy"],
@@ -177,10 +357,26 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         phase = "SHM_EXECUTION_CLIENT_CREATE"
         clients.append(factory(config["execution_name"], config["account_id"]))
         phase = "PROXY_CREATE"
+        if config["execution_cursor_guard_target"] is not None and config["allow_order_methods"]:
+            try:
+                supervisor_gate = InheritedSupervisorWriteGate.from_environment()
+            except Exception:
+                # 来源仍可只读诊断；缺少可信继承句柄绝不放开写入。
+                supervisor_gate = None
+        if (supervisor_gate is not None and
+                config["execution_cursor_guard_target"] == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}):
+            try:
+                rotation_channel = InheritedRotationChannel.from_environment()
+            except Exception:
+                # 无私有授权管道时正常只读可继续，换代入口仍禁用。
+                rotation_channel = None
         proxy = RedisShmReadOnlyProxy(
             redis_transport=transport, readonly_client=clients[0], execution_client=clients[1],
             account_id=config["account_id"], environment=config["environment"],
             live_write_authorized=config["live_write_authorized"],
+            execution_cursor_guard_target=config["execution_cursor_guard_target"],
+            supervisor_write_gate=supervisor_gate,
+            supervisor_rotation_channel=rotation_channel,
             receive_policy=config["receive_policy"],
             start_write_blocked=config["start_write_blocked"], expected_readonly_session_id=config["read_session_id"],
             expected_execution_session_id=config["execution_session_id"],
@@ -192,13 +388,22 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         )
         if config["start_write_blocked"]:
             proxy._block_writes("OPERATOR_WRITE_DISABLED")
+        if (config["execution_cursor_guard_target"] == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+                and config["allow_order_methods"] and supervisor_gate is not None):
+            # manager 已先监听；只尝试一次，失败或超时不进入业务循环。
+            phase = "NATIVE_SUPERVISOR_ATTACH"
+            proxy.attach_native_supervisor()
         phase = "IDENTITY_VERIFY"
         proxy.verify_identity()
+        if (config["execution_cursor_guard_target"] == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+                and supervisor_gate is not None and rotation_channel is not None):
+            rotation_driver = ReadonlyRotationDriver(proxy)
         evidence = dict(proxy.identity_snapshot(), status="READY", automatic_retry=False)
         phase = "READY_OBSERVER"
         (ready_observer or _emit_ready)(evidence)
         stop_requested = False
         reported_error_at = None
+        reported_rotation_block = False
         while not proxy.stopped:
             if stop_event is not None and stop_event.is_set():
                 stop_requested = True
@@ -212,6 +417,12 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                     break
             phase = "RECEIVE_LOOP"
             response = proxy.poll_once()
+            if rotation_driver is not None:
+                rotation_driver.step()
+                if rotation_driver.blocked and not reported_rotation_block:
+                    reported_rotation_block = True
+                    print(json.dumps(dict(event="READ_ROTATION_DRIVER_BLOCKED", phase=rotation_driver.stage,
+                                          error_type=rotation_driver.error_type, automatic_retry=False)), flush=True)
             diagnostic = proxy.diagnostic_snapshot()
             latest = diagnostic["last_error"]
             if latest and latest["error_at_unix"] != reported_error_at:
@@ -249,10 +460,22 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                 snapshot = proxy.identity_snapshot()
                 result.update({field: snapshot[field]
                                for field in ("writes_blocked", "write_ready", "write_block_reason")})
+            elif config["execution_cursor_guard_target"] is not None and config["allow_order_methods"]:
+                result.update(writes_blocked=True, write_ready=False,
+                              write_block_reason=proxy._write_block_reason or "SOURCE_IDENTITY_UNVERIFIED")
             try:
                 proxy.close()
             except Exception as exc:
                 errors.append(type(exc).__name__)
+        else:
+            if config["execution_cursor_guard_target"] is not None and config["allow_order_methods"]:
+                result.update(writes_blocked=True, write_ready=False, write_block_reason="SOURCE_IDENTITY_UNVERIFIED")
+            for resource in (rotation_channel, supervisor_gate):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception as exc:
+                        errors.append(type(exc).__name__)
         for client in clients:
             try:
                 client.close()
@@ -362,6 +585,7 @@ def run_reconciliation(value, plan, *, apply=False, redis_factory=None, shm_fact
         proxy = RedisShmReadOnlyProxy(transport, clients[0], clients[1],
             account_id=config["account_id"], environment=config["environment"], start_write_blocked=config["start_write_blocked"],
             live_write_authorized=config["live_write_authorized"],
+            execution_cursor_guard_target=config["execution_cursor_guard_target"],
             receive_policy=config["receive_policy"],
             expected_readonly_session_id=config["read_session_id"],
             expected_execution_session_id=config["execution_session_id"],

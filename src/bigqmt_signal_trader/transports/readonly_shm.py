@@ -41,7 +41,10 @@ class ShmCapacityError(ValueError):
 
 
 class ShmNativeError(OSError):
-    pass
+    def __init__(self, message, native_winerror=None, native_operation=None):
+        super().__init__(message)
+        self.native_winerror = native_winerror
+        self.native_operation = native_operation
 
 
 def validate_name(name):
@@ -109,7 +112,7 @@ class Win32Region:
             else:
                 self.mapping = kernel.OpenFileMappingW(6, False, name + "_map")
             if not self.mapping:
-                raise self._error("mapping open/create")
+                raise self._error("mapping open/create", "CreateFileMappingW" if create else "OpenFileMappingW")
             self.address = kernel.MapViewOfFile(self.mapping, 6, 0, 0, MAP_SIZE)
             if not self.address:
                 raise self._error("MapViewOfFile")
@@ -146,8 +149,10 @@ class Win32Region:
             function = getattr(self.kernel, name)
             function.argtypes, function.restype = arguments, result
 
-    def _error(self, label):
-        return ShmNativeError("%s failed: winerror=%s" % (label, ctypes.get_last_error()))
+    def _error(self, label, operation=None):
+        code = ctypes.get_last_error()
+        return ShmNativeError("%s failed: winerror=%s" % (label, code),
+                              native_winerror=code, native_operation=operation)
 
     def acquire(self, milliseconds):
         if self.closed:
@@ -204,10 +209,14 @@ class ReadOnlyMailbox:
 
     def __init__(self, name, create=False, region=None):
         validate_name(name)
+        self._name = name
         self.owner = bool(create)
         self.closed = False
         self.session_id = None
         self.server_pid = None
+        self.retain_frame_evidence = False
+        self.last_request_frame = None
+        self.last_response_frame = None
         self.region = region if region is not None else Win32Region(name, create=create)
         try:
             if not self.region.acquire(500):
@@ -230,6 +239,10 @@ class ReadOnlyMailbox:
             except Exception as cleanup:
                 raise ShmNativeError("%s; cleanup failed: %s" % (exc, cleanup)) from exc
             raise
+
+    @property
+    def name(self):
+        return self._name
 
     def _header(self, check_session=True):
         values = list(_HEADER.unpack(self.region.read(0, HEADER_SIZE)))
@@ -273,13 +286,22 @@ class ReadOnlyMailbox:
             length = header[7]
             if not 0 < length <= REQUEST_CAPACITY:
                 raise ShmProtocolError("invalid request payload length")
-            return header[4], decode_payload(self.region.read(REQUEST_OFFSET, length))
+            raw = self.region.read(REQUEST_OFFSET, length)
+            request = decode_payload(raw)
+            if self.retain_frame_evidence:
+                self.last_request_frame = (header[4], raw)
+            return header[4], request
         finally:
             self.region.release()
 
-    def publish_response(self, sequence, response):
+    def publish_response(self, sequence, response, publication_guard=None, publication_lock=None):
         if not self.owner or self.closed:
             raise ShmProtocolError("response publishing requires an open server")
+        if ((publication_guard is None) != (publication_lock is None)
+                or publication_guard is not None and (not callable(publication_guard)
+                    or not callable(getattr(publication_lock, "acquire", None))
+                    or not callable(getattr(publication_lock, "release", None)))):
+            raise ShmProtocolError("response publication guard is invalid")
         try:
             raw = encode_payload(response, RESPONSE_CAPACITY)
         except (ValueError, TypeError, OverflowError) as exc:
@@ -288,16 +310,56 @@ class ReadOnlyMailbox:
             raw = encode_payload(response, RESPONSE_CAPACITY)
         if not self.region.acquire(0):
             return False
+        released = False
+        wrote_response = False
+        header_attempted = False
+        previous_header, previous_response = None, None
         try:
             header = self._header()
             if header[2] != READY or header[4] != sequence or header[5] >= sequence:
                 raise ShmProtocolError("response sequence is no longer pending")
+            previous_header = list(header)
+            previous_response = self.last_response_frame
+            if (publication_guard is not None
+                    and ((not header[5] and header[8])
+                         or (header[5] and (previous_response is None or previous_response[0] != header[5]
+                                            or len(previous_response[1]) != header[8])))):
+                raise ShmProtocolError("previous response evidence is unavailable")
+            if publication_guard is not None and publication_guard() is not True:
+                raise ShmProtocolError("execution continuity is unconfirmed")
+            wrote_response = True
             self.region.write(RESPONSE_OFFSET, raw)
             header[8], header[5] = len(raw), sequence
-            self._write_header(header)
+            if publication_guard is None:
+                self._write_header(header)
+                if self.retain_frame_evidence:
+                    self.last_response_frame = (sequence, raw)
+                return True
+            publication_lock.acquire()
+            try:
+                if publication_guard() is not True:
+                    raise ShmProtocolError("execution continuity is unconfirmed")
+                # 头写可能部分成功；尝试后永不假设可回滚或安全重发。
+                header_attempted = True
+                try:
+                    self._write_header(header)
+                    if self.retain_frame_evidence:
+                        self.last_response_frame = (sequence, raw)
+                finally:
+                    # 使响应可见与缺口标记有确定顺序；锁内没有 QMT 或 pipe 调用。
+                    released = True
+                    self.region.release()
+            finally:
+                publication_lock.release()
             return True
+        except Exception:
+            if (publication_guard is not None and wrote_response and not header_attempted
+                    and previous_header[8]):
+                self.region.write(RESPONSE_OFFSET, previous_response[1])
+            raise
         finally:
-            self.region.release()
+            if not released:
+                self.region.release()
 
     def close(self, failed=False):
         if self.closed:
@@ -334,9 +396,32 @@ class ShmReadOnlyClient:
         self.mailbox = ReadOnlyMailbox(name, region=region)
         self.poisoned = False
 
-    def send_request(self, request, timeout_seconds=5.0):
+    @property
+    def name(self):
+        return self.mailbox.name
+
+    def send_request(self, request, timeout_seconds=5.0, *, after_publication=None):
+        evidence = {
+            "publication_state": "NOT_SENT",
+            "session_id": self.mailbox.session_id,
+            "request_id": request.get("request_id") if isinstance(request, dict) else None,
+            "sequence": None,
+            "previous_unconfirmed": True if self.poisoned else None,
+        }
+        try:
+            return self._send_request(request, timeout_seconds, evidence, after_publication)
+        except Exception as exc:
+            if evidence["publication_state"] == "UNKNOWN":
+                self.poisoned = True
+            for field, value in evidence.items():
+                setattr(exc, field, value)
+            raise
+
+    def _send_request(self, request, timeout_seconds, evidence, after_publication):
         if self.poisoned or self.mailbox.closed:
             raise ShmProtocolError("client is closed or has an unconfirmed result")
+        if after_publication is not None and not callable(after_publication):
+            raise ValueError("after_publication must be callable")
         if not isinstance(request, dict):
             raise ValueError("request must be an object")
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 60:
@@ -380,7 +465,9 @@ class ShmReadOnlyClient:
             if header[2] != READY:
                 raise ShmProtocolError("server is not ready")
             if header[4] != header[6]:
+                evidence["previous_unconfirmed"] = True
                 raise ShmBusyError("mailbox has an unconfirmed request")
+            evidence["previous_unconfirmed"] = False
             sequence = header[4] + 1
             if sequence > 0xFFFFFFFF:
                 raise ShmProtocolError("request sequence exhausted")
@@ -388,6 +475,9 @@ class ShmReadOnlyClient:
                 raise ShmProtocolError("request sequence mismatch")
             payload["sequence"] = sequence
             raw = encode_payload(payload, REQUEST_CAPACITY)
+            evidence["sequence"] = sequence
+            # A failed memory/header write may have partially published the frame.
+            evidence["publication_state"] = "UNKNOWN"
             region.write(REQUEST_OFFSET, raw)
             header[7], header[4] = len(raw), sequence
             self.mailbox._write_header(header)
@@ -403,6 +493,8 @@ class ShmReadOnlyClient:
             raise
         finally:
             region.release()
+        if after_publication is not None:
+            after_publication()
         try:
             while time.monotonic() < deadline:
                 if region.acquire(0):

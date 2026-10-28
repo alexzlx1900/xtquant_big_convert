@@ -560,6 +560,7 @@ def test_generated_native_cancel_confirms_only_fresh_exact_cancelled_contract(st
         assert result["automatic_retry"] is False and not result["error"]
         evidence = result["result"]
         assert evidence["cancellation_confirmed"] is True and evidence["order_terminal"] is True
+        assert evidence["confirmation_pending"] is False and evidence["native_write_executed"] is True
         assert evidence["confirmation_source"] == "native_query_orders_strict"
         assert evidence["native_order_status"] == str(status) and evidence["traded_volume"] == traded
         assert h.call("cancel_order", params, request_id="cancel-terminal")["data"] == result

@@ -20,7 +20,8 @@ class AsyncRedis(LIVE.FIXTURE.FakeRedis):
     """只扩展 ASYNC 双键原子 claim，旧单键 CAS 沿用现有 fixture。"""
 
     def eval(self, script, key_count, *args):
-        if key_count == 1:
+        if (key_count == 1 or "ROTATION_HISTORY_CLAIM_V1" in script or "ROTATION_DEPENDENCIES_VERIFY_V1" in script
+                or "ROTATION_CLOSE_CLAIM_V1" in script or "ROTATION_CLOSE_SETTLE_V1" in script):
             return super().eval(script, key_count, *args)
         assert key_count == 2
         key, cid_key, rid, capacity, encoded, cid = args

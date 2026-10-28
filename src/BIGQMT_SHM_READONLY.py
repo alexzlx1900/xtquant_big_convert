@@ -23,12 +23,14 @@ READONLY_MAX_SECONDS = 60
 READONLY_PERSISTENT_READONLY = False  # 仅显式55013746禁写驻留候选；默认仍有界。
 READONLY_PERSISTENT_MARKET_RPC = False  # 双源读写候选显式开放已有市场只读方法。
 READONLY_PERSISTENT_LIVE_READ_WRITE = False  # 仅显式实盘双源候选，读源始终禁写。
+READONLY_PRESERVE_FAILED_MAILBOX = False  # 双源故障时保留原邮箱和回调证据，不自动重试。
 RPC_REVISION = "shm-readonly-single-file-v2"
 QUOTE_SUBSCRIPTION_CONTRACT = "SCOPED_TICK_CAPTURE_V1"
 QUOTE_SUBSCRIPTION_LIMIT = 128
 HISTORY_PAYLOAD_LIMIT_BYTES = 8 * 1024 * 1024 - 16384
 MINUTE_BATCH_CONTRACT = "SCOPED_MINUTE_HISTORY_BATCH_V1"
 MINUTE_BATCH_MAX_SYMBOLS = 50
+READ_ROTATION_EVIDENCE_CONTRACT = "READ_ROTATION_EVIDENCE_V1"
 _EMBEDDED_SOURCES = {}  # BUILD_READONLY_EMBEDDED
 _MODULE_CACHE = {}
 _ORIGINAL_IMPORT = builtins.__import__
@@ -110,7 +112,8 @@ class ShmReadOnlyBridge:
             raise ValueError("configure 1-%d unique initial SH/SZ/BJ symbols" % initial_symbol_limit)
         if (type(READONLY_PERSISTENT_READONLY) is not bool or type(READONLY_PERSISTENT_MARKET_RPC) is not bool
                 or type(READONLY_PERSISTENT_LIVE_READ_WRITE) is not bool
-                or type(READONLY_ENABLE_MARKET_RPC) is not bool):
+                or type(READONLY_ENABLE_MARKET_RPC) is not bool
+                or type(READONLY_PRESERVE_FAILED_MAILBOX) is not bool):
             raise ValueError("explicit boolean persistent readonly selection required")
         if BIGQMT_ENVIRONMENT not in ("SIM", "LIVE"):
             raise ValueError("explicit SIM/LIVE environment required")
@@ -148,6 +151,15 @@ class ShmReadOnlyBridge:
         self.seen_request_ids = {} if self.persistent_readonly else set()
         self.pending = None
         self.closed = False
+        self.failed = False
+        self.preserve_failed_mailbox = READONLY_PRESERVE_FAILED_MAILBOX
+        self.last_completed_request = None
+        self.native_creation_filetime = None
+        self.retired_request_ids = set()
+        self.rotation_probe_request_id = None
+        self.rotation_probe_used = False
+        self.rotation_continuity_guard = None
+        self.rotation_continuity_lock = None
         self.market_enabled = READONLY_ENABLE_MARKET_RPC is True
         self.history_downloader = globals().get("download_history_data")
         self.event_lock = threading.Lock()
@@ -168,11 +180,13 @@ class ShmReadOnlyBridge:
         transport = _load_embedded("aqp_readonly_transport")
         transport.validate_name(READONLY_SHM_NAME)
         self.mailbox = mailbox if mailbox is not None else transport.ReadOnlyMailbox(READONLY_SHM_NAME, create=True)
+        self.mailbox.retain_frame_evidence = self.preserve_failed_mailbox
 
     def start(self):
         self.mailbox.mark_ready()
 
     def process_request(self, request, sequence=None):
+        started_at_unix = time.time() if self.preserve_failed_mailbox else None
         fields = request if isinstance(request, dict) else {}
         request_id = fields.get("request_id")
         method = fields.get("method")
@@ -228,8 +242,12 @@ class ShmReadOnlyBridge:
                 raise ReadOnlyRequestError("INVALID_DEADLINE", "read deadline must be finite and bounded to 60 seconds")
             if time.time() >= expires_at:
                 raise ReadOnlyRequestError("READ_EXPIRED", "read RPC expired before execution")
-            if request_id in self.seen_request_ids:
+            if request_id in self.seen_request_ids or request_id in self.retired_request_ids:
                 raise ReadOnlyRequestError("DUPLICATE_REQUEST", "request_id was already processed in this session")
+            if self.rotation_probe_request_id is not None:
+                if method != "ping" or request_id != self.rotation_probe_request_id or self.rotation_probe_used:
+                    raise ReadOnlyRequestError("ROTATION_PREPARED_ONLY", "only the candidate probe is permitted before activation")
+                self.rotation_probe_used = True
             if self.persistent_readonly:
                 if len(self.seen_request_ids) >= 1024:
                     raise ReadOnlyRequestError("REPLAY_CAPACITY_EXHAUSTED", "unexpired or unconfirmed read records are not evicted")
@@ -254,6 +272,9 @@ class ShmReadOnlyBridge:
                             ("get_all_subscription", "subscribe_quote", "unsubscribe_quote", "get_market_data_ex")) else [],
                         "session_id": self.mailbox.session_id, "native_pid": self.mailbox.server_pid, "capabilities": list(allowed_methods)}
                 data.update(self.quote_subscription_metadata())
+                if self.preserve_failed_mailbox:
+                    data["read_fault_isolation_contract"] = "READ_FAILURE_ISOLATION_V1"
+                    data["native_creation_filetime"] = self.native_creation_filetime
                 if self.market_enabled:
                     data.update(minute_history_batch_contract=MINUTE_BATCH_CONTRACT,
                                 minute_history_batch_max_symbols=MINUTE_BATCH_MAX_SYMBOLS)
@@ -373,11 +394,98 @@ class ShmReadOnlyBridge:
                 response.update(ok=False, data=None, error="minute batch exceeds bounded 8MiB response; no rows were truncated",
                                 server_error="HISTORY_PAYLOAD_TOO_LARGE")
         self.request_count += 1
+        if self.preserve_failed_mailbox and threading.get_ident() == self.callback_thread_id:
+            self.last_completed_request = {
+                "session_id": self.mailbox.session_id, "request_id": response["request_id"],
+                "method": response["method"], "sequence": response["sequence"],
+                "started_at_unix": started_at_unix, "finished_at_unix": time.time(),
+                "ok": response["ok"], "server_error": response["server_error"],
+            }
         print("AQP_SHM_READONLY_RPC " + json.dumps({
             "request_id": response["request_id"], "method": response["method"], "sequence": response["sequence"],
             "ok": response["ok"], "error": response["error"], "callback_thread_id": threading.get_ident(),
         }, sort_keys=True))
         return response
+
+    def read_rotation_evidence(self, execution_session_id, native_creation_filetime,
+                               mailbox=None, completed=None, mailbox_locked=False):
+        """只读证明原线程已结束旧调用；不更改旧帧、确认号或连接。"""
+        mailbox = mailbox if mailbox is not None else self.mailbox
+        completed = completed if completed is not None else self.last_completed_request
+        if (threading.get_ident() != self.callback_thread_id or self.closed or self.failed
+                or not self.preserve_failed_mailbox or self.pending is not None
+                or not isinstance(execution_session_id, str) or not execution_session_id
+                or execution_session_id == mailbox.session_id
+                or type(native_creation_filetime) is not int or native_creation_filetime <= 0
+                or type(self.windows_session_id) is not int or self.windows_session_id < 0
+                or not isinstance(completed, dict)):
+            return None
+        if not self.event_lock.acquire(False):
+            return None
+        try:
+            if (self.subscription is not None or self.capture_subscriptions or self.capture_contract is not None
+                    or self.events or self.event_sequence or self.callback_error or self.capture_error):
+                return None
+            region = mailbox.region
+            if not mailbox_locked and not region.acquire(0):
+                return None
+            try:
+                transport = _load_embedded("aqp_readonly_transport")
+                header = mailbox._header()
+                if (header[2] != transport.READY or header[4] != header[5]
+                        or header[6] != header[4] - 1 or not 0 < header[7] <= transport.REQUEST_CAPACITY
+                        or not 0 < header[8] <= transport.RESPONSE_CAPACITY):
+                    return None
+                request_raw = region.read(transport.REQUEST_OFFSET, header[7])
+                response_raw = region.read(transport.RESPONSE_OFFSET, header[8])
+                if (mailbox.last_request_frame != (header[4], request_raw)
+                        or mailbox.last_response_frame != (header[5], response_raw)):
+                    return None
+                request = transport.decode_payload(request_raw)
+                response = transport.decode_payload(response_raw)
+                if not isinstance(request, dict) or not isinstance(response, dict):
+                    return None
+                method = request.get("method")
+                allowed = ("ping", "get_positions", "get_full_tick", "get_ticks", "get_asset",
+                           "query_orders", "query_trades", "get_local_data", "get_market_data_ex",
+                           "get_market_data_ex_batch")
+                rid, deadline, now = request.get("request_id"), request.get("read_expires_at_unix"), time.time()
+                if (method not in allowed or not isinstance(rid, str) or not rid or len(rid) > 128
+                        or any(ord(char) < 33 or ord(char) > 126 for char in rid)
+                        or type(request.get("schema_version")) is not int or request["schema_version"] != 1
+                        or request.get("account_id") != self.account_id
+                        or request.get("environment", None if self.environment == "LIVE" else "SIM") != self.environment
+                        or request.get("session_id") != mailbox.session_id
+                        or type(request.get("sequence")) is not int or request["sequence"] != header[4]
+                        or type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline > now
+                        or completed["session_id"] != mailbox.session_id or completed["request_id"] != rid
+                        or completed["method"] != method or completed["sequence"] != header[4]
+                        or not completed["started_at_unix"] <= completed["finished_at_unix"] <= now
+                        or not (completed["ok"] is True or
+                                (completed["server_error"] == "READ_EXPIRED" and deadline <= completed["started_at_unix"]) or
+                                (completed["server_error"] == "READ_EXPIRED_DURING_EXECUTION" and
+                                 completed["started_at_unix"] < deadline <= completed["finished_at_unix"]))):
+                    return None
+                transport.ShmReadOnlyClient._validate_response(None, request, response)
+                if (response.get("environment") != self.environment or response["ok"] is not completed["ok"]
+                        or response["server_error"] != completed["server_error"]):
+                    return None
+                return dict(contract=READ_ROTATION_EVIDENCE_CONTRACT, status="ELIGIBLE",
+                    account_id=self.account_id, environment=self.environment,
+                    native_pid=mailbox.server_pid, native_creation_filetime=native_creation_filetime,
+                    windows_session_id=self.windows_session_id,
+                    read_session_id=mailbox.session_id, execution_session_id=execution_session_id,
+                    request_id=rid, method=method, sequence=header[4], request_sequence=header[4],
+                    response_sequence=header[5], confirmed_sequence=header[6], read_expires_at_unix=deadline,
+                    native_started_at_unix=completed["started_at_unix"],
+                    native_finished_at_unix=completed["finished_at_unix"], automatic_retry=False)
+            except Exception:
+                return None
+            finally:
+                if not mailbox_locked:
+                    region.release()
+        finally:
+            self.event_lock.release()
 
     @staticmethod
     def _history_symbol(code):
@@ -942,11 +1050,14 @@ class ShmReadOnlyBridge:
         return result
 
     def drain(self):
-        if self.closed:
+        if self.closed or self.failed:
             return
         if threading.get_ident() != self.callback_thread_id:
             raise ReadOnlyRequestError("WRONG_CALLBACK_THREAD", "mailbox polling requires the original QMT callback thread")
         try:
+            if (self.rotation_continuity_guard is not None
+                    and self.rotation_continuity_guard() is not True):
+                raise ReadOnlyRequestError("EXECUTION_CONTINUITY_UNKNOWN", "read result is unconfirmed")
             if self.persistent_readonly and self.pending is None and self.mailbox.region.acquire(0):
                 try:
                     confirmed = self.mailbox._header()[6]
@@ -967,18 +1078,29 @@ class ShmReadOnlyBridge:
                 if incoming is None:
                     return
                 sequence, request = incoming
+                if (self.rotation_continuity_guard is not None
+                        and self.rotation_continuity_guard() is not True):
+                    raise ReadOnlyRequestError("EXECUTION_CONTINUITY_UNKNOWN", "read result is unconfirmed")
                 self.pending = (sequence, self.process_request(request, sequence=sequence))
             sequence, response = self.pending
-            if self.mailbox.publish_response(sequence, response):
+            if self.rotation_continuity_guard is None:
+                published = self.mailbox.publish_response(sequence, response)
+            else:
+                published = self.mailbox.publish_response(
+                    sequence, response, publication_guard=self.rotation_continuity_guard,
+                    publication_lock=self.rotation_continuity_lock)
+            if published:
                 self.pending = None
                 if not self.persistent_readonly and self.request_count >= READONLY_MAX_REQUESTS:
                     self.close("request_limit")
         except Exception as exc:
+            self.failed = True
             print("AQP_SHM_READONLY_ERROR %s: %s" % (type(exc).__name__, exc))
-            try:
-                self.close("callback_error", failed=True)
-            except Exception as cleanup:
-                print("AQP_SHM_READONLY_CLEANUP_ERROR %s: %s" % (type(cleanup).__name__, cleanup))
+            if not self.preserve_failed_mailbox:
+                try:
+                    self.close("callback_error", failed=True)
+                except Exception as cleanup:
+                    print("AQP_SHM_READONLY_CLEANUP_ERROR %s: %s" % (type(cleanup).__name__, cleanup))
             raise
 
     def close(self, reason="stop", failed=False):

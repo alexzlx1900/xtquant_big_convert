@@ -402,14 +402,20 @@ class MailboxProtocolTest(BridgeFixture):
     def test_initial_mutex_timeout_uses_earlier_read_deadline_and_posts_nothing(self):
         client = self.client()
         before = bytes(self.state.data)
-        payload = self.envelope(read_expires_at_unix=time.time() + 0.03)
+        payload = self.envelope("get_positions", read_expires_at_unix=time.time() + 0.03)
         payload.pop("sequence")
         self.state.lock.acquire()
         try:
             with mock.patch.object(client.mailbox.region, "acquire", wraps=client.mailbox.region.acquire) as acquire, \
                     mock.patch.object(client.mailbox.region, "write", wraps=client.mailbox.region.write) as writes:
-                with self.assertRaisesRegex(self.transport.ShmTimeoutError, "before publication; request not sent"):
+                with self.assertRaisesRegex(self.transport.ShmTimeoutError, "before publication; request not sent") as caught:
                     client.send_request(payload, 1.0)
+                self.assertEqual(caught.exception.publication_state, "NOT_SENT")
+                self.assertEqual(caught.exception.session_id, self.mailbox.session_id)
+                self.assertEqual(caught.exception.request_id, payload["request_id"])
+                self.assertIsNone(caught.exception.sequence)
+                self.assertIsNone(caught.exception.previous_unconfirmed)
+                self.assertIn("shm_client_started_at_unix", caught.exception.read_timing)
                 self.assertGreater(acquire.call_args.args[0], 0)
                 self.assertLessEqual(acquire.call_args.args[0], 30)
                 writes.assert_not_called()
@@ -455,8 +461,15 @@ class MailboxProtocolTest(BridgeFixture):
         sequence = self.post_raw(value)
         self.bridge.drain()
         before = bytes(self.state.data)
-        with self.assertRaises(self.transport.ShmBusyError):
-            self.client().send_request(self.envelope(), 0.05)
+        client = self.client()
+        request = self.envelope()
+        with self.assertRaises(self.transport.ShmBusyError) as caught:
+            client.send_request(request, 0.05)
+        self.assertEqual(caught.exception.publication_state, "NOT_SENT")
+        self.assertTrue(caught.exception.previous_unconfirmed)
+        self.assertEqual(caught.exception.request_id, request["request_id"])
+        self.assertEqual(caught.exception.session_id, self.mailbox.session_id)
+        self.assertIsNone(caught.exception.sequence)
         self.assertEqual(bytes(self.state.data), before)
         self.assertEqual(self.mailbox._header()[4:7], [sequence, sequence, 0])
 
@@ -469,16 +482,91 @@ class MailboxProtocolTest(BridgeFixture):
 
     def test_timeout_poisoning_prevents_same_or_new_client_resubmit(self):
         client = self.client()
-        with self.assertRaises(self.transport.ShmTimeoutError):
-            client.send_request(self.envelope(), 0.02)
+        request = self.envelope()
+        with self.assertRaises(self.transport.ShmTimeoutError) as caught:
+            client.send_request(request, 0.02)
+        self.assertEqual(caught.exception.publication_state, "UNKNOWN")
+        self.assertEqual(caught.exception.session_id, self.mailbox.session_id)
+        self.assertEqual(caught.exception.request_id, request["request_id"])
+        self.assertEqual(caught.exception.sequence, 1)
+        self.assertFalse(caught.exception.previous_unconfirmed)
         self.assertTrue(client.poisoned)
-        with self.assertRaises(self.transport.ShmProtocolError):
+        with self.assertRaises(self.transport.ShmProtocolError) as poisoned:
             client.send_request(self.envelope(), 0.02)
+        self.assertEqual(poisoned.exception.publication_state, "NOT_SENT")
+        self.assertTrue(poisoned.exception.previous_unconfirmed)
         with self.assertRaises(self.transport.ShmBusyError):
             self.client().send_request(self.envelope(), 0.02)
         self.bridge.drain()
         self.assertEqual(self.mailbox._header()[6], 0)
         self.query.assert_not_called()
+
+    def test_partial_frame_write_is_unknown_and_cannot_be_reused(self):
+        client = self.client()
+        request = self.envelope()
+        original_write = client.mailbox.region.write
+
+        def partial_write(offset, raw):
+            if offset == self.transport.REQUEST_OFFSET:
+                original_write(offset, raw[:3])
+                raise OSError("fixture interrupted frame write")
+            return original_write(offset, raw)
+
+        with mock.patch.object(client.mailbox.region, "write", side_effect=partial_write):
+            with self.assertRaises(OSError) as caught:
+                client.send_request(request, 0.1)
+        self.assertEqual(caught.exception.publication_state, "UNKNOWN")
+        self.assertEqual(caught.exception.sequence, 1)
+        self.assertEqual(caught.exception.request_id, request["request_id"])
+        self.assertTrue(client.poisoned)
+        self.assertEqual(self.mailbox._header()[4:7], [0, 0, 0])
+
+    def test_after_publication_runs_once_after_mailbox_lock_is_released(self):
+        client = self.client()
+        request = self.envelope()
+        observed = []
+
+        def after_publication():
+            acquired = self.state.lock.acquire(False)
+            self.assertTrue(acquired)
+            try:
+                observed.append(self.mailbox._header()[4:7])
+            finally:
+                self.state.lock.release()
+
+        with self.assertRaises(self.transport.ShmTimeoutError):
+            client.send_request(request, 0.02, after_publication=after_publication)
+        self.assertEqual(observed, [[1, 0, 0]])
+        self.assertTrue(client.poisoned)
+        self.assertEqual(self.mailbox._header()[4:7], [1, 0, 0])
+
+    def test_after_publication_failure_is_unknown_without_ack_or_reuse(self):
+        client = self.client()
+        request = self.envelope()
+        callback = mock.Mock(side_effect=RuntimeError("fixture release failure"))
+        with self.assertRaises(RuntimeError) as caught:
+            client.send_request(request, 0.1, after_publication=callback)
+        callback.assert_called_once_with()
+        self.assertEqual(caught.exception.publication_state, "UNKNOWN")
+        self.assertEqual(caught.exception.request_id, request["request_id"])
+        self.assertEqual(caught.exception.sequence, 1)
+        self.assertTrue(client.poisoned)
+        self.assertEqual(self.mailbox._header()[4:7], [1, 0, 0])
+        self.query.assert_not_called()
+
+    def test_after_publication_never_runs_when_initial_lock_is_unavailable(self):
+        client = self.client()
+        callback = mock.Mock()
+        self.state.lock.acquire()
+        try:
+            with self.assertRaises(self.transport.ShmTimeoutError) as caught:
+                client.send_request(self.envelope(), 0.02, after_publication=callback)
+        finally:
+            self.state.lock.release()
+        callback.assert_not_called()
+        self.assertEqual(caught.exception.publication_state, "NOT_SENT")
+        self.assertIsNone(caught.exception.previous_unconfirmed)
+        self.assertFalse(client.poisoned)
 
     def test_oversized_request_does_not_modify_mailbox(self):
         client = self.client()
@@ -768,6 +856,23 @@ class Win32FailurePathTest(unittest.TestCase):
         with self.assertRaisesRegex(self.transport.ShmNativeError, "MapViewOfFile"):
             self.transport.Win32Region(NAME, create=True, kernel=self.kernel)
         self.kernel.CloseHandle.assert_called_once_with(101)
+
+    def test_mapping_creation_preserves_direct_win32_error_without_guessing_other_failures(self):
+        self.kernel.CreateFileMappingW.return_value = None
+        ctypes.get_last_error.return_value = 1455
+        with self.assertRaises(self.transport.ShmNativeError) as raised:
+            self.transport.Win32Region(NAME, create=True, kernel=self.kernel)
+        self.assertEqual(raised.exception.native_operation, "CreateFileMappingW")
+        self.assertEqual(raised.exception.native_winerror, 1455)
+        self.kernel.MapViewOfFile.assert_not_called()
+        self.kernel.CreateMutexW.assert_not_called()
+        self.kernel.CreateFileMappingW.reset_mock()
+        self.kernel.CreateFileMappingW.return_value = 101
+        self.kernel.MapViewOfFile.return_value = None
+        with self.assertRaises(self.transport.ShmNativeError) as raised:
+            self.transport.Win32Region(NAME, create=True, kernel=self.kernel)
+        self.assertIsNone(raised.exception.native_operation)
+        self.assertEqual(raised.exception.native_winerror, 1455)
 
     def test_new_client_refuses_old_smaller_mapping_and_preserves_wire_offsets(self):
         legacy_size = 64 + 8192 + 262144

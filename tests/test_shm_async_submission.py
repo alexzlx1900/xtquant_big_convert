@@ -158,6 +158,80 @@ def test_callback_during_native_call_is_not_lost_and_receipt_still_does_not_clai
     assert len(value.gateway.submits) == 2
 
 
+def guarded_value(harness):
+    value = harness(handshake=False, execution_event_guard_required=True)
+    value.bridge.runtime_metadata["execution_event_guard_contract"] = "EXECUTION_CURSOR_WRITE_GATE_V1"
+    value.handshake()
+    assert value.execute(lambda: value.client.poll_execution_events(0))["gap"] is False
+    guard = dict(contract="EXECUTION_CURSOR_WRITE_GATE_V1", execution_session_id=value.bridge.mailbox.session_id,
+                 native_pid=777, sequence=0)
+    value.bridge.flag_off_thread_execution_event()
+    return value, guard
+
+
+def test_direct_guarded_client_preserves_no_write_receipt_and_keeps_writes_blocked(harness):
+    value, guard = guarded_value(harness)
+    result = submit(value, rid="guarded-rid", cid="guarded-cid", execution_event_guard=guard)
+    assert result["status"] == "BLOCKED" and result["native_write_executed"] is False
+    assert result["no_write_contract"] == "EXECUTION_CURSOR_NO_WRITE_V1"
+    assert result["request_id"] == "guarded-rid" and result["client_order_id"] == "guarded-cid"
+    assert result["native_event_sequence"] == result["native_lost_sequence"] == 1
+    assert result["writes_blocked"] is True and result["automatic_retry"] is False
+    assert not value.gateway.submits
+    with pytest.raises(ShmProtocolError):
+        submit(value, rid="new-rid", cid="new-cid", execution_event_guard=guard)
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("no_write_contract", "wrong"), ("request_id", "other"), ("client_order_id", "other"),
+    ("account_id", "other"), ("environment", "LIVE"), ("session_id", "other"),
+    ("native_pid", True), ("windows_session_id", True), ("native_event_sequence", True),
+    ("native_lost_sequence", -1), ("native_write_executed", None), ("automatic_retry", True),
+    ("write_block_reason", ""), ("execution_event_guard", {}), ("error", "other"),
+])
+def test_direct_guarded_client_rejects_incomplete_no_write_receipts(harness, field, bad):
+    value, guard = guarded_value(harness)
+    original_send = value.client._client.send_request
+
+    def altered(request, *args, **kwargs):
+        response = original_send(request, *args, **kwargs)
+        if request.get("method") == METHOD:
+            response["data"][field] = bad
+        return response
+
+    value.client._client.send_request = altered
+    result = submit(value, rid="guarded-rid", cid="guarded-cid", execution_event_guard=guard)
+    assert result["status"] == "UNKNOWN" and result["automatic_retry"] is False
+    assert result["error"] == "NATIVE_ASYNC_RECEIPT_UNCONFIRMED"
+    assert not value.gateway.submits
+    with pytest.raises(ShmProtocolError):
+        submit(value, rid="new-rid", cid="new-cid", execution_event_guard=guard)
+
+
+@pytest.mark.parametrize("native_epoch,expected", [(2, "BLOCKED"), (1, "UNKNOWN"), (0, "UNKNOWN"), (True, "UNKNOWN"), (None, "UNKNOWN")])
+def test_direct_client_requires_a_complete_different_supervisor_epoch(harness, native_epoch, expected):
+    value, guard = guarded_value(harness)
+    old_epoch = dict(contract="SUPERVISOR_GATE_EPOCH_V1", epoch=1)
+    original_send = value.client._client.send_request
+
+    def epoch_receipt(request, *args, **kwargs):
+        response = original_send(request, *args, **kwargs)
+        if request.get("method") == METHOD:
+            response["data"].update(no_write_contract="SUPERVISOR_GATE_NO_WRITE_V1",
+                error="SUPERVISOR_GATE_EPOCH_MISMATCH", supervisor_gate_epoch=dict(old_epoch),
+                native_supervisor_gate_epoch=native_epoch)
+        return response
+
+    value.client._client.send_request = epoch_receipt
+    result = submit(value, rid="epoch-rid", cid="epoch-cid", execution_event_guard=guard,
+                    supervisor_gate_epoch=old_epoch)
+    assert result["status"] == expected and result["automatic_retry"] is False
+    assert not value.gateway.submits
+    with pytest.raises(ShmProtocolError):
+        submit(value, rid="later-rid", cid="later-cid", execution_event_guard=guard,
+               supervisor_gate_epoch=old_epoch)
+
+
 def test_two_different_cids_cannot_claim_the_same_broker_contract(harness):
     value = harness()
     submit(value)

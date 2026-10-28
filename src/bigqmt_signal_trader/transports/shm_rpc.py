@@ -12,6 +12,10 @@ WRITE_METHODS = frozenset(("submit_order", "cancel_order"))
 ASYNC_WRITE_METHODS = frozenset(("submit_order_async",))
 ALL_WRITE_METHODS = WRITE_METHODS | ASYNC_WRITE_METHODS
 ASYNC_SUBMIT_CONTRACT = "NATIVE_CALL_RETURNED_V1"
+EXECUTION_CURSOR_WRITE_GATE_CONTRACT = "EXECUTION_CURSOR_WRITE_GATE_V1"
+EXECUTION_CURSOR_NO_WRITE_CONTRACT = "EXECUTION_CURSOR_NO_WRITE_V1"
+SUPERVISOR_GATE_EPOCH_CONTRACT = "SUPERVISOR_GATE_EPOCH_V1"
+SUPERVISOR_GATE_NO_WRITE_CONTRACT = "SUPERVISOR_GATE_NO_WRITE_V1"
 READ_METHODS = frozenset(("ping", "get_asset", "get_positions", "query_orders", "query_trades", "query_execution_snapshot", "poll_execution_events", "get_trade_login_state"))
 
 
@@ -58,6 +62,8 @@ class ShmRpcClient:
         self._client, self._identity = None, None
         self._async_submit_enabled = False
         self._async_windows_session_id = None
+        self._execution_event_guard_enabled = False
+        self._windows_session_id = None
         self._async_write_uncertain = False
         self._closed, self._uncertain = False, False
         self._lock = threading.Lock()
@@ -81,6 +87,12 @@ class ShmRpcClient:
             self.close()
             raise ShmProtocolError("bridge identity mismatch")
         self._identity = (expected_session_id, expected_native_pid)
+        self._execution_event_guard_enabled = result.get("execution_event_guard_contract") == EXECUTION_CURSOR_WRITE_GATE_CONTRACT
+        session = result.get("windows_session_id")
+        self._windows_session_id = session if type(session) is int and session >= 0 else None
+        if self._execution_event_guard_enabled and self._windows_session_id is None:
+            self.close()
+            raise ShmProtocolError("execution cursor contract requires a confirmed Windows session")
         capabilities = result.get("capabilities")
         self._async_submit_enabled = (
             isinstance(capabilities, list) and all(isinstance(value, str) for value in capabilities)
@@ -91,6 +103,67 @@ class ShmRpcClient:
         if self._async_submit_enabled and result.get("writes_blocked") is True:
             self._async_write_uncertain = True
         return result
+
+    def _valid_no_write_identity(self, method, request_id, params, response, data):
+        if (not isinstance(response, dict) or type(response.get("schema_version")) is not int
+                or response["schema_version"] != 1 or response.get("ok") is not True
+                or response.get("request_id") != request_id or response.get("account_id") != self.account_id
+                or response.get("method") != method or response.get("session_id") != self._identity[0]
+                or response.get("environment", None if self.environment == "LIVE" else "SIM") != self.environment
+                or type(response.get("sequence")) is not int or response["sequence"] <= 0):
+            return False
+        if (not isinstance(data, dict) or data.get("status") != "BLOCKED"
+                or data.get("request_id") != request_id or data.get("account_id") != self.account_id
+                or data.get("environment") != self.environment or data.get("session_id") != self._identity[0]
+                or type(data.get("native_pid")) is not int or data["native_pid"] != self._identity[1]
+                or type(data.get("windows_session_id")) is not int or data["windows_session_id"] != self._windows_session_id
+                or data.get("native_write_executed") is not False or data.get("automatic_retry") is not False
+                or type(data.get("writes_blocked")) is not bool or not isinstance(data.get("write_block_reason"), str)
+                or bool(data["write_block_reason"]) is not data["writes_blocked"]):
+            return False
+        if method in ASYNC_WRITE_METHODS:
+            source = data.get("source_evidence")
+            if (data.get("client_order_id") != params.get("client_order_id") or not isinstance(source, dict)
+                    or source.get("account_id") != self.account_id or source.get("environment") != self.environment
+                    or source.get("session_id") != self._identity[0]
+                    or type(source.get("native_pid")) is not int or source["native_pid"] != self._identity[1]
+                    or type(source.get("windows_session_id")) is not int
+                    or source["windows_session_id"] != self._windows_session_id):
+                return False
+        return True
+
+    def _valid_cursor_no_write(self, method, request_id, params, response, data):
+        guard = params.get("execution_event_guard")
+        if (not self._valid_no_write_identity(method, request_id, params, response, data)
+                or not isinstance(guard, dict) or set(guard) != {"contract", "execution_session_id", "native_pid", "sequence"}
+                or guard.get("contract") != EXECUTION_CURSOR_WRITE_GATE_CONTRACT
+                or guard.get("execution_session_id") != self._identity[0]
+                or type(guard.get("native_pid")) is not int or guard["native_pid"] != self._identity[1]
+                or type(guard.get("sequence")) is not int or guard["sequence"] < 0
+                or data.get("no_write_contract") != EXECUTION_CURSOR_NO_WRITE_CONTRACT
+                or data.get("error") != "EXECUTION_EVENT_CURSOR_NOT_CURRENT"
+                or data.get("execution_event_guard") != guard or type(data.get("native_event_sequence")) is not int
+                or type(data.get("native_lost_sequence")) is not int or data["native_lost_sequence"] < 0
+                or data["native_event_sequence"] < data["native_lost_sequence"]):
+            return False
+        returned = data["execution_event_guard"]
+        return isinstance(returned, dict) and type(returned.get("native_pid")) is int and type(returned.get("sequence")) is int
+
+    def _valid_supervisor_no_write(self, method, request_id, params, response, data):
+        epoch = params.get("supervisor_gate_epoch")
+        if (not self._valid_no_write_identity(method, request_id, params, response, data)
+                or not isinstance(epoch, dict) or set(epoch) != {"contract", "epoch"}
+                or epoch.get("contract") != SUPERVISOR_GATE_EPOCH_CONTRACT
+                or type(epoch.get("epoch")) is not int or not 1 <= epoch["epoch"] <= 0xFFFFFFFFFFFFFFFF
+                or data.get("no_write_contract") != SUPERVISOR_GATE_NO_WRITE_CONTRACT
+                or data.get("error") != "SUPERVISOR_GATE_EPOCH_MISMATCH"
+                or data.get("supervisor_gate_epoch") != epoch
+                or type(data.get("native_supervisor_gate_epoch")) is not int
+                or not 1 <= data["native_supervisor_gate_epoch"] <= 0xFFFFFFFFFFFFFFFF
+                or data["native_supervisor_gate_epoch"] == epoch["epoch"]):
+            return False
+        returned = data["supervisor_gate_epoch"]
+        return isinstance(returned, dict) and type(returned.get("epoch")) is int
 
     def call(self, method, params=None, *, account_id=None, timeout_seconds=None,
              use_formula=False, request_id=None):
@@ -160,8 +233,12 @@ class ShmRpcClient:
                                  and data.get("native_write_executed") is True
                                  and bool(data["write_block_reason"]) is data["writes_blocked"])
                     elif status == "BLOCKED":
-                        valid = (data.get("native_write_executed") is False and data["writes_blocked"] is False
-                                 and data["write_block_reason"] == "" and data.get("receipt_type") is None)
+                        valid = (data.get("receipt_type") is None and
+                                 ((self._valid_cursor_no_write(method, rid, values, response, data)
+                                   or self._valid_supervisor_no_write(method, rid, values, response, data))
+                                  if self._execution_event_guard_enabled else
+                                  data.get("native_write_executed") is False and data["writes_blocked"] is False
+                                  and data["write_block_reason"] == ""))
                     elif status == "UNKNOWN":
                         valid = data["writes_blocked"] is True and bool(data["write_block_reason"])
                     else:
@@ -171,6 +248,17 @@ class ShmRpcClient:
                     return dict(status="UNKNOWN", automatic_retry=False, request_id=rid,
                                 error="NATIVE_ASYNC_RECEIPT_UNCONFIRMED")
                 if data.get("status") == "UNKNOWN" or data["writes_blocked"]:
+                    self._async_write_uncertain = True
+            elif method in WRITE_METHODS and self._execution_event_guard_enabled:
+                if isinstance(data, dict) and data.get("status") == "BLOCKED":
+                    if not (self._valid_cursor_no_write(method, rid, values, response, data)
+                            or self._valid_supervisor_no_write(method, rid, values, response, data)):
+                        self._uncertain = True
+                        return dict(status="UNKNOWN", automatic_retry=False, request_id=rid,
+                                    error="NATIVE_CURSOR_RECEIPT_UNCONFIRMED")
+                    if data["writes_blocked"]:
+                        self._async_write_uncertain = True
+                elif not isinstance(data, dict) or data.get("status") == "UNKNOWN":
                     self._async_write_uncertain = True
             return data
         finally:

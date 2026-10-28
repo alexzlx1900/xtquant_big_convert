@@ -25,6 +25,7 @@ SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE = False  # 显式模拟读写驻留；�
 SHM_RPC_PERSISTENT_LIVE_READ_WRITE = False  # 仅显式实盘账户常驻；不启用策略tick。
 SHM_RPC_ACCOUNT_ALREADY_BOUND = False  # 仅显式双源外壳已完成唯一账户绑定时使用。
 SHM_RPC_LIVE_ACCOUNT_QUERY_LOGIN = False  # 仅显式LIVE候选使用当前ACCOUNT登录状态。
+SHM_RPC_EXECUTION_EVENT_GUARD = False  # 仅显式目标实例启用事件游标写门。
 SHM_RPC_ORDER_GATEWAY = None  # 禁写默认不绑定；另行授权后才可显式注入既有gateway。
 SHM_RPC_ORDER_GATEWAY_FACTORY = None  # 显式候选可注入factory；禁写时不会构造。
 _EMBEDDED_SOURCES = {}  # BUILD_SHM_RPC_EMBEDDED
@@ -483,6 +484,12 @@ class NativeShmRpcRuntime:
             raise ValueError("explicit boolean order permission required")
         if type(SHM_RPC_BIND_ACCOUNT_CALLBACKS) is not bool:
             raise ValueError("explicit boolean callback binding required")
+        if type(SHM_RPC_EXECUTION_EVENT_GUARD) is not bool or (SHM_RPC_EXECUTION_EVENT_GUARD and not SHM_RPC_ALLOW_ORDER_METHODS):
+            raise ValueError("execution event guard requires explicit write-enabled target")
+        if SHM_RPC_EXECUTION_EVENT_GUARD and not (
+                BIGQMT_ENVIRONMENT == "SIM" and BIGQMT_ACCOUNT_ID == "55013746"
+                or BIGQMT_ENVIRONMENT == "LIVE" and BIGQMT_ACCOUNT_ID == "8882152350"):
+            raise ValueError("execution event guard account/environment does not match the explicit target")
         if (type(SHM_RPC_PERSISTENT_READONLY) is not bool or type(SHM_RPC_PERSISTENT_SIMULATION_READ_WRITE) is not bool
                 or type(SHM_RPC_PERSISTENT_LIVE_READ_WRITE) is not bool
                 or type(SHM_RPC_ACCOUNT_ALREADY_BOUND) is not bool):
@@ -556,6 +563,9 @@ class NativeShmRpcRuntime:
                                                        globals().get("passorder"), globals().get("cancel"))
             if gateway is None:
                 raise RuntimeError("authorized order_gateway factory returned no gateway")
+        if SHM_RPC_EXECUTION_EVENT_GUARD and any(
+                not callable(getattr(gateway, field, None)) for field in ("passorder", "cancel_func")):
+            raise RuntimeError("execution event guard cannot wrap both native write functions")
         handlers = rpc.BigQmtRpcHandlers(BIGQMT_ACCOUNT_ID, None, provider, gateway,
                                         allow_order_methods=SHM_RPC_ALLOW_ORDER_METHODS,
                                         allowed_methods=allowed, settle_orders_inline=False)
@@ -564,7 +574,8 @@ class NativeShmRpcRuntime:
             allow_order_methods=SHM_RPC_ALLOW_ORDER_METHODS, trade_login_reader=self.trade_login.readback,
             persistent_readonly=self.persistent_readonly,
             persistent_simulation_read_write=self.persistent_simulation_read_write,
-            environment=BIGQMT_ENVIRONMENT, persistent_live_read_write=self.persistent_live_read_write)
+            environment=BIGQMT_ENVIRONMENT, persistent_live_read_write=self.persistent_live_read_write,
+            execution_event_guard_required=SHM_RPC_EXECUTION_EVENT_GUARD)
         self.bridge.runtime_metadata = dict(runtime_policy=self.runtime_policy, environment=BIGQMT_ENVIRONMENT,
             started_at_unix=self.created_at_unix, source_deadline_unix=None if self.persistent else self.created_at_unix + SHM_RPC_MAX_SECONDS,
             max_seconds=SHM_RPC_MAX_SECONDS, max_requests=SHM_RPC_MAX_REQUESTS,
@@ -572,18 +583,45 @@ class NativeShmRpcRuntime:
         self.trade_login.bind_identity(self.bridge.mailbox.session_id, self.bridge.mailbox.server_pid)
         self.bridge.trade_login_diagnostic_reader = self.trade_login.diagnostic_readback
         if SHM_RPC_ALLOW_ORDER_METHODS:
+            guarded_fields = set()
             for field in ("passorder", "cancel_func"):
                 native_function = getattr(gateway, field, None)
                 if callable(native_function):
                     setattr(gateway, field, self._guard_native_write(native_function))
+                    guarded_fields.add(field)
+            if SHM_RPC_EXECUTION_EVENT_GUARD and guarded_fields != {"passorder", "cancel_func"}:
+                raise RuntimeError("execution event guard cannot wrap both native write functions")
+            if SHM_RPC_EXECUTION_EVENT_GUARD:
+                self.bridge.runtime_metadata["execution_event_guard_contract"] = "EXECUTION_CURSOR_WRITE_GATE_V1"
+                self.bridge.runtime_metadata["native_write_runtime_guard_ready"] = False
+                self.bridge.runtime_metadata["native_callback_threading_verified"] = False
 
     def _guard_native_write(self, function):
         def guarded(*args, **kwargs):
-            self._thread()
-            login = self.bridge._trade_login()
-            if login.get("status") != "LOGGED_IN":
-                raise PermissionError(login.get("reason") or "TRADE_LOGIN_NOT_CONFIRMED")
-            return function(*args, **kwargs)
+            def invoke(lease=None):
+                self._thread()
+                login = self.bridge._trade_login()
+                if lease is not None:
+                    if lease.ensure_ready() is not True:
+                        raise PermissionError("SUPERVISOR_WRITE_GATE_UNAVAILABLE")
+                    self.bridge.check_native_supervisor_gate_epoch(lease)
+                if login.get("status") != "LOGGED_IN":
+                    raise PermissionError(login.get("reason") or "TRADE_LOGIN_NOT_CONFIRMED")
+                # 监督器/登录检查后再次比较回报；这些检查期间也可能收到原生回调。
+                self.bridge.check_native_write_guard()
+                return function(*args, **kwargs)
+            if not self.bridge.execution_event_guard_required:
+                return invoke()
+            if (self.bridge.runtime_metadata.get("native_write_runtime_guard_ready") is not True
+                    or self.bridge.runtime_metadata.get("native_write_runtime_guard_attached") is not True
+                    or self.bridge.runtime_metadata.get("native_callback_threading_verified") is not True
+                    or self.bridge.runtime_metadata.get("supervisor_write_gate_contract") != "INHERITED_SUPERVISOR_GATE_V1"
+                    or self.bridge.runtime_metadata.get("supervisor_gate_epoch_contract") != "SUPERVISOR_GATE_EPOCH_V1"
+                    or not callable(self.bridge.native_write_runtime_guard)):
+                raise PermissionError("SUPERVISOR_WRITE_GATE_UNAVAILABLE")
+            with self.bridge.native_write_runtime_guard() as lease:
+                self.bridge.check_native_supervisor_gate_epoch(lease)
+                return invoke(lease)
         return guarded
 
     def _thread(self):
@@ -605,10 +643,14 @@ class NativeShmRpcRuntime:
             raise
 
     def event(self, event_type, native_object):
-        self._thread()
         if self.closed:
-            return
+            return False
+        if self.bridge.execution_event_guard_required and threading.get_ident() != self.thread_id:
+            self.bridge.flag_off_thread_execution_event()
+            return False
+        self._thread()
         self.bridge.record_execution_event(event_type, native_object)
+        return True
 
     def close(self, reason="stop"):
         self._thread()
@@ -659,18 +701,33 @@ def handlebar(ContextInfo):
 
 def account_callback(ContextInfo, accountInfo):
     if _SERVER is not None and not _SERVER.closed:
+        if _SERVER.bridge.execution_event_guard_required and threading.get_ident() != _SERVER.thread_id:
+            _SERVER.bridge.flag_off_thread_execution_event()
+            return
         _SERVER._thread()
-        _SERVER.trade_login.record_account_callback(accountInfo)
+        try:
+            _SERVER.trade_login.record_account_callback(accountInfo)
+        except Exception as exc:
+            if not _SERVER.bridge.execution_event_guard_required:
+                raise
+            _SERVER.bridge.record_execution_event_loss("account", "ACCOUNT_CALLBACK_INVALID:%s" % type(exc).__name__)
 
 
 def order_callback(ContextInfo, orderInfo):
     if _SERVER is not None:
-        _SERVER.event("order", orderInfo)
-        status = orderInfo.get("m_nOrderStatus", orderInfo.get("status")) if isinstance(orderInfo, dict) else getattr(orderInfo, "m_nOrderStatus", getattr(orderInfo, "status", None))
+        if not _SERVER.event("order", orderInfo):
+            return
         try:
-            rejected = int(status) == 57
-        except (TypeError, ValueError):
-            rejected = False
+            status = orderInfo.get("m_nOrderStatus", orderInfo.get("status")) if isinstance(orderInfo, dict) else getattr(orderInfo, "m_nOrderStatus", getattr(orderInfo, "status", None))
+            try:
+                rejected = int(status) == 57
+            except (TypeError, ValueError):
+                rejected = False
+        except Exception as exc:
+            if not _SERVER.bridge.execution_event_guard_required:
+                raise
+            _SERVER.bridge.record_execution_event_loss("order_error", "EXECUTION_EVENT_PREPROCESS_FAILED:%s" % type(exc).__name__)
+            return
         if rejected:
             _SERVER.event("order_error", orderInfo)
 
@@ -688,22 +745,31 @@ def aqp_shm_rpc_order_error(ContextInfo, orderErrorInfo):
 def orderError_callback(ContextInfo, orderArgs, errMsg):
     if _SERVER is None or _SERVER.closed:
         return
-    events = _load_embedded("bigqmt_signal_trader.exec_events")
-    remark = events._attr(orderArgs, ["m_strRemark", "order_remark", "remark", "user_order_id"], "")
-    if not remark:
-        strategy_name = str(events._attr(orderArgs, ["strategyName"], "") or "")
-        _, separator, native_remark = strategy_name.partition("_&&&_")
-        remark = native_remark if separator else ""
-    stock_code = events._attr(orderArgs, ["orderCode", "stock_code", "m_strInstrumentID"], "")
+    if _SERVER.bridge.execution_event_guard_required and threading.get_ident() != _SERVER.thread_id:
+        _SERVER.bridge.flag_off_thread_execution_event()
+        return
     try:
-        stock_code = _load_embedded("bigqmt_signal_trader.code_utils").normalize_stock_code(stock_code)
-    except ValueError:
-        stock_code = str(stock_code or "")
-    payload = {field: events._attr(orderArgs, [field]) for field in
-               ("m_strOrderSysID", "order_sys_id", "order_sysid", "order_id", "seq", "request_id",
-                "m_nErrorID", "error_id", "m_nOrderStatus", "status")}
-    payload.update(account_id=events._attr(orderArgs, ["m_strAccountID", "accountID", "account_id"], BIGQMT_ACCOUNT_ID),
-                   stock_code=stock_code, remark=remark, error_msg=str(errMsg or ""))
+        events = _load_embedded("bigqmt_signal_trader.exec_events")
+        remark = events._attr(orderArgs, ["m_strRemark", "order_remark", "remark", "user_order_id"], "")
+        if not remark:
+            strategy_name = str(events._attr(orderArgs, ["strategyName"], "") or "")
+            _, separator, native_remark = strategy_name.partition("_&&&_")
+            remark = native_remark if separator else ""
+        stock_code = events._attr(orderArgs, ["orderCode", "stock_code", "m_strInstrumentID"], "")
+        try:
+            stock_code = _load_embedded("bigqmt_signal_trader.code_utils").normalize_stock_code(stock_code)
+        except ValueError:
+            stock_code = str(stock_code or "")
+        payload = {field: events._attr(orderArgs, [field]) for field in
+                   ("m_strOrderSysID", "order_sys_id", "order_sysid", "order_id", "seq", "request_id",
+                    "m_nErrorID", "error_id", "m_nOrderStatus", "status")}
+        payload.update(account_id=events._attr(orderArgs, ["m_strAccountID", "accountID", "account_id"], BIGQMT_ACCOUNT_ID),
+                       stock_code=stock_code, remark=remark, error_msg=str(errMsg or ""))
+    except Exception as exc:
+        if not _SERVER.bridge.execution_event_guard_required:
+            raise
+        _SERVER.bridge.record_execution_event_loss("order_error", "EXECUTION_EVENT_PREPROCESS_FAILED:%s" % type(exc).__name__)
+        return
     _SERVER.event("order_error", payload)
 
 
