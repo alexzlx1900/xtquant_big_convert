@@ -2865,6 +2865,61 @@ def test_off_thread_event_during_login_blocks_before_passorder(monkeypatch):
     h.close()
 
 
+@pytest.mark.parametrize("method", ["submit_order_async", "submit_order", "cancel_order"])
+@pytest.mark.parametrize("mode", ["SIM", "LIVE"])
+def test_callback_gap_after_last_guard_never_replays_and_blocks_later_writes(monkeypatch, method, mode):
+    options = (read_write_settings() if mode == "SIM" else
+               live_settings(account_id="8882152350", execution_event_guard=True,
+                             read_fault_isolation=True, live_account_query_login=True))
+    h = Fixture(monkeypatch, **options)
+    _, submit, cancel = _enable_fixture_simulation_orders(h)
+    h.start()  # 仅测试注入写门就绪；真实模型不能由此宣称线程合同已验证。
+    _fixture_native_login(h)
+    if method == "cancel_order":
+        previous = h.call("execution", "submit_order",
+            dict(stock_code=CODE, action="BUY", volume=100, price=10.5, remark="fixture-existing"),
+            request_id="fixture-existing")
+        assert previous["data"]["status"] == "CONFIRMED"
+        h.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge.handlers.order_settle_timeout_seconds = 0.005
+
+    bridge = h.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge
+    original_check, injected = bridge.check_native_write_guard, []
+
+    def event_after_last_check():
+        original_check()
+        injected.append(True)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(h.namespace["deal_callback"], h.context, {"m_strAccountID": h.account}).result(timeout=1)
+
+    bridge.check_native_write_guard = event_after_last_check
+    if method == "cancel_order":
+        params = dict(order_sys_id="SIM-FIXTURE-001", user_order_id="fixture-existing")
+    elif method == "submit_order_async":
+        params = dict(stock_code=CODE, action="BUY", volume=100, price=10.5,
+                      client_order_id="fixture-race-async")
+    else:
+        params = dict(stock_code=CODE, action="BUY", volume=100, price=10.5, remark="fixture-race-sync")
+
+    request_id = "fixture-race-" + method
+    result = h.call("execution", method, params, request_id=request_id)
+    assert len(injected) == 1 and bridge._off_thread_event_loss.is_set() and bridge._lost_sequence > 0
+    assert (submit.call_count, cancel.call_count) == ((1, 1) if method == "cancel_order" else (1, 0))
+    if method == "submit_order_async":
+        assert result["data"]["status"] == "UNKNOWN" and result["data"]["native_write_executed"] is True
+        assert result["data"]["automatic_retry"] is False
+    if method == "cancel_order":
+        assert result["data"]["status"] == "UNKNOWN" and result["data"]["automatic_retry"] is False
+    counts = (submit.call_count, cancel.call_count)
+    replay = h.call("execution", method, params, request_id=request_id)
+    assert replay["data"] == result["data"] and (submit.call_count, cancel.call_count) == counts
+    next_result = h.call("execution", "submit_order",
+        dict(stock_code=CODE, action="BUY", volume=100, price=10.5, remark="fixture-new"),
+        request_id="fixture-new-" + method)
+    assert next_result["data"]["status"] == "BLOCKED" and next_result["data"]["native_write_executed"] is False
+    assert (submit.call_count, cancel.call_count) == counts
+    h.close()
+
+
 def test_generated_persistent_simulation_read_write_has_real_separate_handshakes_and_single_binding(monkeypatch, capsys):
     h = Fixture(monkeypatch, **read_write_settings())
     _, submit, cancel = _enable_fixture_simulation_orders(h)
