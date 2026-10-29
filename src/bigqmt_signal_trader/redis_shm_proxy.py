@@ -47,6 +47,7 @@ RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMU
 WRITE_POLICIES = frozenset(("PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 RECEIVE_POLICIES = frozenset(("QUEUE_AND_PUBSUB", "QUEUE_ONLY"))
 READ_FAULT_ISOLATION_CONTRACT = "READ_FAILURE_ISOLATION_V1"
+POSITION_READ_ROUTE_CONTRACT = "POSITION_READ_ROUTE_V1"
 EXECUTION_CURSOR_WRITE_GATE_CONTRACT = "EXECUTION_CURSOR_WRITE_GATE_V1"
 EXECUTION_CURSOR_NO_WRITE_CONTRACT = "EXECUTION_CURSOR_NO_WRITE_V1"
 SUPERVISOR_WRITE_GATE_CONTRACT = "INHERITED_SUPERVISOR_GATE_V1"
@@ -608,6 +609,29 @@ class RedisShmReadOnlyProxy:
                 self._read_expiries.pop(rid, None)
                 self._replays.pop(rid, None)
 
+    def _position_read_route_supported(self):
+        read = self._source_identity.get("readonly", {})
+        capabilities = read.get("capabilities")
+        return (self.execution_cursor_guard_target == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+                and self.account_id == "8882152350" and self.environment == "LIVE"
+                and self._read_isolation_supported and isinstance(capabilities, list)
+                and "get_positions" in capabilities)
+
+    @staticmethod
+    def _request_route(request):
+        method = request.get("method")
+        if (method in QUOTE_METHODS | MARKET_RPC_METHODS
+                or (method == "get_positions"
+                    and request.get("position_read_route_contract") == POSITION_READ_ROUTE_CONTRACT)):
+            return "readonly"
+        return "execution"
+
+    def _request_fingerprint(self, request):
+        values = [request.get("schema_version"), self.account_id, request.get("method"), request.get("params")]
+        if "position_read_route_contract" in request:
+            values.append(request["position_read_route_contract"])
+        return json.dumps(values, sort_keys=True, allow_nan=False, separators=(",", ":"))
+
     def identity_snapshot(self):
         """仅返回实际双源握手证据，未握手不能声明 READY。"""
         if not self._verified:
@@ -635,6 +659,8 @@ class RedisShmReadOnlyProxy:
                 result["read_rotation_capacity_evidence"] = copy.deepcopy(self._read_rotation_capacity_evidence)
         if self.execution_cursor_guard_target is not None and self._read_isolation_supported:
             result["read_fault_isolation_contract"] = READ_FAULT_ISOLATION_CONTRACT
+        if self._position_read_route_supported():
+            result["position_read_route_contract"] = POSITION_READ_ROUTE_CONTRACT
         if self.execution_cursor_guard_target is not None and self._execution_cursor_gate_supported:
             result["execution_event_guard_contract"] = EXECUTION_CURSOR_WRITE_GATE_CONTRACT
         if (self.execution_cursor_guard_target is not None and self._supervisor_write_gate is not None
@@ -1098,7 +1124,7 @@ class RedisShmReadOnlyProxy:
                 or fault.get("previous_unconfirmed") is not False
                 or fault.get("trigger_request_id") != evidence.get("request_id")
                 or fault.get("sequence") != evidence.get("sequence")
-                or evidence.get("method") not in QUOTE_METHODS | {"get_local_data", "get_market_data_ex", "get_market_data_ex_batch"}):
+                or evidence.get("method") not in QUOTE_METHODS | {"get_positions", "get_local_data", "get_market_data_ex", "get_market_data_ex_batch"}):
             raise ShmProtocolError("old read completion evidence is incomplete or mismatched")
         sequence = evidence.get("sequence")
         if (type(sequence) is not int or sequence <= 0 or evidence.get("request_sequence") != sequence
@@ -1132,8 +1158,7 @@ class RedisShmReadOnlyProxy:
                     or request.get("method") != evidence["method"] or request.get("sequence") != sequence
                     or request.get("session_id") != evidence["read_session_id"]
                     or request.get("read_expires_at_unix") != evidence["read_expires_at_unix"]
-                    or json.dumps([request.get("schema_version"), self.account_id, request.get("method"), request.get("params")],
-                                  sort_keys=True, allow_nan=False, separators=(",", ":")) != prior[0]):
+                    or self._request_fingerprint(request) != prior[0]):
                 raise ShmProtocolError("original readonly request differs from retained UNKNOWN")
             self._check_response(request, response, evidence["read_session_id"])
             if response.get("sequence") != sequence:
@@ -2401,6 +2426,10 @@ class RedisShmReadOnlyProxy:
         method, params = request.get("method"), request.get("params")
         if method not in self._capabilities:
             raise ShmProtocolError("method is unavailable or not declared by the verified native source")
+        if "position_read_route_contract" in request and (
+                method != "get_positions" or request["position_read_route_contract"] != POSITION_READ_ROUTE_CONTRACT
+                or not self._position_read_route_supported()):
+            raise ShmProtocolError("position read route is not explicitly supported by the verified source")
         if not isinstance(params, dict) or request.get("use_formula", False) is not False:
             raise ShmProtocolError("params must be object and formula routing is unavailable")
         if (method == "ping" and ("read_rotation" in params or "read_rotation_control_status" in params or
@@ -2442,8 +2471,7 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("bounded nonnegative execution event cursor required")
         if method in ASYNC_WRITE_METHODS:
             validate_async_submit_params(params)
-        return json.dumps([request["schema_version"], self.account_id, method, params],
-                          sort_keys=True, allow_nan=False, separators=(",", ":"))
+        return self._request_fingerprint(request)
 
     def _validate_async_body_identity(self, request, data, binding):
         if (not isinstance(data, dict) or data.get("request_id") != request["request_id"]
@@ -3148,7 +3176,7 @@ class RedisShmReadOnlyProxy:
         if binding is not None:
             response["source_binding"] = binding
             if request.get("method") in self._capabilities:
-                route = "readonly" if request["method"] in QUOTE_METHODS | MARKET_RPC_METHODS else "execution"
+                route = self._request_route(request)
                 response["session_id"] = self._sessions[route]
         return response
 
@@ -3190,7 +3218,7 @@ class RedisShmReadOnlyProxy:
             confirmed_no_write = False
             try:
                 fingerprint = self._validate_request(request)
-                route = "readonly" if request["method"] in QUOTE_METHODS | MARKET_RPC_METHODS else "execution"
+                route = self._request_route(request)
                 if rid in self._retired_read_ids:
                     raise ShmProtocolError("original readonly request belongs to a retired session; do not resend")
                 if route == "readonly" and self._rotation_waiting_gateway:
@@ -3285,6 +3313,9 @@ class RedisShmReadOnlyProxy:
                     forwarded = dict(schema_version=1, request_id=rid, account_id=self.account_id,
                                      method=request["method"], params=dict(request["params"]),
                                      read_expires_at_unix=deadline)
+                    if "position_read_route_contract" in request:
+                        # 旧帧换代核验必须能重建包含路由标记的原请求身份。
+                        forwarded["position_read_route_contract"] = request["position_read_route_contract"]
                     if self.environment == "LIVE":
                         forwarded["environment"] = self.environment
                     fault_route = route
