@@ -132,6 +132,36 @@ def test_late_validated_quote_response_does_not_stop_proxy_or_replay(monkeypatch
     assert all(call[0]["method"] not in ("submit_order", "cancel_order") for call in execution.calls)
 
 
+def test_pending_position_callback_defers_execution_without_publication():
+    proxy, _, read, execution = LIVE.make_proxy(client_mutator=position_route_capable)
+    request = LIVE.request("get_positions", rid="slow-position", position_read_route_contract=POSITION_ROUTE)
+    timeout = ShmTimeoutError("position callback still running")
+    timeout.publication_state, timeout.previous_unconfirmed = "UNKNOWN", False
+    timeout.request_id, timeout.session_id, timeout.sequence = request["request_id"], "readonly-sid", 2
+    read.failure = timeout
+    assert proxy.process_request(request)["status"] == "UNKNOWN"
+    count = len(execution.calls)
+    result = proxy.process_request(LIVE.request("ping", rid="ping-during-position"))
+    assert result["status"] == "REJECTED" and result["server_error"] == "SHM_NOT_SENT"
+    assert result["publication_state"] == "NOT_SENT" and result["previous_unconfirmed"] is False
+    assert len(execution.calls) == count
+    assert proxy.identity_snapshot()["execution_source_state"] == "HEALTHY" and not proxy.stopped
+
+
+@pytest.mark.parametrize("fault", [
+    {"state": "IDENTITY_OR_PROTOCOL_ERROR"},
+    {"state": "RESULT_UNKNOWN", "publication_state": "UNKNOWN", "previous_unconfirmed": None,
+     "sequence": 2, "trigger_request_id": "prior-read"},
+])
+def test_unverifiable_read_fault_defers_execution(fault):
+    proxy, _, _, execution = LIVE.make_proxy(client_mutator=position_route_capable)
+    proxy._route_faults["readonly"] = fault
+    count = len(execution.calls)
+    result = proxy.process_request(LIVE.request("ping", rid="ping-with-unverifiable-read"))
+    assert result["server_error"] == "SHM_NOT_SENT" and result["publication_state"] == "NOT_SENT"
+    assert result["previous_unconfirmed"] is False and len(execution.calls) == count
+
+
 def test_live_position_timeout_crosses_gateway_without_stopping_proxy(monkeypatch, gateway_modules):
     target = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
     harness = Harness(monkeypatch, gateway_modules, live=True, receive_policy="QUEUE_ONLY",
@@ -175,9 +205,12 @@ def test_live_position_timeout_crosses_gateway_without_stopping_proxy(monkeypatc
                 client.call("get_positions", {}, request_id="integration-position-timeout")
             assert len(harness.redis.inbound_wires) == count
 
-            ping = await harness.operation(asyncio.to_thread(client.call, "ping", {},
-                                                             request_id="execution-still-available"))
-            assert ping["execution_source_state"] == "HEALTHY"
+            for rid in ("execution-not-published", "execution-still-not-published"):
+                with pytest.raises(gateway_modules.client.RedisShmReadUnavailable) as pending:
+                    await harness.operation(asyncio.to_thread(client.call, "ping", {}, request_id=rid))
+                assert pending.value.publication_state == "NOT_SENT" and pending.value.previous_unconfirmed is False
+            assert client._identity_invalidated is False
+            assert harness.proxy.identity_snapshot()["execution_source_state"] == "HEALTHY"
             assert not harness.submit_calls and not harness.cancel_calls
         finally:
             await harness.close()
@@ -236,6 +269,10 @@ def test_position_old_frame_can_be_verified_without_ack_or_execution_change(monk
             harness.proxy._verify_old_read_rotation_evidence(evidence)
             assert bytes(harness.source.states["read"].data) == frame
             assert execution.mailbox._header()[4:7] == before_execution
+            assert harness.proxy._readonly_callback_finished() is True
+            ping = await harness.operation(asyncio.to_thread(client.call, "ping", {}, request_id="after-position-return"))
+            assert ping["execution_source_state"] == "HEALTHY"
+            assert bytes(harness.source.states["read"].data) == frame
             assert not harness.submit_calls and not harness.cancel_calls
         finally:
             await harness.close()
@@ -272,8 +309,12 @@ def test_gateway_router_returns_unknown_for_position_timeout_and_keeps_proxy_ali
             assert response["status"] == "UNKNOWN" and response["automatic_retry"] is False
             assert response["publication_state"] == "UNKNOWN"
             assert harness.proxy.stopped is False and harness.pump.done() is False
-            ping = await harness.operation(asyncio.to_thread(harness.read._get_client().call, "ping", {}))
-            assert ping["execution_source_state"] == "HEALTHY"
+            client = harness.read._get_client()
+            with pytest.raises(gateway_modules.client.RedisShmReadUnavailable) as pending:
+                await harness.operation(asyncio.to_thread(client.call, "ping", {}))
+            assert pending.value.publication_state == "NOT_SENT" and pending.value.previous_unconfirmed is False
+            assert client._identity_invalidated is False
+            assert harness.proxy.identity_snapshot()["execution_source_state"] == "HEALTHY"
             assert not harness.submit_calls and not harness.cancel_calls
         finally:
             await harness.close()

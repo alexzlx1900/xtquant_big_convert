@@ -840,6 +840,53 @@ class RedisShmReadOnlyProxy:
             self._route_faults[route] = fault
         self._block_writes("READ_SOURCE_UNTRUSTED" if route == "readonly" else "EXECUTION_SOURCE_UNTRUSTED")
 
+    def _readonly_callback_finished(self):
+        """只读旧帧证明回调已结束；不确认、重发或解释旧结果。"""
+        fault = self._route_faults["readonly"]
+        if fault is None:
+            return True
+        if not isinstance(fault, dict) or fault.get("state") != "RESULT_UNKNOWN":
+            return False
+        sequence, rid = fault.get("sequence"), fault.get("trigger_request_id")
+        if (fault.get("publication_state") != "UNKNOWN" or fault.get("previous_unconfirmed") is not False
+                or type(sequence) is not int or sequence <= 0 or not isinstance(rid, str)):
+            return False
+        mailbox = self._clients["readonly"].mailbox
+        region = getattr(mailbox, "region", None)
+        if mailbox.closed or region is None:
+            return False
+        try:
+            acquired = region.acquire(0)
+        except Exception:
+            return False
+        if not acquired:
+            return False
+        try:
+            header = mailbox._header()
+            if (header[2] != READY or header[4:6] != [sequence, sequence]
+                    or header[6] not in (sequence - 1, sequence)
+                    or not 0 < header[7] <= REQUEST_CAPACITY or not 0 < header[8] <= RESPONSE_CAPACITY):
+                return False
+            request = decode_payload(region.read(REQUEST_OFFSET, header[7]))
+            response = decode_payload(region.read(RESPONSE_OFFSET, header[8]))
+            prior = self._replays.get(rid)
+            if (not isinstance(request, dict) or not isinstance(response, dict)
+                    or request.get("request_id") != rid or request.get("account_id") != self.account_id
+                    or request.get("session_id") != self._sessions["readonly"]
+                    or request.get("sequence") != sequence or response.get("sequence") != sequence
+                    or not prior or prior[1].get("status") != "UNKNOWN"
+                    or self._request_fingerprint(request) != prior[0]):
+                return False
+            self._check_response(request, response, self._sessions["readonly"])
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                region.release()
+            except Exception:
+                return False
+
     def _execution_event_state(self, data, request):
         """仅据同账户、同执行源和自洽游标识别回报缺口；不把无效结果当作零。"""
         binding = self._source_binding()
@@ -3344,6 +3391,12 @@ class RedisShmReadOnlyProxy:
                         client = self._clients[route]
                         self._operation_phase = "SHM_PRE_FORWARD"
                         self._ensure_open()
+                        if (route == "execution" and not is_write
+                                and self.execution_cursor_guard_target == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+                                and not self._readonly_callback_finished()):
+                            deferred = ShmBusyError("readonly callback completion is unconfirmed; execution request not sent")
+                            deferred.previous_unconfirmed = False
+                            raise deferred
                         remaining = deadline - time.time()
                         if remaining <= 0:
                             raise ShmTimeoutError("read deadline expired before forwarding")
