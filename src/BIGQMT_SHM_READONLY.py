@@ -7,6 +7,7 @@ import ctypes
 import datetime as _dt
 import json
 import math
+import struct
 import threading
 import time
 import types
@@ -31,6 +32,9 @@ HISTORY_PAYLOAD_LIMIT_BYTES = 8 * 1024 * 1024 - 16384
 MINUTE_BATCH_CONTRACT = "SCOPED_MINUTE_HISTORY_BATCH_V1"
 MINUTE_BATCH_MAX_SYMBOLS = 50
 READ_ROTATION_EVIDENCE_CONTRACT = "READ_ROTATION_EVIDENCE_V1"
+READ_PY_CALLBACK_RETURNED_CONTRACT = "READ_PY_CALLBACK_RETURNED_V1"
+_READ_CALLBACK_WITNESS = struct.Struct("<II")
+_READ_CALLBACK_WITNESS_OFFSET = 56
 _EMBEDDED_SOURCES = {}  # BUILD_READONLY_EMBEDDED
 _MODULE_CACHE = {}
 _ORIGINAL_IMPORT = builtins.__import__
@@ -155,6 +159,7 @@ class ShmReadOnlyBridge:
         self.preserve_failed_mailbox = READONLY_PRESERVE_FAILED_MAILBOX
         self.last_completed_request = None
         self.native_creation_filetime = None
+        self.callback_return_witness_enabled = False
         self.retired_request_ids = set()
         self.rotation_probe_request_id = None
         self.rotation_probe_used = False
@@ -275,6 +280,8 @@ class ShmReadOnlyBridge:
                 if self.preserve_failed_mailbox:
                     data["read_fault_isolation_contract"] = "READ_FAILURE_ISOLATION_V1"
                     data["native_creation_filetime"] = self.native_creation_filetime
+                    if self.callback_return_witness_enabled:
+                        data["read_py_callback_returned_contract"] = READ_PY_CALLBACK_RETURNED_CONTRACT
                 if self.market_enabled:
                     data.update(minute_history_batch_contract=MINUTE_BATCH_CONTRACT,
                                 minute_history_batch_max_symbols=MINUTE_BATCH_MAX_SYMBOLS)
@@ -406,6 +413,55 @@ class ShmReadOnlyBridge:
             "ok": response["ok"], "error": response["error"], "callback_thread_id": threading.get_ident(),
         }, sort_keys=True))
         return response
+
+    def publish_callback_return_witness(self):
+        """外层验证同线程及调用栈后写保留位，不改变请求、响应和确认号。"""
+        completed = self.last_completed_request
+        mailbox = self.mailbox
+        if (not self.callback_return_witness_enabled or self.closed or self.failed or self.pending is not None
+                or threading.get_ident() != self.callback_thread_id or mailbox.closed
+                or not isinstance(completed, dict)):
+            return False
+        region = mailbox.region
+        try:
+            if not region.acquire(0):
+                return False
+            try:
+                transport = _load_embedded("aqp_readonly_transport")
+                header = mailbox._header()
+                sequence = header[4]
+                stamp = int(time.time())
+                if (header[2] != transport.READY or not 0 < sequence <= 0xffffffff
+                        or header[5] != sequence or header[6] != sequence - 1
+                        or not 0 < header[7] <= transport.REQUEST_CAPACITY
+                        or not 0 < header[8] <= transport.RESPONSE_CAPACITY
+                        or not 0 < stamp <= 0xffffffff or completed.get("sequence") != sequence
+                        or completed.get("session_id") != mailbox.session_id):
+                    return False
+                witness = _READ_CALLBACK_WITNESS.pack(sequence, stamp)
+                if region.read(_READ_CALLBACK_WITNESS_OFFSET, _READ_CALLBACK_WITNESS.size) == witness:
+                    return True
+                request_raw = region.read(transport.REQUEST_OFFSET, header[7])
+                response_raw = region.read(transport.RESPONSE_OFFSET, header[8])
+                if (mailbox.last_request_frame != (sequence, request_raw)
+                        or mailbox.last_response_frame != (sequence, response_raw)):
+                    return False
+                request = transport.decode_payload(request_raw)
+                response = transport.decode_payload(response_raw)
+                if (not isinstance(request, dict) or not isinstance(response, dict)
+                        or request.get("request_id") != completed.get("request_id")
+                        or request.get("method") != completed.get("method")
+                        or request.get("session_id") != mailbox.session_id
+                        or request.get("account_id") != self.account_id
+                        or request.get("sequence") != sequence):
+                    return False
+                transport.ShmReadOnlyClient._validate_response(None, request, response)
+                region.write(_READ_CALLBACK_WITNESS_OFFSET, witness)
+                return True
+            finally:
+                region.release()
+        except Exception:
+            return False
 
     def read_rotation_evidence(self, execution_session_id, native_creation_filetime,
                                mailbox=None, completed=None, mailbox_locked=False):

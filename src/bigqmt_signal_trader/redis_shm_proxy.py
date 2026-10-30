@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import struct
 import threading
 import time
 import uuid
@@ -47,6 +48,10 @@ RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMU
 WRITE_POLICIES = frozenset(("PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
 RECEIVE_POLICIES = frozenset(("QUEUE_AND_PUBSUB", "QUEUE_ONLY"))
 READ_FAULT_ISOLATION_CONTRACT = "READ_FAILURE_ISOLATION_V1"
+READ_PY_CALLBACK_RETURNED_CONTRACT = "READ_PY_CALLBACK_RETURNED_V1"
+READ_PY_CALLBACK_WITNESS_TTL_SECONDS = 3.0
+_READ_CALLBACK_WITNESS = struct.Struct("<II")
+_READ_CALLBACK_WITNESS_OFFSET = 56
 POSITION_READ_ROUTE_CONTRACT = "POSITION_READ_ROUTE_V1"
 EXECUTION_CURSOR_WRITE_GATE_CONTRACT = "EXECUTION_CURSOR_WRITE_GATE_V1"
 EXECUTION_CURSOR_NO_WRITE_CONTRACT = "EXECUTION_CURSOR_NO_WRITE_V1"
@@ -840,8 +845,8 @@ class RedisShmReadOnlyProxy:
             self._route_faults[route] = fault
         self._block_writes("READ_SOURCE_UNTRUSTED" if route == "readonly" else "EXECUTION_SOURCE_UNTRUSTED")
 
-    def _readonly_callback_finished(self):
-        """只读旧帧证明回调已结束；不确认、重发或解释旧结果。"""
+    def _readonly_callback_finished(self, *, mailbox_locked=False):
+        """旧帧与同源短时 Python 回调返回见证同时成立；不确认或重发旧结果。"""
         fault = self._route_faults["readonly"]
         if fault is None:
             return True
@@ -849,23 +854,64 @@ class RedisShmReadOnlyProxy:
             return False
         sequence, rid = fault.get("sequence"), fault.get("trigger_request_id")
         if (fault.get("publication_state") != "UNKNOWN" or fault.get("previous_unconfirmed") is not False
+                or fault.get("session_id") != self._sessions["readonly"]
                 or type(sequence) is not int or sequence <= 0 or not isinstance(rid, str)):
+            return False
+        read_identity = self._source_identity.get("readonly", {})
+        execution_identity = self._source_identity.get("execution", {})
+        binding = self._source_binding()
+        native = self._verified_process_identity
+        if (not self._read_isolation_supported or binding is None
+                or read_identity.get("read_py_callback_returned_contract") != READ_PY_CALLBACK_RETURNED_CONTRACT
+                or execution_identity.get("read_py_callback_returned_contract") != READ_PY_CALLBACK_RETURNED_CONTRACT
+                or read_identity.get("session_id") != binding["read_session_id"]
+                or execution_identity.get("session_id") != binding["execution_session_id"]
+                or not isinstance(native, dict) or native.get("native_pid") != binding["native_pid"]
+                or native.get("windows_session_id") != binding["windows_session_id"]
+                or type(native.get("native_creation_filetime")) is not int
+                or native["native_creation_filetime"] <= 0
+                or read_identity.get("native_creation_filetime") != native["native_creation_filetime"]
+                or execution_identity.get("native_creation_filetime") != native["native_creation_filetime"]):
+            return False
+        try:
+            if _windows_native_process_identity(binding["native_pid"]) != native:
+                return False
+            execution_mailbox = self._clients["execution"].mailbox
+            if (execution_mailbox.closed or execution_mailbox.session_id != binding["execution_session_id"]
+                    or execution_mailbox.server_pid != binding["native_pid"]
+                    or not execution_mailbox.region.acquire(0)):
+                return False
+            try:
+                execution_header = execution_mailbox._header()
+                if execution_header[2] != READY:
+                    return False
+            finally:
+                execution_mailbox.region.release()
+        except Exception:
             return False
         mailbox = self._clients["readonly"].mailbox
         region = getattr(mailbox, "region", None)
-        if mailbox.closed or region is None:
+        if (mailbox.closed or region is None or mailbox.session_id != binding["read_session_id"]
+                or mailbox.server_pid != binding["native_pid"]):
             return False
-        try:
-            acquired = region.acquire(0)
-        except Exception:
-            return False
-        if not acquired:
-            return False
+        if not mailbox_locked:
+            try:
+                acquired = region.acquire(0)
+            except Exception:
+                return False
+            if not acquired:
+                return False
         try:
             header = mailbox._header()
             if (header[2] != READY or header[4:6] != [sequence, sequence]
-                    or header[6] not in (sequence - 1, sequence)
+                    or header[6] != sequence - 1
                     or not 0 < header[7] <= REQUEST_CAPACITY or not 0 < header[8] <= RESPONSE_CAPACITY):
+                return False
+            witnessed_sequence, witnessed_at = _READ_CALLBACK_WITNESS.unpack(
+                region.read(_READ_CALLBACK_WITNESS_OFFSET, _READ_CALLBACK_WITNESS.size))
+            age = time.time() - witnessed_at
+            if (witnessed_sequence != sequence or witnessed_at <= 0
+                    or not 0 <= age <= READ_PY_CALLBACK_WITNESS_TTL_SECONDS):
                 return False
             request = decode_payload(region.read(REQUEST_OFFSET, header[7]))
             response = decode_payload(region.read(RESPONSE_OFFSET, header[8]))
@@ -882,10 +928,11 @@ class RedisShmReadOnlyProxy:
         except Exception:
             return False
         finally:
-            try:
-                region.release()
-            except Exception:
-                return False
+            if not mailbox_locked:
+                try:
+                    region.release()
+                except Exception:
+                    return False
 
     def _execution_event_state(self, data, request):
         """仅据同账户、同执行源和自洽游标识别回报缺口；不把无效结果当作零。"""
@@ -1218,6 +1265,13 @@ class RedisShmReadOnlyProxy:
         if field not in ("read_rotation", "read_rotation_control_status", "read_rotation_capability",
                          "read_rotation_capability_status"):
             raise ShmProtocolError("unsupported internal execution control field")
+        if (self.execution_cursor_guard_target == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+                and self._route_faults["readonly"] is not None):
+            # 换代控制需要原生回调读取旧邮箱。跨执行请求持该锁会阻止读取；
+            # 不持锁又无法排除覆盖竞争，当前禁止发送直到另有完整换代合同。
+            error = ShmBusyError("readonly fault prevents internal execution rotation control; request not sent")
+            error.previous_unconfirmed = False
+            raise error
         client = self._check_client("execution")
         timeout = self.timeout_seconds if timeout_seconds is None else min(self.timeout_seconds, timeout_seconds)
         if timeout <= 0:
@@ -3369,6 +3423,7 @@ class RedisShmReadOnlyProxy:
                     native_response = None
                     native_response_validated = False
                     gate_held = False
+                    readonly_guard = None
                     try:
                         # 执行查询独立验证执行路；写入仍须验证原双源绑定。
                         self._operation_phase = "SHM_IDENTITY_CHECK"
@@ -3393,10 +3448,17 @@ class RedisShmReadOnlyProxy:
                         self._ensure_open()
                         if (route == "execution" and not is_write
                                 and self.execution_cursor_guard_target == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
-                                and not self._readonly_callback_finished()):
-                            deferred = ShmBusyError("readonly callback completion is unconfirmed; execution request not sent")
-                            deferred.previous_unconfirmed = False
-                            raise deferred
+                                and self._route_faults["readonly"] is not None):
+                            readonly_guard = getattr(self._clients["readonly"].mailbox, "region", None)
+                            if readonly_guard is None or not readonly_guard.acquire(0):
+                                readonly_guard = None
+                                deferred = ShmBusyError("readonly evidence lock is unavailable; execution request not sent")
+                                deferred.previous_unconfirmed = False
+                                raise deferred
+                            if not self._readonly_callback_finished(mailbox_locked=True):
+                                deferred = ShmBusyError("readonly callback completion is unconfirmed; execution request not sent")
+                                deferred.previous_unconfirmed = False
+                                raise deferred
                         remaining = deadline - time.time()
                         if remaining <= 0:
                             raise ShmTimeoutError("read deadline expired before forwarding")
@@ -3591,6 +3653,16 @@ class RedisShmReadOnlyProxy:
                             if read_timing is not None:
                                 response["read_timing"] = dict(read_timing)
                     finally:
+                        if readonly_guard is not None:
+                            try:
+                                readonly_guard.release()
+                            except Exception as exc:
+                                self._record_error(exc)
+                                self._block_writes("READ_SOURCE_UNTRUSTED")
+                                self._seal("READ_EVIDENCE_LOCK_RELEASE_FAILED")
+                                unknown = self._operation_phase == "SHM_FORWARD" or native_response is not None
+                                response = self._response(request, exc, "READ_EVIDENCE_LOCK_RELEASE_FAILED", unknown=unknown)
+                                response.update(publication_state="UNKNOWN" if unknown else "NOT_SENT", publication_scope="SHM")
                         if gate_held:
                             try:
                                 self._supervisor_write_gate.release()

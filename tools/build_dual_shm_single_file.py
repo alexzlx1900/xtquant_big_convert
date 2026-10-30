@@ -179,7 +179,9 @@ import ctypes
 import json
 import ntpath
 import os
+import struct
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -197,6 +199,7 @@ _SOURCE_DEADLINE = None
 _BOUND_NATIVE_PID = None
 _BOUND_NATIVE_CREATION_FILETIME = None
 _READ_FAULT = None
+_READ_CALLBACK_DEPTH = 0
 _SOURCE_IDENTITY = None
 _READ_ROTATION = None
 # 已关代的旧映射与请求证据只增不删；不得在换代过程中关闭或覆写。
@@ -1436,6 +1439,9 @@ def init(ContextInfo):
                 native_creation_filetime=_BOUND_NATIVE_CREATION_FILETIME,
                 read_rotation_authorization_ready=False)
             read_server.native_creation_filetime = _BOUND_NATIVE_CREATION_FILETIME
+            if DUAL_SHM_SETTINGS["environment"] == "LIVE":
+                read_server.callback_return_witness_enabled = True
+                execution_server.bridge.runtime_metadata["read_py_callback_returned_contract"] = "READ_PY_CALLBACK_RETURNED_V1"
             if DUAL_SHM_SETTINGS["execution_event_guard"]:
                 read_server.rotation_continuity_guard = _rotated_read_continuity_clear
                 read_server.rotation_continuity_lock = execution_server.bridge._read_publication_lock
@@ -1527,26 +1533,133 @@ def _within_budget(ContextInfo):
     return True
 
 
-def aqp_shm_readonly_adjust(ContextInfo):
-    global _READ_FAULT
-    if not DUAL_SHM_SETTINGS["read_fault_isolation"]:
-        if _within_budget(ContextInfo):
-            return _RUNTIMES["read"]["aqp_shm_readonly_adjust"](ContextInfo)
-        return None
-    if _within_budget(ContextInfo) and _READ_FAULT is None:
+def _revoke_read_callback_return_witness():
+    # 已被 Proxy 持有时跳过本次读回调，避免旧见证校验后又进入读线程。
+    read = _RUNTIMES["read"]["_SERVER"]
+    if read is None or read.closed or read.mailbox.closed:
+        return False
+    region = read.mailbox.region
+    try:
+        if not region.acquire(0):
+            return False
         try:
-            return _RUNTIMES["read"]["aqp_shm_readonly_adjust"](ContextInfo)
-        except Exception as exc:
-            # Do not restart the read server or stop the execution callback route.
-            # A read failure is not evidence of an execution channel or event gap.
-            _READ_FAULT = {"status": "FAILED", "error_type": type(exc).__name__, "error": str(exc)}
-            execution_server = _RUNTIMES["execution"]["_SERVER"]
-            if execution_server is not None:
-                execution_server.bridge.runtime_metadata["native_read_source_state"] = "RESULT_UNKNOWN"
-            print("AQP_DUAL_SHM_READONLY_FAILED " + json.dumps(_READ_FAULT, sort_keys=True))
+            header = read.mailbox._header()
+            if _frozen_read_callback_can_skip(read, header):
+                return False
+            previous_witness = region.read(56, 8)
+            region.write(56, bytes(8))
+            # 撤销过旧见证的这一轮不启动读工作；下一轮再核验当前邮箱。
+            if previous_witness != bytes(8):
+                return False
+        finally:
+            region.release()
+        return True
+    except Exception:
+        return False
+
+
+def _frozen_read_callback_can_skip(read, header):
+    # 仅冻结的完整旧响应没有新读工作；保留仍有效的原线程见证供 Proxy 使用。
+    execution = _RUNTIMES["execution"]["_SERVER"]
+    completed = read.last_completed_request
+    if (_READ_CALLBACK_DEPTH != 1 or threading.get_ident() != read.callback_thread_id
+            or not read.callback_return_witness_enabled or read.pending is not None
+            or execution is None or execution.closed or _SOURCE_IDENTITY is None
+            or type(_BOUND_NATIVE_CREATION_FILETIME) is not int or _BOUND_NATIVE_CREATION_FILETIME <= 0
+            or _SOURCE_IDENTITY.get("native_pid") != _BOUND_NATIVE_PID
+            or os.getpid() != _BOUND_NATIVE_PID or read.mailbox.server_pid != _BOUND_NATIVE_PID
+            or execution.bridge.mailbox.server_pid != _BOUND_NATIVE_PID
+            or _SOURCE_IDENTITY.get("native_creation_filetime") != _BOUND_NATIVE_CREATION_FILETIME
+            or read.native_creation_filetime != _BOUND_NATIVE_CREATION_FILETIME
+            or execution.bridge.runtime_metadata.get("native_creation_filetime") != _BOUND_NATIVE_CREATION_FILETIME
+            or _SOURCE_IDENTITY.get("account_id") != read.account_id or _SOURCE_IDENTITY.get("environment") != read.environment
+            or execution.bridge.account_id != read.account_id or execution.bridge.environment != read.environment
+            or _SOURCE_IDENTITY.get("read_session_id") != read.mailbox.session_id
+            or _SOURCE_IDENTITY.get("execution_session_id") != execution.bridge.mailbox.session_id
+            or _SOURCE_IDENTITY.get("windows_session") != read.windows_session_id
+            or DUAL_SHM_SETTINGS["windows_session"] != read.windows_session_id
+            or read.windows_session_id != execution.bridge.runtime_metadata.get("windows_session_id")
+            or not isinstance(completed, dict)):
+        return False
+    transport = _RUNTIMES["read"]["_load_embedded"]("aqp_readonly_transport")
+    sequence = header[4]
+    if (header[2] != transport.READY or sequence <= 0 or header[5] != sequence
+            or header[6] != sequence - 1 or not 0 < header[7] <= transport.REQUEST_CAPACITY
+            or not 0 < header[8] <= transport.RESPONSE_CAPACITY
+            or completed.get("sequence") != sequence or completed.get("session_id") != read.mailbox.session_id):
+        return False
+    try:
+        witnessed_sequence, witnessed_at = struct.unpack("<II", read.mailbox.region.read(56, 8))
+        age = time.time() - witnessed_at
+        if witnessed_sequence != sequence or witnessed_at <= 0 or not 0 <= age <= 3.0:
+            return False
+        request_raw = read.mailbox.region.read(transport.REQUEST_OFFSET, header[7])
+        response_raw = read.mailbox.region.read(transport.RESPONSE_OFFSET, header[8])
+        if (read.mailbox.last_request_frame != (sequence, request_raw)
+                or read.mailbox.last_response_frame != (sequence, response_raw)):
+            return False
+        request = transport.decode_payload(request_raw)
+        return (isinstance(request, dict) and request.get("request_id") == completed.get("request_id")
+                and request.get("method") == completed.get("method")
+                and request.get("account_id") == read.account_id and request.get("environment") == read.environment
+                and request.get("session_id") == read.mailbox.session_id and request.get("sequence") == sequence)
+    except Exception:
+        return False
+
+
+def aqp_shm_readonly_adjust(ContextInfo):
+    global _READ_FAULT, _READ_CALLBACK_DEPTH
+    _READ_CALLBACK_DEPTH += 1
+    try:
+        if (DUAL_SHM_SETTINGS["read_fault_isolation"] and DUAL_SHM_SETTINGS["environment"] == "LIVE"
+                and not _revoke_read_callback_return_witness()):
+            return None
+        if not DUAL_SHM_SETTINGS["read_fault_isolation"]:
+            if _within_budget(ContextInfo):
+                return _RUNTIMES["read"]["aqp_shm_readonly_adjust"](ContextInfo)
+            return None
+        if _within_budget(ContextInfo) and _READ_FAULT is None:
+            try:
+                return _RUNTIMES["read"]["aqp_shm_readonly_adjust"](ContextInfo)
+            except Exception as exc:
+                # Do not restart the read server or stop the execution callback route.
+                # A read failure is not evidence of an execution channel or event gap.
+                _READ_FAULT = {"status": "FAILED", "error_type": type(exc).__name__, "error": str(exc)}
+                execution_server = _RUNTIMES["execution"]["_SERVER"]
+                if execution_server is not None:
+                    execution_server.bridge.runtime_metadata["native_read_source_state"] = "RESULT_UNKNOWN"
+                print("AQP_DUAL_SHM_READONLY_FAILED " + json.dumps(_READ_FAULT, sort_keys=True))
+    finally:
+        _READ_CALLBACK_DEPTH -= 1
+
+
+_READ_CALLBACK_CODE = aqp_shm_readonly_adjust.__code__
+
+
+def _publish_read_callback_return_witness():
+    # 仅证明 Python 外层读回调已返回；QMT 原生调度合同仍需实机验收。
+    if (_CLOSED or _READ_FAULT is not None or _READ_CALLBACK_DEPTH != 0
+            or not DUAL_SHM_SETTINGS["read_fault_isolation"] or DUAL_SHM_SETTINGS["environment"] != "LIVE"):
+        return
+    read = _RUNTIMES["read"]["_SERVER"]
+    execution = _RUNTIMES["execution"]["_SERVER"]
+    if (read is None or execution is None or execution.closed or _SOURCE_IDENTITY is None
+            or threading.get_ident() != read.callback_thread_id
+            or type(_BOUND_NATIVE_CREATION_FILETIME) is not int or _BOUND_NATIVE_CREATION_FILETIME <= 0
+            or _SOURCE_IDENTITY.get("native_pid") != _BOUND_NATIVE_PID
+            or _SOURCE_IDENTITY.get("read_session_id") != read.mailbox.session_id
+            or _SOURCE_IDENTITY.get("execution_session_id") != execution.bridge.mailbox.session_id):
+        return
+    frame = sys._getframe()
+    while frame is not None:
+        if frame.f_code is _READ_CALLBACK_CODE:
+            return
+        frame = frame.f_back
+    read.publish_callback_return_witness()
 
 
 def aqp_shm_rpc_adjust(ContextInfo):
+    _publish_read_callback_return_witness()
     if _within_budget(ContextInfo):
         _advance_supervisor_attach()
         _advance_read_rotation_capability()

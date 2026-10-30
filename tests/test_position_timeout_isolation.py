@@ -222,6 +222,14 @@ def test_position_old_frame_can_be_verified_without_ack_or_execution_change(monk
     target = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
     harness = Harness(monkeypatch, gateway_modules, live=True, receive_policy="QUEUE_ONLY",
                       execution_cursor_guard_target=target, test_supervisor_gate=True)
+    # 跨仓测试以本地替身提供固定出生身份，不能解释为真实 Windows 进程验收。
+    identity = {"native_pid": harness.source_binding["native_pid"], "native_creation_filetime": 123456,
+                "windows_session_id": 1, "executable": "fixture-native"}
+    harness.source.namespace["_BOUND_NATIVE_CREATION_FILETIME"] = 123456
+    harness.source.namespace["_SOURCE_IDENTITY"]["native_creation_filetime"] = 123456
+    harness.source.namespace["_RUNTIMES"]["read"]["_SERVER"].native_creation_filetime = 123456
+    harness.source.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge.runtime_metadata["native_creation_filetime"] = 123456
+    monkeypatch.setattr(proxy_module, "_windows_native_process_identity", lambda pid: identity)
 
     async def scenario():
         try:
@@ -259,20 +267,21 @@ def test_position_old_frame_can_be_verified_without_ack_or_execution_change(monk
             harness.drain()
             old_header = native_read.mailbox._header()
             assert old_header[4] == old_header[5] and old_header[6] == old_header[4] - 1
-            frame = bytes(harness.source.states["read"].data)
+            head = native_read.mailbox.region.read(0, 56)
+            request_frame = native_read.mailbox.region.read(transport.REQUEST_OFFSET, old_header[7])
+            response_frame = native_read.mailbox.region.read(transport.RESPONSE_OFFSET, old_header[8])
             evidence = native_read.read_rotation_evidence(harness.source_binding["execution_session_id"], 123456)
             assert evidence["method"] == "get_positions" and evidence["request_id"] == "late-position"
-            identity = {"native_pid": harness.source_binding["native_pid"], "native_creation_filetime": 123456,
-                        "windows_session_id": 1, "executable": "fixture-native"}
             harness.proxy._verified_process_identity = identity
-            monkeypatch.setattr(proxy_module, "_windows_native_process_identity", lambda pid: identity)
             harness.proxy._verify_old_read_rotation_evidence(evidence)
-            assert bytes(harness.source.states["read"].data) == frame
+            assert native_read.mailbox.region.read(0, 56) == head
             assert execution.mailbox._header()[4:7] == before_execution
             assert harness.proxy._readonly_callback_finished() is True
             ping = await harness.operation(asyncio.to_thread(client.call, "ping", {}, request_id="after-position-return"))
             assert ping["execution_source_state"] == "HEALTHY"
-            assert bytes(harness.source.states["read"].data) == frame
+            assert native_read.mailbox.region.read(0, 56) == head
+            assert native_read.mailbox.region.read(transport.REQUEST_OFFSET, old_header[7]) == request_frame
+            assert native_read.mailbox.region.read(transport.RESPONSE_OFFSET, old_header[8]) == response_frame
             assert not harness.submit_calls and not harness.cancel_calls
         finally:
             await harness.close()
