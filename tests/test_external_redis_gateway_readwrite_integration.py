@@ -18,12 +18,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from bigqmt_signal_trader.redis_shm_proxy import RedisShmReadOnlyProxy
+from bigqmt_signal_trader.redis_shm_proxy import RedisShmReadOnlyProxy, SupervisorWriteGateError
 from bigqmt_signal_trader.transports.redis_transport import RedisTransport
 from bigqmt_signal_trader.transports.readonly_shm_client import ShmReadOnlyRpcClient
 from bigqmt_signal_trader.transports.readonly_shm import ShmProtocolError
 from test_external_redis_dual_shm_integration import DUAL, MemoryRedis
 from test_live_redis_shm_proxy import RUNNER as LIVE_RUNNER
+from test_live_redis_shm_proxy import isolated_redis
 
 
 ACCOUNT = "55013746"
@@ -587,6 +588,46 @@ def test_live_sixty_seven_quote_symbols_cross_generated_source_proxy_and_formal_
             assert h.proxy.identity_snapshot()["environment"] == "LIVE"
             assert h.proxy.identity_snapshot()["writes_blocked"] is True
             assert not h.submit_calls and not h.cancel_calls
+        finally:
+            await h.close()
+
+    asyncio.run(run())
+
+
+def test_identity_pending_thirteen_quotes_cross_gateway_without_touching_order(
+        monkeypatch, gateway_modules, isolated_redis):
+    symbols = ["%06d.SH" % code for code in range(600000, 600013)]
+    target = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+    h = Harness(monkeypatch, gateway_modules, live=True, symbols=symbols,
+                redis_factory=lambda: isolated_redis, receive_policy="QUEUE_ONLY",
+                execution_cursor_guard_target=target, test_supervisor_gate=True)
+    h.source.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge.runtime_metadata.update(
+        native_callback_threading_verified=False, native_write_runtime_guard_ready=False)
+
+    def identity_pending():
+        raise SupervisorWriteGateError("SUPERVISOR_IDENTITY_NOT_READY", permanent=False)
+
+    h.proxy._supervisor_write_gate.check = identity_pending
+    # 模型中的进程并非 Windows QMT；此替身不构成真实进程身份验收。
+    h.proxy._check_native_process_identity = lambda: None
+    queue = h.proxy.transport.request_queue
+    queued_order = json.dumps({"schema_version": 1, "request_id": "old-order", "account_id": h.account,
+                               "environment": "LIVE", "method": "submit_order", "params": {}})
+
+    async def run():
+        try:
+            await h.start()
+            h.redis.rpush(queue, queued_order)
+            quotes = await h.operation(h.read.query_quotes(symbols))
+            assert set(quotes) == set(symbols) and len(quotes) == 13
+            assert all(quote["last_price"] == 11.47 for quote in quotes.values())
+            assert h.redis.lrange(queue, 0, -1) == [queued_order]
+            for method in ("submit_order", "cancel_order"):
+                with pytest.raises(RuntimeError, match="write gate blocked"):
+                    await asyncio.to_thread(h.read._get_client().call, method, {})
+            assert not h.submit_calls and not h.cancel_calls
+            assert h.proxy.identity_snapshot()["write_ready"] is False
+            assert not h.redis.hgetall("aqp:redis_shm:write_ledger:%s:v1" % h.account)
         finally:
             await h.close()
 

@@ -75,6 +75,13 @@ EVENT_POLL_TIMING_FIELDS = POSITION_READ_TIMING_FIELDS + (
 )
 # 柜台订单秒精度时钟与代理本机时钟不同；1258真实样本偏差为-3.049735秒。
 _BROKER_PROXY_CLOCK_TOLERANCE_SECONDS = 5.0
+_READ_ONLY_QUEUE_SCAN_BATCH = 64
+_TAKE_VERIFIED_READ = """
+-- TAKE_VERIFIED_READ_V1: only remove the exact inspected entry; never shadow a durable write RID.
+if redis.call('HGET', KEYS[2], ARGV[3]) then return 0 end
+if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+return redis.call('LREM', KEYS[1], 1, ARGV[2])
+"""
 _CLAIM_WRITE = """
 local prior = redis.call('HGET', KEYS[1], ARGV[1])
 if prior then return {0, prior} end
@@ -486,6 +493,8 @@ class RedisShmReadOnlyProxy:
         self._isolation_reason = ""
         self._lock = threading.Lock()
         self._poll_lock = threading.Lock()
+        self._read_only_queue_cursor = 0
+        self._read_only_gate_pending = False
         self._pubsub = None
         self._replays = {}
         self._read_expiries = {}
@@ -3798,6 +3807,70 @@ class RedisShmReadOnlyProxy:
         prior = self._replays.get(request_id)
         return None if prior is None else copy.deepcopy(prior[1])
 
+    def _poll_verified_read_while_identity_pending(self, length):
+        """仅取已校验读取；订单、无法分类的帧和持久写账本原样保留。"""
+        start = self._read_only_queue_cursor if self._read_only_queue_cursor < length else 0
+        end = min(start + _READ_ONLY_QUEUE_SCAN_BATCH, length)
+        try:
+            entries = self.transport.listen_redis.lrange(self.transport.request_queue, start, end - 1)
+        except (RedisConnectionError, RedisTimeoutError) as exc:
+            # LRANGE 不消费队列；与原有空闲检查一样只退避，不重发业务。
+            self._record_error(exc)
+            self._idle_receive_timeouts += 1
+            self._consecutive_idle_timeouts += 1
+            self._redis_retry_at = time.monotonic() + 1.0
+            return None
+        self._read_only_queue_cursor = end if end < length else 0
+        for offset, raw in enumerate(entries):
+            try:
+                request = json.loads(decode_rpc_request_payload(decode_text(raw)))
+                if not isinstance(request, dict) or request.get("method") not in PURE_READ_METHODS:
+                    continue
+                self._reply_request(request)
+                self._validate_request(request)
+            except (ShmProtocolError, ValueError, TypeError):
+                continue
+            index = start + offset
+            try:
+                self._check_native_process_identity()
+            except Exception as exc:
+                self._record_error(exc)
+                self._seal("READ_ONLY_SOURCE_IDENTITY_UNCONFIRMED")
+                return None
+            # 检查期间若门变为永久故障，维持原有的全量隔离。
+            try:
+                self._check_supervisor_write_gate()
+            except SupervisorWriteGateError as exc:
+                if exc.permanent or exc.reason != "SUPERVISOR_IDENTITY_NOT_READY":
+                    self._record_error(exc)
+                    self._seal(exc.reason)
+                    return None
+            self._operation_phase = "REDIS_QUEUE_SELECT_READ"
+            taken = self.transport.listen_redis.eval(_TAKE_VERIFIED_READ, 2, self.transport.request_queue,
+                                                       self._write_ledger_key, index, raw, request["request_id"])
+            if type(taken) is not int or taken not in (0, 1):
+                raise ShmProtocolError("selective read dequeue returned an invalid result")
+            if taken == 0:
+                # 队列已变化或 RID 有写账本；本次未消费，稍后继续扫描。
+                self._read_only_queue_cursor = index + 1
+                return None
+            self._read_only_queue_cursor = 0
+            try:
+                self._check_supervisor_write_gate()
+            except SupervisorWriteGateError as exc:
+                if exc.permanent or exc.reason != "SUPERVISOR_IDENTITY_NOT_READY":
+                    self._record_error(exc)
+                    self._seal(exc.reason)
+                    return None
+            try:
+                self._check_native_process_identity()
+            except Exception as exc:
+                self._record_error(exc)
+                self._seal("READ_ONLY_SOURCE_IDENTITY_UNCONFIRMED")
+                return None
+            return self.process_request(request)
+        return None
+
     def poll_once(self):
         """空队列检查可恢复；破坏性接收或原生结果未确认仍封闭。"""
         if not self._poll_lock.acquire(False):
@@ -3808,6 +3881,7 @@ class RedisShmReadOnlyProxy:
             self._ensure_open()
             if not self._verified:
                 raise ShmProtocolError("explicit identity handshake required")
+            restricted_reads = False
             if (self.environment == "LIVE" and self.runtime_policy == "PERSISTENT_LIVE_READ_WRITE"
                     and self.execution_cursor_guard_target is not None):
                 if self._supervisor_write_gate is None:
@@ -3819,7 +3893,17 @@ class RedisShmReadOnlyProxy:
                     if exc.permanent:
                         self._record_error(exc)
                         self._seal(exc.reason)
-                    return None
+                        return None
+                    if exc.reason != "SUPERVISOR_IDENTITY_NOT_READY" or self.receive_policy != "QUEUE_ONLY":
+                        return None
+                    self._read_only_gate_pending = restricted_reads = True
+                if (self.receive_policy == "QUEUE_ONLY" and self._read_only_gate_pending
+                        and self._writes_blocked):
+                    # 信号恢复不等于其他写入阻断原因已解除，旧订单仍保留。
+                    restricted_reads = True
+            if not restricted_reads:
+                self._read_only_gate_pending = False
+                self._read_only_queue_cursor = 0
             if time.monotonic() < self._redis_retry_at:
                 return None
             if self.runtime_policy == "BOUNDED" and self._processed_count >= self.max_requests:
@@ -3865,6 +3949,8 @@ class RedisShmReadOnlyProxy:
                 if length == 0:
                     self._operation_phase = "IDLE"
                     return None
+                if restricted_reads:
+                    return self._poll_verified_read_while_identity_pending(length)
                 self._operation_phase = "REDIS_QUEUE_LPOP"
                 raw = self.transport.listen_redis.lpop(self.transport.request_queue)
                 return None if raw is None else self.process_raw(raw, source="queue")

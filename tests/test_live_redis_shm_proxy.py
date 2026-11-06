@@ -7,13 +7,17 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import redis
 
 from test_external_redis_dual_shm_integration import DUAL
 
@@ -89,6 +93,33 @@ def request(method="get_positions", rid="live-original", **changes):
                                    execution_session_id="execution-sid", native_pid=2852, sequence=0))
         value["params"].setdefault("supervisor_gate_epoch", dict(contract="SUPERVISOR_GATE_EPOCH_V1", epoch=1))
     return value
+
+
+class SelectiveReadRedis(FIXTURE.FakeRedis):
+    """为内存测试提供与真实 Redis 队列相同的原子选择语义。"""
+
+    def lrange(self, queue, start, end):
+        self._record("lrange", queue, start, end)
+        return self.queues.get(queue, [])[start:end + 1]
+
+    def eval(self, script, key_count, *args):
+        if "TAKE_VERIFIED_READ_V1" not in script:
+            return super().eval(script, key_count, *args)
+        assert key_count == 2
+        queue, ledger, index, raw, rid = args
+        self._record("select_read", queue, index, rid)
+        values = self.queues.get(queue, [])
+        if rid in self.hashes.get(ledger, {}) or index >= len(values) or values[index] != raw:
+            return 0
+        values.remove(raw)
+        return 1
+
+
+def pending_identity(proxy):
+    gate_error = sys.modules[RUNNER.RedisShmReadOnlyProxy.__module__].SupervisorWriteGateError
+    proxy._supervisor_write_gate.check = mock.Mock(side_effect=gate_error(
+        "SUPERVISOR_IDENTITY_NOT_READY", permanent=False))
+    proxy._check_native_process_identity = mock.Mock()
 
 
 def config(**changes):
@@ -1021,6 +1052,214 @@ def test_live_supervisor_fatal_gate_stops_consumption_without_exiting():
     assert not proxy.stopped and proxy.isolation_reason == "SUPERVISOR_WRITE_BLOCKED"
     assert proxy.identity_snapshot()["write_ready"] is False
     provider.llen.assert_not_called()
+    assert len(read.calls) == len(execution.calls) == 1
+
+
+def test_identity_pending_serves_reads_without_consuming_writes_or_shadowing_ledger():
+    provider = SelectiveReadRedis()
+    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
+    pending_identity(proxy)
+    order = json.dumps(request("submit_order", rid="old-order"))
+    cancel = json.dumps(request("cancel_order", rid="old-cancel"))
+    conflict = json.dumps(request("get_ticks", rid="old-order", params={"code": "000001.SZ"}))
+    forbidden_control = json.dumps(request("ping", rid="control", params={"supervisor_attach": {}}))
+    quote = json.dumps(request("get_full_tick", rid="independent-read", params={"codes": ["000001.SZ"]}))
+    queue = proxy.transport.request_queue
+    provider.queues[queue] = [order, cancel, conflict, forbidden_control, quote]
+    ledger_record = '{"state":"UNKNOWN","automatic_retry":false}'
+    provider.hashes[LEDGER] = {"old-order": ledger_record}
+
+    assert proxy.poll_once() is None  # 持久写 RID 的读取不允许覆盖其回报。
+    response = proxy.poll_once()
+    assert response["ok"] is True and response["request_id"] == "independent-read"
+    assert provider.queues[queue] == [order, cancel, conflict, forbidden_control]
+    assert provider.hashes[LEDGER] == {"old-order": ledger_record}
+    assert [call[0]["method"] for call in read.calls] == ["ping", "get_full_tick"]
+    assert [call[0]["method"] for call in execution.calls] == ["ping"]
+    assert proxy.identity_snapshot()["write_ready"] is False
+    assert not proxy.stopped and not proxy.isolation_reason
+    assert len([op for op in provider.operations if op[0] == "setex"]) == 1
+
+
+def test_identity_pending_scans_past_multiple_batches_without_touching_orders():
+    provider = SelectiveReadRedis()
+    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
+    pending_identity(proxy)
+    orders = [json.dumps(request("submit_order", rid="order-%s" % number)) for number in range(130)]
+    quote = json.dumps(request("get_ticks", rid="quote-after-orders", params={"code": "000001.SZ"}))
+    queue = proxy.transport.request_queue
+    provider.queues[queue] = orders + [quote]
+    assert proxy.poll_once() is None and proxy.poll_once() is None
+    response = proxy.poll_once()
+    assert response["ok"] is True and response["request_id"] == "quote-after-orders"
+    assert provider.queues[queue] == orders
+    assert len(read.calls) == 2 and len(execution.calls) == 1
+    assert LEDGER not in provider.hashes
+
+
+def test_identity_ready_again_does_not_consume_old_order_while_writes_still_blocked():
+    provider = SelectiveReadRedis()
+    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
+    pending_identity(proxy)
+    queue = proxy.transport.request_queue
+    order = json.dumps(request("submit_order", rid="old-order"))
+    first = json.dumps(request("get_ticks", rid="first-read", params={"code": "000001.SZ"}))
+    second = json.dumps(request("get_ticks", rid="second-read", params={"code": "000001.SZ"}))
+    provider.queues[queue] = [order, first]
+    assert proxy.poll_once()["request_id"] == "first-read"
+    proxy._supervisor_write_gate.check.side_effect = None
+    provider.queues[queue].append(second)
+    assert proxy.poll_once()["request_id"] == "second-read"
+    assert provider.queues[queue] == [order]
+    assert len(read.calls) == 3 and len(execution.calls) == 1
+    assert proxy.identity_snapshot()["write_ready"] is False
+    assert not any(op[0] == "lpop" for op in provider.operations)
+
+
+def test_identity_ready_again_resumes_normal_queue_when_no_write_block_remains():
+    provider = SelectiveReadRedis()
+    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY",
+        start_write_blocked=False, live_write_authorized=True)
+    pending_identity(proxy)
+    queue = proxy.transport.request_queue
+    first = json.dumps(request("get_ticks", rid="first-read", params={"code": "000001.SZ"}))
+    second = json.dumps(request("get_ticks", rid="second-read", params={"code": "000001.SZ"}))
+    provider.queues[queue] = [first]
+    assert proxy.poll_once()["request_id"] == "first-read"
+    proxy._supervisor_write_gate.check.side_effect = None
+    provider.queues[queue].append(second)
+    assert proxy.poll_once()["request_id"] == "second-read"
+    assert provider.queues[queue] == []
+    assert len(read.calls) == 3 and len(execution.calls) == 1
+    assert any(op[0] == "lpop" for op in provider.operations)
+
+
+def test_identity_pending_source_identity_failure_preserves_the_queue():
+    provider = SelectiveReadRedis()
+    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
+    pending_identity(proxy)
+    proxy._check_native_process_identity.side_effect = FIXTURE.ShmProtocolError("identity changed")
+    queue = proxy.transport.request_queue
+    original = json.dumps(request("get_ticks", rid="unchanged", params={"code": "000001.SZ"}))
+    provider.queues[queue] = [original]
+    assert proxy.poll_once() is None
+    assert provider.queues[queue] == [original]
+    assert proxy.isolation_reason == "READ_ONLY_SOURCE_IDENTITY_UNCONFIRMED"
+    assert len(read.calls) == len(execution.calls) == 1
+
+
+@pytest.mark.parametrize("fatal_on_check", [2, 3])
+def test_identity_pending_turning_fatal_never_forwards_the_read(fatal_on_check):
+    provider = SelectiveReadRedis()
+    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
+    pending_identity(proxy)
+    gate_error = sys.modules[RUNNER.RedisShmReadOnlyProxy.__module__].SupervisorWriteGateError
+    pending = gate_error("SUPERVISOR_IDENTITY_NOT_READY", permanent=False)
+    fatal = gate_error("SUPERVISOR_WRITE_BLOCKED", permanent=True)
+    proxy._supervisor_write_gate.check.side_effect = [pending] * (fatal_on_check - 1) + [fatal]
+    queue = proxy.transport.request_queue
+    order = json.dumps(request("submit_order", rid="preserved-order"))
+    quote = json.dumps(request("get_ticks", rid="no-forward", params={"code": "000001.SZ"}))
+    provider.queues[queue] = [order, quote]
+    assert proxy.poll_once() is None
+    assert provider.queues[queue] == ([order, quote] if fatal_on_check == 2 else [order])
+    assert proxy.isolation_reason == "SUPERVISOR_WRITE_BLOCKED"
+    assert len(read.calls) == len(execution.calls) == 1
+    assert not any(op[0] == "setex" for op in provider.operations)
+
+
+def test_identity_pending_unconfirmed_selective_dequeue_is_not_retried():
+    provider = SelectiveReadRedis()
+    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
+    pending_identity(proxy)
+    queue = proxy.transport.request_queue
+    original = json.dumps(request("get_ticks", rid="unknown-dequeue", params={"code": "000001.SZ"}))
+    provider.queues[queue] = [original]
+    actual_eval = provider.eval
+
+    def consume_then_timeout(*args):
+        actual_eval(*args)
+        raise TimeoutError("selective dequeue may have happened")
+
+    provider.eval = mock.Mock(side_effect=consume_then_timeout)
+    with pytest.raises(TimeoutError):
+        proxy.poll_once()
+    assert proxy.isolation_reason == "REDIS_RECEIVE_OR_PROCESS_FAILED"
+    assert provider.queues[queue] == []
+    assert proxy.poll_once() is None and provider.eval.call_count == 1
+    assert len(read.calls) == len(execution.calls) == 1
+
+
+@pytest.fixture
+def isolated_redis(tmp_path):
+    executable = shutil.which("redis-server")
+    if executable is None or os.name == "nt":
+        pytest.skip("isolated Unix-socket Redis is unavailable")
+    # macOS 的 AF_UNIX 路径长度小于 pytest 默认临时路径长度。
+    with tempfile.TemporaryDirectory(prefix="aqp-rd-", dir="/tmp") as short_directory:
+        socket_path = str(Path(short_directory) / "redis.sock")
+        server = subprocess.Popen([executable, "--port", "0", "--unixsocket", socket_path,
+                                   "--save", "", "--appendonly", "no", "--dir", str(tmp_path)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        client = redis.Redis(unix_socket_path=socket_path, decode_responses=True, socket_timeout=1)
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    client.ping()
+                    break
+                except redis.exceptions.ConnectionError:
+                    if server.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("isolated Redis did not start")
+                    time.sleep(0.01)
+            yield client
+        finally:
+            client.close()
+            server.terminate()
+            server.wait(timeout=5)
+
+
+def test_identity_pending_real_redis_atomic_selection_and_changed_queue(isolated_redis):
+    proxy, provider, read, execution = make_proxy(provider=isolated_redis, receive_policy="QUEUE_ONLY")
+    pending_identity(proxy)
+    queue = proxy.transport.request_queue
+    order = json.dumps(request("submit_order", rid="old-order"))
+    quote = json.dumps(request("get_ticks", rid="independent-read", params={"code": "000001.SZ"}))
+    injected = json.dumps(request("cancel_order", rid="other-order"))
+    provider.rpush(queue, order, quote)
+    provider.hset(LEDGER, "old-order", '{"state":"UNKNOWN","automatic_retry":false}')
+    real_eval = provider.eval
+
+    def insert_before_claim(script, key_count, *args):
+        provider.lpush(queue, injected)
+        provider.eval = real_eval
+        return real_eval(script, key_count, *args)
+
+    provider.eval = insert_before_claim
+    assert proxy.poll_once() is None
+    assert provider.lrange(queue, 0, -1) == [injected, order, quote]
+    response = proxy.poll_once()
+    assert response["ok"] is True and response["request_id"] == "independent-read"
+    assert provider.lrange(queue, 0, -1) == [injected, order]
+    assert provider.hget(LEDGER, "old-order") == '{"state":"UNKNOWN","automatic_retry":false}'
+    assert len(read.calls) == 2 and len(execution.calls) == 1
+    assert proxy.identity_snapshot()["write_ready"] is False
+    conflict = json.dumps(request("get_ticks", rid="old-order", params={"code": "000001.SZ"}))
+    second = json.dumps(request("get_ticks", rid="second-read", params={"code": "000001.SZ"}))
+    provider.rpush(queue, conflict, second)
+    assert proxy.poll_once() is None
+    assert provider.lrange(queue, 0, -1) == [injected, order, conflict, second]
+    assert provider.get("bigqmt:rpc:resp:%s:old-order" % ACCOUNT) is None
+    assert proxy.poll_once()["request_id"] == "second-read"
+    assert provider.lrange(queue, 0, -1) == [injected, order, conflict]
+
+
+def test_identity_pending_does_not_consume_pubsub_mode():
+    proxy, provider, read, execution = make_proxy(receive_policy="QUEUE_AND_PUBSUB")
+    pending_identity(proxy)
+    operations = len(provider.operations)
+    assert proxy.poll_once() is None
+    assert len(provider.operations) == operations
     assert len(read.calls) == len(execution.calls) == 1
 
 
