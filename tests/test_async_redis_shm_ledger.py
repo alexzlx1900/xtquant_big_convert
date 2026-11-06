@@ -91,7 +91,7 @@ def record(provider, rid):
 
 
 def assert_new_write_refused(proxy, request):
-    if proxy.stopped:
+    if proxy.stopped or proxy.isolation_reason:
         with pytest.raises(ShmProtocolError):
             proxy.process_request(request)
     else:

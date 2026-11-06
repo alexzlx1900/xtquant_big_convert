@@ -483,6 +483,7 @@ class RedisShmReadOnlyProxy:
         self._closed = False
         self._resources_closed = False
         self.stop_reason = ""
+        self._isolation_reason = ""
         self._lock = threading.Lock()
         self._poll_lock = threading.Lock()
         self._pubsub = None
@@ -584,8 +585,9 @@ class RedisShmReadOnlyProxy:
         result = dict(operation_phase=self._operation_phase, last_error=copy.deepcopy(self._last_error),
                       first_error=copy.deepcopy(self._first_error), read_publish_failures=self._read_publish_failures,
                       idle_receive_timeouts=self._idle_receive_timeouts,
-                      consecutive_idle_timeouts=self._consecutive_idle_timeouts)
-        if self.execution_cursor_guard_target is not None:
+                      consecutive_idle_timeouts=self._consecutive_idle_timeouts,
+                      isolation_reason=self._isolation_reason)
+        if self.execution_cursor_guard_target is not None or self._legacy_live_read_quarantined():
             result["source_faults"] = copy.deepcopy(self._route_faults)
         return result
 
@@ -596,6 +598,10 @@ class RedisShmReadOnlyProxy:
     @property
     def stopped(self):
         return self._closed
+
+    @property
+    def isolation_reason(self):
+        return self._isolation_reason
 
     @property
     def verified(self):
@@ -621,6 +627,10 @@ class RedisShmReadOnlyProxy:
                 and self.account_id == "8882152350" and self.environment == "LIVE"
                 and self._read_isolation_supported and isinstance(capabilities, list)
                 and "get_positions" in capabilities)
+
+    def _legacy_live_read_quarantined(self):
+        return (self.environment == "LIVE" and self.execution_cursor_guard_target is None
+                and self._route_faults["readonly"] is not None)
 
     @staticmethod
     def _request_route(request):
@@ -652,6 +662,9 @@ class RedisShmReadOnlyProxy:
                     execution_source=copy.deepcopy(self._source_identity["execution"]))
         if self.environment == "LIVE":
             result["live_write_authorized"] = self.live_write_authorized
+        if self._legacy_live_read_quarantined():
+            result.update(read_source_state=self._route_state("readonly"), execution_source_state="UNKNOWN",
+                          read_source_fault=copy.deepcopy(self._route_faults["readonly"]))
         if self.execution_cursor_guard_target is not None:
             result["execution_cursor_guard_target"] = copy.deepcopy(self.execution_cursor_guard_target)
             result.update(shm_publication_evidence_contract="SHM_PUBLICATION_STATE_V1",
@@ -2230,6 +2243,12 @@ class RedisShmReadOnlyProxy:
                 raise ShmProtocolError("native persistent policy does not match explicit runner policy")
 
     def _seal(self, reason):
+        if (reason != "CLOSED" and self.environment == "LIVE"
+                and self.runtime_policy == "PERSISTENT_LIVE_READ_WRITE"):
+            # 故障不退出进程。无法证明独立安全时停止取件和转发，保留原帧与账本。
+            self._isolation_reason = self._isolation_reason or reason
+            self._block_writes("PROXY_ISOLATED_" + reason)
+            return
         self._closed = True
         self.stop_reason = self.stop_reason or reason
 
@@ -2238,6 +2257,8 @@ class RedisShmReadOnlyProxy:
             self._seal("ABSOLUTE_DEADLINE_EXPIRED")
         if self._closed:
             raise ShmProtocolError("proxy is stopped: %s; do not resend" % self.stop_reason)
+        if self._isolation_reason:
+            raise ShmProtocolError("proxy is isolated: %s; do not resend" % self._isolation_reason)
 
     def _check_client(self, route):
         client = self._clients[route]
@@ -3317,9 +3338,19 @@ class RedisShmReadOnlyProxy:
             reservation = None
             write_settlement = None
             confirmed_no_write = False
+            quarantined_write_unknown = False
             try:
                 fingerprint = self._validate_request(request)
                 route = self._request_route(request)
+                legacy_quarantined = self._legacy_live_read_quarantined()
+                if legacy_quarantined and rid not in self._replays:
+                    if request["method"] in ALL_WRITE_METHODS:
+                        try:
+                            quarantined_write_unknown = self.transport.redis.hget(self._write_ledger_key, rid) is not None
+                        except Exception:
+                            # 无法确认旧 RID 是否已执行时，不能把它伪装为明确未发送。
+                            quarantined_write_unknown = True
+                    raise ShmProtocolError("source is quarantined after an unconfirmed read; request not sent")
                 if rid in self._retired_read_ids:
                     raise ShmProtocolError("original readonly request belongs to a retired session; do not resend")
                 if route == "readonly" and self._rotation_waiting_gateway:
@@ -3344,7 +3375,10 @@ class RedisShmReadOnlyProxy:
                         raise ShmProtocolError("request_id semantic conflict")
                     try:
                         self._operation_phase = "SHM_IDENTITY_CHECK"
-                        if self.execution_cursor_guard_target is None:
+                        if legacy_quarantined:
+                            # 返回原缓存，不检查或重发已污染的旧邮箱。
+                            pass
+                        elif self.execution_cursor_guard_target is None:
                             for checked_route in self._clients:
                                 self._check_client(checked_route)
                         elif prior.get("status") != "UNKNOWN":
@@ -3608,7 +3642,12 @@ class RedisShmReadOnlyProxy:
                             response = self._response(request, exc, "SHM_RESULT_UNCONFIRMED", unknown=True)
                             if read_timing is not None:
                                 response["read_timing"] = dict(read_timing)
-                            self._seal("SHM_RESULT_UNCONFIRMED")
+                            if self.environment == "LIVE" and route == "readonly" and fault_route == "readonly":
+                                # 旧协议无法证明双源故障隔离；保留代理和原帧，隔离全部新请求并停写。
+                                self._mark_route_fault("readonly", "RESULT_UNKNOWN", request, "UNKNOWN",
+                                                       previous_unconfirmed=None)
+                            else:
+                                self._seal("SHM_RESULT_UNCONFIRMED")
                         else:
                             phase = self._operation_phase
                             previous_unconfirmed = getattr(exc, "previous_unconfirmed", None)
@@ -3633,8 +3672,10 @@ class RedisShmReadOnlyProxy:
                                 state = "IDENTITY_OR_PROTOCOL_ERROR" if protocol_fault else "RESULT_UNKNOWN"
                                 self._mark_route_fault(fault_route, state, request, publication_state,
                                                        sequence=sequence, previous_unconfirmed=previous_unconfirmed)
-                                if fault_route == "execution" and protocol_fault:
-                                    self._seal("SHM_IDENTITY_OR_PROTOCOL_ERROR")
+                                if fault_route == "execution" and (protocol_fault or self.environment == "LIVE"):
+                                    # 执行回调未确认时，现有只读隔离合同未证明反向独立。
+                                    self._seal("SHM_IDENTITY_OR_PROTOCOL_ERROR" if protocol_fault
+                                               else "SHM_EXECUTION_RESULT_UNCONFIRMED")
                             # 已占账本而缺少原生 NOT_EXECUTED 凭证时，保留 UNKNOWN。
                             unknown = (not not_sent or reservation is not None
                                        or (is_write and phase == "WRITE_LEDGER_CLAIM"))
@@ -3693,11 +3734,16 @@ class RedisShmReadOnlyProxy:
                         else:
                             self._read_expiries[rid] = deadline
             except (ShmProtocolError, ValueError, TypeError) as exc:
-                response = self._response(request, exc, "PROXY_REQUEST_REJECTED",
-                    unknown=request.get("method") in ASYNC_WRITE_METHODS
-                    and self._write_block_reason == "ASYNC_IDENTITY_CONFLICT")
+                unknown = (quarantined_write_unknown or (request.get("method") in ASYNC_WRITE_METHODS
+                    and self._write_block_reason == "ASYNC_IDENTITY_CONFLICT"))
+                response = self._response(request, exc,
+                    "SHM_RESULT_UNCONFIRMED" if quarantined_write_unknown else "PROXY_REQUEST_REJECTED",
+                    unknown=unknown)
                 if self.execution_cursor_guard_target is not None:
                     response.update(publication_state="NOT_SENT", publication_scope="SHM", previous_unconfirmed=None)
+                elif self._legacy_live_read_quarantined():
+                    response.update(publication_state="UNKNOWN" if quarantined_write_unknown else "NOT_SENT",
+                                    publication_scope="SHM", previous_unconfirmed=None)
             if request["method"] in ASYNC_WRITE_METHODS and response.get("status") == "UNKNOWN":
                 self._block_writes("NATIVE_WRITE_RESULT_UNKNOWN")
             binding = self._source_binding()
@@ -3735,9 +3781,13 @@ class RedisShmReadOnlyProxy:
                 if write_settlement is not None:
                     try:
                         self._settle_write(request, write_settlement, response, "PUBLISH_UNCONFIRMED")
-                    except Exception:
+                    except Exception as settlement_error:
                         # 至少原子占用记录仍在；同 RID 永远不能重新原生执行。
-                        self.stop_reason = "REDIS_RESPONSE_AND_WRITE_LEDGER_UNCONFIRMED"
+                        self._record_error(settlement_error)
+                        if self._isolation_reason:
+                            self._block_writes("REDIS_RESPONSE_AND_WRITE_LEDGER_UNCONFIRMED")
+                        else:
+                            self.stop_reason = "REDIS_RESPONSE_AND_WRITE_LEDGER_UNCONFIRMED"
                 raise
             return response
         finally:
@@ -3753,9 +3803,23 @@ class RedisShmReadOnlyProxy:
         if not self._poll_lock.acquire(False):
             raise ShmProtocolError("proxy already has an in-flight poll")
         try:
+            if self._isolation_reason:
+                return None
             self._ensure_open()
             if not self._verified:
                 raise ShmProtocolError("explicit identity handshake required")
+            if (self.environment == "LIVE" and self.runtime_policy == "PERSISTENT_LIVE_READ_WRITE"
+                    and self.execution_cursor_guard_target is not None):
+                if self._supervisor_write_gate is None:
+                    self._seal("SUPERVISOR_GATE_UNAVAILABLE")
+                    return None
+                try:
+                    self._check_supervisor_write_gate()
+                except SupervisorWriteGateError as exc:
+                    if exc.permanent:
+                        self._record_error(exc)
+                        self._seal(exc.reason)
+                    return None
             if time.monotonic() < self._redis_retry_at:
                 return None
             if self.runtime_policy == "BOUNDED" and self._processed_count >= self.max_requests:

@@ -323,12 +323,30 @@ def _safe_message(message, target):
     return value[:2048]
 
 
+def _emit_proxy_health(config, proxy, *, startup_error=""):
+    """向持有本进程日志的监督器报告保活与隔离；不暴露请求或凭据。"""
+    if config["environment"] != "LIVE" or config["runtime_policy"] != "PERSISTENT_LIVE_READ_WRITE":
+        return
+    reason = startup_error or (getattr(proxy, "isolation_reason", "") if proxy is not None else "")
+    faults = getattr(proxy, "_route_faults", {}) if proxy is not None else {}
+    reasons = getattr(proxy, "_write_block_reasons", ()) if proxy is not None else ()
+    degraded = ((isinstance(faults, dict) and any(faults.values()))
+                or any(item != "OPERATOR_WRITE_DISABLED" for item in reasons))
+    print(json.dumps(dict(event="PROXY_HEALTH", status="ISOLATED" if reason else "DEGRADED" if degraded else "RUNNING",
+                          reason=reason, account_id=config["account_id"], proxy_pid=os.getpid(),
+                          native_pid=config["native_pid"], execution_session_id=config["execution_session_id"],
+                          writes_blocked=bool(getattr(proxy, "_writes_blocked", True)),
+                          updated_at_unix=time.time()), ensure_ascii=False), flush=True)
+
+
 def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=None, ready_observer=None):
     """显式运行政策；仅空闲只读队列检查允许有限恢复，不重发业务、不删键。"""
     config = validate_config(value)
-    if windows_session_id(os.getpid()) != config["windows_session"] or windows_session_id(config["native_pid"]) != config["windows_session"]:
-        raise RuntimeError("consumer and native source must share the explicit Windows session")
     bounded = config["runtime_policy"] == "BOUNDED"
+    persistent_live = config["environment"] == "LIVE" and config["runtime_policy"] == "PERSISTENT_LIVE_READ_WRITE"
+    if (not persistent_live and (windows_session_id(os.getpid()) != config["windows_session"]
+            or windows_session_id(config["native_pid"]) != config["windows_session"])):
+        raise RuntimeError("consumer and native source must share the explicit Windows session")
     parent_deadline = None
     if bounded:
         remaining = min(config["max_seconds"], config["source_deadline_unix"] - time.time())
@@ -347,8 +365,12 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                   write_block_reason="OPERATOR_WRITE_DISABLED" if config["start_write_blocked"] else "",
                   processed_requests=0, received_requests=0, full_duration_acceptance_proved=False)
     began = time.monotonic()
-    phase = "REDIS_CLIENT_CREATE"
+    phase = "SESSION_IDENTITY_VERIFY"
     try:
+        if persistent_live and (windows_session_id(os.getpid()) != config["windows_session"]
+                or windows_session_id(config["native_pid"]) != config["windows_session"]):
+            raise RuntimeError("consumer and native source must share the explicit Windows session")
+        phase = "REDIS_CLIENT_CREATE"
         redis_client = (redis_factory or create_redis_client)(config["redis"])
         transport = RedisTransport(redis_client, account_id=config["account_id"])
         factory = shm_factory or ShmReadOnlyClient
@@ -400,10 +422,13 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
             rotation_driver = ReadonlyRotationDriver(proxy)
         evidence = dict(proxy.identity_snapshot(), status="READY", automatic_retry=False)
         phase = "READY_OBSERVER"
+        _emit_proxy_health(config, proxy)
         (ready_observer or _emit_ready)(evidence)
         stop_requested = False
         reported_error_at = None
         reported_rotation_block = False
+        last_health_at = time.monotonic()
+        last_health_state = None
         while not proxy.stopped:
             if stop_event is not None and stop_event.is_set():
                 stop_requested = True
@@ -416,8 +441,15 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                         or result["received_requests"] >= config["max_requests"]):
                     break
             phase = "RECEIVE_LOOP"
-            response = proxy.poll_once()
-            if rotation_driver is not None:
+            try:
+                response = proxy.poll_once()
+            except Exception as exc:
+                if not persistent_live:
+                    raise
+                proxy._record_error(exc)
+                proxy._seal("RECEIVE_LOOP_FAILED")
+                response = None
+            if rotation_driver is not None and not getattr(proxy, "isolation_reason", ""):
                 rotation_driver.step()
                 if rotation_driver.blocked and not reported_rotation_block:
                     reported_rotation_block = True
@@ -429,6 +461,14 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                 reported_error_at = latest["error_at_unix"]
                 print(json.dumps({"event": "PROXY_TRANSPORT_ERROR", **latest,
                     "error_message": _safe_message(latest["error_message"], config["redis"])}), flush=True)
+            if persistent_live:
+                faults = getattr(proxy, "_route_faults", {})
+                reasons = getattr(proxy, "_write_block_reasons", ())
+                state = (getattr(proxy, "isolation_reason", ""),
+                         bool(isinstance(faults, dict) and any(faults.values())), tuple(reasons))
+                if state != last_health_state or time.monotonic() - last_health_at >= 5:
+                    _emit_proxy_health(config, proxy)
+                    last_health_state, last_health_at = state, time.monotonic()
             if response is None:
                 time.sleep(min(0.02, remaining) if bounded else 0.02)
             else:
@@ -449,6 +489,17 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                       identity_verified=bool(proxy and proxy.verified))
         if proxy is not None:
             result["processed_requests"] = proxy.processed_count
+        if persistent_live:
+            # 启动或运行异常只隔离本账户；不重新连接、握手、取件或重发。
+            if proxy is not None:
+                proxy._seal("RUNNER_FAILURE")
+            reason = (getattr(proxy, "isolation_reason", "") if proxy is not None else "") or "RUNNER_" + phase
+            try:
+                _emit_proxy_health(config, proxy, startup_error=reason)
+            except Exception:
+                pass
+            while stop_event is None or not stop_event.is_set():
+                time.sleep(0.2)
     finally:
         if proxy is not None:
             diagnostics = proxy.diagnostic_snapshot()
@@ -460,7 +511,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                 snapshot = proxy.identity_snapshot()
                 result.update({field: snapshot[field]
                                for field in ("writes_blocked", "write_ready", "write_block_reason")})
-            elif config["execution_cursor_guard_target"] is not None and config["allow_order_methods"]:
+            elif config["allow_order_methods"] and (persistent_live or config["execution_cursor_guard_target"] is not None):
                 result.update(writes_blocked=True, write_ready=False,
                               write_block_reason=proxy._write_block_reason or "SOURCE_IDENTITY_UNVERIFIED")
             try:
@@ -468,7 +519,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
             except Exception as exc:
                 errors.append(type(exc).__name__)
         else:
-            if config["execution_cursor_guard_target"] is not None and config["allow_order_methods"]:
+            if config["allow_order_methods"] and (persistent_live or config["execution_cursor_guard_target"] is not None):
                 result.update(writes_blocked=True, write_ready=False, write_block_reason="SOURCE_IDENTITY_UNVERIFIED")
             for resource in (rotation_channel, supervisor_gate):
                 if resource is not None:

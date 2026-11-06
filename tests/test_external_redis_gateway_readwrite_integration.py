@@ -23,6 +23,7 @@ from bigqmt_signal_trader.transports.redis_transport import RedisTransport
 from bigqmt_signal_trader.transports.readonly_shm_client import ShmReadOnlyRpcClient
 from bigqmt_signal_trader.transports.readonly_shm import ShmProtocolError
 from test_external_redis_dual_shm_integration import DUAL, MemoryRedis
+from test_live_redis_shm_proxy import RUNNER as LIVE_RUNNER
 
 
 ACCOUNT = "55013746"
@@ -507,6 +508,59 @@ def test_live_unknown_native_submission_blocks_second_order_and_keeps_account_re
             await h.close()
 
     asyncio.run(run())
+
+
+def test_live_quote_timeout_keeps_proxy_and_gateway_path_alive_without_resend(monkeypatch, gateway_modules):
+    h = Harness(monkeypatch, gateway_modules, live=True, receive_policy="QUEUE_ONLY",
+                live_write_authorized=True, start_write_blocked=False)
+
+    async def run():
+        try:
+            await h.start()
+            before = h.source.clients["read"].mailbox._header()
+            monkeypatch.setitem(h.source.namespace, "aqp_shm_readonly_adjust", lambda context: None)
+            with pytest.raises(Exception):
+                await h.operation(h.read.query_quotes([CODE]))
+            deadline = time.monotonic() + 2
+            while h.proxy._route_faults["readonly"] is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert h.proxy._route_faults["readonly"]["state"] == "RESULT_UNKNOWN"
+            assert not h.proxy.stopped and not h.pump.done()
+            assert h.proxy.identity_snapshot()["write_ready"] is False
+            pending = h.source.clients["read"].mailbox._header()
+            assert pending[4] == before[4] + 1 and pending[6] == before[6]
+            with pytest.raises(Exception):
+                await h.operation(h.read.query_asset())
+            health = await h.operation(h.multi.healthcheck(profile_id=h.profile_id))
+            assert health["status"] == "NOT_CONNECTED"
+            assert health["read_provider_health"]["status"] == "ERROR"
+            assert health["order_provider_health"]["write_readiness"] != "WRITE_RUNTIME_READY"
+            assert h.source.clients["read"].mailbox._header()[4:7] == pending[4:7]
+            assert not h.submit_calls and not h.cancel_calls
+        finally:
+            await h.close()
+
+    asyncio.run(run())
+
+
+def test_live_proxy_health_is_understood_by_actual_supervisor(gateway_modules, tmp_path, capsys):
+    supervisor = importlib.import_module("supervise_qmt_runtime")
+    config = dict(environment="LIVE", runtime_policy="PERSISTENT_LIVE_READ_WRITE",
+                  account_id="8882152350", native_pid=2852, execution_session_id="e" * 32)
+    proxy = SimpleNamespace(isolation_reason="REDIS_RECEIVE_OR_PROCESS_FAILED", _route_faults={},
+                            _write_block_reasons=["PROXY_ISOLATED_REDIS_RECEIVE_OR_PROCESS_FAILED"],
+                            _writes_blocked=True)
+    LIVE_RUNNER._emit_proxy_health(config, proxy)
+    log = tmp_path / "proxy.stdout.log"
+    log.write_text(capsys.readouterr().out, encoding="utf-8")
+    manager = object.__new__(supervisor.RuntimeSupervisor)
+    manager.proxy_log_path = log
+    manager.config = {"account_id": config["account_id"]}
+    manager.children = {"proxy": SimpleNamespace(pid=os.getpid())}
+    health = manager.proxy_health({"native_pid": config["native_pid"],
+                                   "execution_session_id": config["execution_session_id"]})
+    assert health["status"] == "ISOLATED" and health["reason"] == proxy.isolation_reason
+    assert health["writes_blocked"] is True
 
 
 def test_live_sixty_seven_quote_symbols_cross_generated_source_proxy_and_formal_adapter(monkeypatch, gateway_modules):

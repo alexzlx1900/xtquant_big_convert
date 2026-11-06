@@ -122,6 +122,87 @@ def test_late_read_frame_is_not_acknowledged_or_resent_and_execution_stays_reada
         server.close()
 
 
+def test_legacy_live_quote_timeout_keeps_proxy_alive_and_preserves_unconfirmed_frame():
+    name = "Local\\AQP_SHM_LEGACY_LIVE_FAULT_TEST"
+    state = MemoryState()
+    server_region = MemoryRegion(state)
+    server_region.pid = 2852
+    server = ReadOnlyMailbox(name, create=True, region=server_region)
+    server.mark_ready()
+    read = ShmReadOnlyClient(name, LIVE.ACCOUNT, region=MemoryRegion(state))
+    execution = LIVE.LiveClient("execution")
+    redis = FIXTURE.FakeRedis()
+    proxy = RedisShmReadOnlyProxy(
+        RedisTransport(redis, account_id=LIVE.ACCOUNT), read, execution,
+        account_id=LIVE.ACCOUNT, environment="LIVE", runtime_policy=LIVE.POLICY,
+        allow_order_methods=True, live_write_authorized=True, start_write_blocked=False,
+        expected_readonly_session_id=server.session_id, expected_execution_session_id="execution-sid",
+        expected_native_pid=2852, expected_windows_session_id=1, timeout_seconds=0.1, max_requests=0,
+        receive_policy="QUEUE_ONLY",
+    )
+    errors = []
+
+    def serve_identity():
+        try:
+            until = time.monotonic() + 2
+            item = None
+            while item is None and time.monotonic() < until:
+                item = server.read_request()
+                time.sleep(0.001)
+            assert item is not None
+            sequence, request = item
+            data = dict(pong=True, account_id=LIVE.ACCOUNT, environment="LIVE", allow_order_methods=False,
+                        session_id=server.session_id, native_pid=2852, windows_session_id=1,
+                        transport="shm_readonly", runtime_policy="PERSISTENT_READONLY",
+                        source_deadline_unix=None, max_seconds=0, max_requests=0,
+                        capabilities=sorted(QUOTE_METHODS))
+            assert server.publish_response(sequence, dict(
+                schema_version=1, request_id=request["request_id"], account_id=LIVE.ACCOUNT,
+                environment="LIVE", method="ping", session_id=server.session_id, sequence=sequence,
+                ok=True, data=data, error="", server_error="", handled_at="2026-11-06T00:00:00"))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=serve_identity)
+    worker.start()
+    try:
+        proxy.verify_identity()
+        worker.join(timeout=2)
+        assert not worker.is_alive() and not errors
+        before = server._header()
+        original = LIVE.request("get_ticks", rid="legacy-live-read", params={"code": "000001.SZ"})
+        response = proxy.process_request(original)
+        pending = server._header()
+        assert response["status"] == "UNKNOWN" and response["automatic_retry"] is False
+        assert not proxy.stopped and proxy.identity_snapshot()["write_ready"] is False
+        assert pending[4] == before[4] + 1 and pending[5:7] == before[5:7]
+        original_frame = server_region.read(REQUEST_OFFSET, pending[7])
+        assert proxy.process_request(original) == response
+
+        for request in (LIVE.request("get_ticks", rid="new-read", params={"code": "000001.SZ"}),
+                        LIVE.request("get_positions", rid="new-position"),
+                        LIVE.request("submit_order", rid="new-write")):
+            rejected = proxy.process_request(request)
+            assert rejected["status"] == "REJECTED" and rejected["publication_state"] == "NOT_SENT"
+            assert not proxy.stopped
+        assert not redis.hashes and len(execution.calls) == 1
+
+        assert server.publish_response(pending[4], dict(
+            schema_version=1, request_id=original["request_id"], account_id=LIVE.ACCOUNT,
+            environment="LIVE", method="get_ticks", session_id=server.session_id, sequence=pending[4],
+            ok=True, data={"000001.SZ": {"lastPrice": 10}}, error="", server_error="",
+            handled_at="2026-11-06T00:00:01"))
+        late = server._header()
+        assert late[4] == late[5] == pending[4] and late[6] == before[6]
+        assert server_region.read(REQUEST_OFFSET, pending[7]) == original_frame
+        assert proxy.process_request(original) == response and not proxy.stopped
+        assert server._header()[4:7] == late[4:7]
+    finally:
+        worker.join(timeout=2)
+        proxy.close()
+        server.close()
+
+
 @pytest.mark.parametrize("previous_unconfirmed", [False, True, None])
 def test_not_sent_requires_exact_structured_evidence_and_keeps_prior_unknown(previous_unconfirmed):
     proxy, _, read, execution = FIXTURE.RedisShmReadOnlyProxyTest().make_proxy(
@@ -354,6 +435,53 @@ def test_read_fault_does_not_modify_another_account_proxy_or_its_ledger():
     assert sim.process_request(FIXTURE.request("get_positions", rid="sim-independent"))["ok"]
     assert provider.hashes == before
     assert all(call[0]["method"] != "submit_order" for call in live_execution.calls + sim_execution.calls)
+
+
+def test_legacy_live_read_quarantine_leaves_other_account_usable():
+    provider = FIXTURE.FakeRedis()
+    live, _, live_read, live_execution = LIVE.make_proxy(
+        provider=provider, execution_cursor_guard_target=None, supervisor_write_gate=None,
+        start_write_blocked=False, live_write_authorized=True)
+    sim, _, _, sim_execution = FIXTURE.RedisShmReadOnlyProxyTest().make_proxy(
+        redis=provider, policy="PERSISTENT_SIMULATION_READ_WRITE")
+    live_read.failure = ShmTimeoutError("quote result unconfirmed")
+    response = live.process_request(LIVE.request("get_ticks", rid="legacy-live-fault",
+                                                  params={"code": "000001.SZ"}))
+    assert response["status"] == "UNKNOWN" and not live.stopped
+    assert live.identity_snapshot()["write_ready"] is False
+    assert sim.identity_snapshot()["write_ready"] is True
+    assert sim.process_request(FIXTURE.request("get_positions", rid="sim-after-live-fault"))["ok"]
+    assert not provider.hashes
+    assert all(call[0]["method"] != "submit_order" for call in live_execution.calls + sim_execution.calls)
+
+
+def test_legacy_live_read_quarantine_preserves_prior_write_outcomes():
+    proxy, redis, read, execution = LIVE.make_proxy(
+        execution_cursor_guard_target=None, supervisor_write_gate=None,
+        start_write_blocked=False, live_write_authorized=True)
+    original = LIVE.request("submit_order", rid="confirmed-before-read-fault")
+    original["params"].pop("execution_event_guard")
+    original["params"].pop("supervisor_gate_epoch")
+    execution.result = {"status": "SUBMITTED", "order_sys_id": "fixture-only"}
+    confirmed = proxy.process_request(original)
+    assert confirmed["ok"] and len(execution.calls) == 2
+
+    read.failure = ShmTimeoutError("quote result unconfirmed")
+    assert proxy.process_request(LIVE.request("get_ticks", rid="quote-fault",
+                                               params={"code": "000001.SZ"}))["status"] == "UNKNOWN"
+    assert proxy.process_request(original) == confirmed and len(execution.calls) == 2
+
+    ledger = proxy._write_ledger_key
+    redis.hashes[ledger]["older-unknown"] = json.dumps({"state": "UNKNOWN"})
+    before = copy.deepcopy(redis.hashes[ledger])
+    historical = proxy.process_request(LIVE.request("submit_order", rid="older-unknown"))
+    assert historical["status"] == "UNKNOWN" and historical["publication_state"] == "UNKNOWN"
+    assert redis.hashes[ledger] == before and len(execution.calls) == 2
+
+    redis.fail_operation = "hget"
+    unavailable = proxy.process_request(LIVE.request("submit_order", rid="ledger-unavailable"))
+    assert unavailable["status"] == "UNKNOWN" and unavailable["publication_state"] == "UNKNOWN"
+    assert not proxy.stopped and len(execution.calls) == 2
 
 
 @pytest.mark.parametrize("stage", ["PREPARE_PENDING", "PREPARED", "COMMIT_PENDING", "COMMITTED",
