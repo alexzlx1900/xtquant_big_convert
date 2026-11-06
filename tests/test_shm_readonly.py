@@ -934,6 +934,32 @@ class Win32FailurePathTest(unittest.TestCase):
 
 
 class AccountReadTest(BridgeFixture):
+    def test_native_cash_flow_fields_survive_roundtrip_without_claiming_validation(self):
+        self.query.return_value = [account_row(m_dDeposit=0.0, m_dWithdraw=125.5,
+                                               m_dCashIn=-125.5, m_strTradingDate="20261106")]
+        response = self.roundtrip(self.client(), "get_asset")
+        self.assertTrue(response["ok"])
+        asset = response["data"]["asset"]
+        self.assertEqual(asset["account_id"], ACCOUNT)
+        self.assertEqual(asset["native_cash_flow"], {
+            "status": "UNKNOWN",
+            "fields": {"m_dDeposit": 0.0, "m_dWithdraw": 125.5,
+                       "m_dCashIn": -125.5, "m_strTradingDate": "20261106"},
+        })
+        self.assertTrue(response["data"]["source_evidence"]["complete"])
+        self.query.assert_called_once_with(ACCOUNT, "STOCK", "ACCOUNT")
+
+    def test_optional_cash_flow_fields_missing_or_unserializable_do_not_break_asset(self):
+        self.query.return_value = [account_row(m_dDeposit=float("nan"), m_dCashIn=object())]
+        response = self.roundtrip(self.client(), "get_asset")
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["data"]["asset"]["native_cash_flow"], {
+            "status": "UNKNOWN",
+            "fields": {"m_dDeposit": None, "m_dWithdraw": None,
+                       "m_dCashIn": None, "m_strTradingDate": None},
+        })
+        self.assertTrue(response["data"]["source_evidence"]["complete"])
+
     def test_native_asset_values_and_reconciliation_are_kept(self):
         self.query.return_value = [account_row()]
         response = self.roundtrip(self.client(), "get_asset")

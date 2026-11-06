@@ -245,6 +245,19 @@ class ReadOnlyAccountProvider:
             if values[field] is None:
                 evidence["unknown_fields"].append(field)
         result["asset"] = AssetSnapshot(account_id=account_id, **values)
+        # 只留存原生观察值。券商是否填充及统计周期尚未核验，不能据此推断净入出金。
+        cash_flow_fields = {}
+        for name in ("m_dDeposit", "m_dWithdraw", "m_dCashIn", "m_strTradingDate"):
+            try:
+                raw = getattr(rows[0], name, None)
+            except Exception:
+                raw = None
+            if not isinstance(raw, (str, int, float, bool)):
+                raw = None
+            elif isinstance(raw, float) and not math.isfinite(raw):
+                raw = None
+            cash_flow_fields[name] = raw
+        result["asset"].native_cash_flow = {"status": "UNKNOWN", "fields": cash_flow_fields}
         evidence.update(converted_row_count=1, returned_row_count=1)
         complete = not evidence["unknown_fields"]
         evidence.update(complete=complete, status="OK" if complete else "PARTIAL",

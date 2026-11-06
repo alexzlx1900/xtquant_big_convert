@@ -303,6 +303,36 @@ def test_original_queue_and_pubsub_clients_use_actual_two_source_protocols(monke
         h.close()
 
 
+def test_cash_flow_observation_survives_execution_source_and_redis_proxy(monkeypatch):
+    h = Harness(monkeypatch)
+    original_query = h.original_query
+
+    def query(account, account_type, detail_type, strategy_name=""):
+        rows = original_query(account, account_type, detail_type, strategy_name)
+        if detail_type == "ACCOUNT":
+            rows[0].m_dDeposit = 0.0
+            rows[0].m_dWithdraw = 125.5
+            rows[0].m_dCashIn = -125.5
+            rows[0].m_strTradingDate = "20261106"
+        return rows
+
+    h.original_query = query
+    try:
+        response = h.legacy_call("get_asset", {"include_source_evidence": True})
+        assert response["ok"] is True
+        assert response["data"]["asset"]["account_id"] == ACCOUNT
+        assert response["data"]["asset"]["native_cash_flow"] == {
+            "status": "UNKNOWN",
+            "fields": {"m_dDeposit": 0.0, "m_dWithdraw": 125.5,
+                       "m_dCashIn": -125.5, "m_strTradingDate": "20261106"},
+        }
+        assert response["data"]["source_evidence"]["account_id"] == ACCOUNT
+        assert response["data"]["source_evidence"]["complete"] is True
+        h.source.writes.assert_not_called()
+    finally:
+        h.close()
+
+
 def test_partial_quotes_preserve_native_error_and_available_rows(monkeypatch):
     h = Harness(monkeypatch, symbols=[CODE, "600000.SH"])
     h.source.context.get_full_tick = lambda codes: {CODE: dict(lastPrice=11.47, time=1792110000000)}

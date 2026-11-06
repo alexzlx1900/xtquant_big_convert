@@ -170,6 +170,34 @@ def test_actual_bootstrap_default_deny_query_and_session_identity():
     assert all(region.closed for region in h.state.regions)
 
 
+def test_native_cash_flow_fields_survive_execution_bridge_roundtrip():
+    h = Fixture()
+    original_query = h.query
+
+    def query(account, account_type, detail_type, strategy_name=""):
+        rows = original_query(account, account_type, detail_type, strategy_name)
+        if detail_type == "ACCOUNT":
+            rows[0].m_dDeposit = 300.0
+            rows[0].m_dWithdraw = 0.0
+            rows[0].m_dCashIn = 300.0
+            rows[0].m_strTradingDate = "20261106"
+        return rows
+
+    try:
+        h.server.bridge.handlers.position_provider.accounts.query = query
+        response = h.call("get_asset")
+        assert response["ok"] is True
+        assert response["data"]["asset"]["account_id"] == ACCOUNT
+        assert response["data"]["asset"]["native_cash_flow"] == {
+            "status": "UNKNOWN",
+            "fields": {"m_dDeposit": 300.0, "m_dWithdraw": 0.0,
+                       "m_dCashIn": 300.0, "m_strTradingDate": "20261106"},
+        }
+        assert response["data"]["source_evidence"]["complete"] is True
+    finally:
+        h.close()
+
+
 def test_native_callbacks_preserve_identity_and_derive_rejection_event():
     h = Fixture()
     h.namespace["order_callback"](h.context, SimpleNamespace(m_strAccountID=ACCOUNT, m_strOrderSysID="REAL-1", m_nOrderStatus=57, m_strRemark="own-order"))
