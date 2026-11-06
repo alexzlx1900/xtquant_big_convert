@@ -55,6 +55,29 @@ class PositionSourceEvidenceTest(unittest.TestCase):
         self.assert_counts(evidence, 2, 2, 2, 0, 0)
         self.assertEqual(to_jsonable(result)["positions"]["600000.SH"]["volume"], 100)
 
+    def test_native_quantity_field_provenance_survives_rpc_serialization(self):
+        result = self.provider([row(m_nFrozenVolume=0)]).get_positions_with_evidence("test-account")
+        position = to_jsonable(result)["positions"]["600000.SH"]
+        self.assertEqual(position["available_source_field"], "m_nCanUseVolume")
+        self.assertIs(position["available_quantity_known"], True)
+        self.assertEqual(position["frozen_volume_source_field"], "m_nFrozenVolume")
+        self.assertIs(position["frozen_volume_known"], True)
+        self.assertEqual(position["frozen_volume"], 0)
+
+    def test_missing_and_alias_fields_do_not_gain_native_known_status(self):
+        missing = self.provider([row()]).get_positions_with_evidence("test-account")
+        position = to_jsonable(missing)["positions"]["600000.SH"]
+        self.assertEqual(position["frozen_volume"], 0)
+        self.assertIsNone(position["frozen_volume_source_field"])
+        self.assertIs(position["frozen_volume_known"], False)
+        alias = self.provider([row(m_nCanUseVolume=None, available=80, frozen_volume=20)]).get_positions_with_evidence("test-account")
+        position = to_jsonable(alias)["positions"]["600000.SH"]
+        self.assertEqual(position["available"], 80)
+        self.assertEqual(position["available_source_field"], "available")
+        self.assertIs(position["available_quantity_known"], False)
+        self.assertEqual(position["frozen_volume_source_field"], "frozen_volume")
+        self.assertIs(position["frozen_volume_known"], False)
+
     def test_real_empty_list_is_complete(self):
         result = self.provider([]).get_positions_with_evidence("test-account")
         self.assertTrue(result["source_evidence"]["complete"])

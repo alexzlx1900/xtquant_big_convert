@@ -55,7 +55,20 @@ def _evidence_market_value(row):
     return None
 
 
+def _evidence_named_field(row, names):
+    """保留本次实际命中的字段；不把缺失或兼容别名升级为原生证明。"""
+    for name in names:
+        value = getattr(row, name, None)
+        if value is not None:
+            return name, value
+    return None, None
+
+
 def _evidence_position(row):
+    available_field, available_value = _evidence_named_field(
+        row, ("m_nCanUseVolume", "available", "can_use_volume"))
+    frozen_field, frozen_value = _evidence_named_field(
+        row, ("m_nFrozenVolume", "frozen_volume"))
     code = _full_code(
         _attr(row, ("m_strInstrumentID", "instrument_id", "stock_code")),
         _attr(row, ("m_strExchangeID", "exchange_id", "market")),
@@ -72,8 +85,7 @@ def _evidence_position(row):
         "stock_code": code,
         "stock_name": str(_attr(row, ("m_strInstrumentName", "stock_name"), "") or ""),
         "volume": _evidence_number(_attr(row, ("m_nVolume", "volume")), integer=True),
-        "available": _evidence_number(
-            _attr(row, ("m_nCanUseVolume", "available", "can_use_volume")), integer=True),
+        "available": _evidence_number(available_value, integer=True),
         "cost": _evidence_number(_attr(row, ("m_dOpenPrice", "m_dCostPrice", "cost"))),
     }
     for field, names in (
@@ -91,9 +103,15 @@ def _evidence_position(row):
         ("on_road_volume", ("m_nOnRoadVolume", "on_road_volume")),
         ("yesterday_volume", ("m_nYesterdayVolume", "yesterday_volume")),
     ):
-        values[field] = _evidence_number(_attr(row, names, 0), integer=True)
+        value = frozen_value if field == "frozen_volume" else _attr(row, names)
+        values[field] = _evidence_number(0 if value is None else value, integer=True)
     values["direction"] = int(_attr(row, ("m_nDirection", "direction"), 48) or 48)
-    return PositionSnapshot(**values)
+    result = PositionSnapshot(**values)
+    result.available_source_field = available_field
+    result.available_quantity_known = available_field == "m_nCanUseVolume"
+    result.frozen_volume_source_field = frozen_field
+    result.frozen_volume_known = frozen_field == "m_nFrozenVolume"
+    return result
 
 
 # Candidate ThinkTrader field names on the ACCOUNT row of get_trade_detail_data.
