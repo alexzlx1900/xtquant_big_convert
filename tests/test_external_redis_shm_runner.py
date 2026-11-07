@@ -659,6 +659,62 @@ def test_persistent_runner_emits_actual_ready_before_consumption_and_stop_event_
     assert not any(operation[0] == "delete" for operation in provider.operations)
 
 
+@pytest.mark.parametrize("cleanup_error", [False, True])
+def test_supervised_stop_receipt_requires_completed_proxy_cleanup(monkeypatch, tmp_path, cleanup_error):
+    value, provider, clients, factory = persistent_resources("PERSISTENT_READONLY")
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    request = tmp_path / "proxy-stop-request.json"
+    token = "a" * 32
+    monkeypatch.setenv("AQP_UPDATE_PROXY_STOP_REQUEST", str(request))
+    monkeypatch.setenv("AQP_UPDATE_PROXY_STOP_TOKEN", token)
+    if cleanup_error:
+        provider.connection_pool.disconnect.side_effect = RuntimeError("cleanup failed")
+    expected = {"contract": "QMT_PROXY_STOP_V1", "proxy_pid": os.getpid(), "token": token}
+
+    def ready(_proof):
+        request.write_text(json.dumps(expected), encoding="utf-8")
+
+    result = RUNNER.run_candidate(value, lambda target: provider, factory, ready_observer=ready)
+    assert json.loads((tmp_path / "proxy-stop-ready.json").read_text()) == expected
+    receipt = tmp_path / "proxy-stop-receipt.json"
+    if cleanup_error:
+        assert result["status"] == "UNKNOWN" and not receipt.exists()
+    else:
+        assert result["status"] == "STOP_REQUESTED" and result["resources_closed"]
+        assert json.loads(receipt.read_text()) == expected
+    assert all(client.closed for client in clients)
+
+
+def test_supervised_stop_waits_for_current_proxy_request(monkeypatch, tmp_path):
+    value, provider, clients, factory = persistent_resources("PERSISTENT_READONLY")
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+    request = tmp_path / "proxy-stop-request.json"
+    token = "b" * 32
+    monkeypatch.setenv("AQP_UPDATE_PROXY_STOP_REQUEST", str(request))
+    monkeypatch.setenv("AQP_UPDATE_PROXY_STOP_TOKEN", token)
+    entered, release = threading.Event(), threading.Event()
+
+    def pending_request(_proxy):
+        entered.set()
+        assert release.wait(2)
+        return None
+
+    monkeypatch.setattr(RUNNER.RedisShmReadOnlyProxy, "poll_once", pending_request)
+    expected = {"contract": "QMT_PROXY_STOP_V1", "proxy_pid": os.getpid(), "token": token}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        job = pool.submit(RUNNER.run_candidate, value, lambda target: provider, factory,
+                          ready_observer=lambda _proof: None)
+        try:
+            assert entered.wait(2)
+            request.write_text(json.dumps(expected), encoding="utf-8")
+            assert not (tmp_path / "proxy-stop-receipt.json").exists()
+        finally:
+            release.set()
+        assert job.result(timeout=2)["status"] == "STOP_REQUESTED"
+    assert json.loads((tmp_path / "proxy-stop-receipt.json").read_text()) == expected
+    assert all(client.closed for client in clients)
+
+
 def test_ready_observer_failure_prevents_consumption_and_releases_owned_connections(monkeypatch):
     value, provider, clients, factory = persistent_resources("PERSISTENT_READONLY")
     monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)

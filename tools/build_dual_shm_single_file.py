@@ -4,6 +4,7 @@
 import argparse
 import ast
 import base64
+import hashlib
 import importlib.util
 import math
 import ntpath
@@ -47,7 +48,8 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
                  max_requests=1000, enable_market_rpc=False, persistent_readonly=False,
                  persistent_simulation_read_write=False, environment="SIM", persistent_live_read_write=False,
                  live_account_query_login=False, native_executable=None, runtime_launcher=None,
-                 source_identity_path=None, execution_event_guard=False, read_fault_isolation=False):
+                 source_identity_path=None, execution_event_guard=False, read_fault_isolation=False,
+                 runtime_update_identity=False):
     if environment not in ("SIM", "LIVE"):
         raise ValueError("explicit SIM/LIVE environment required")
     if type(live_account_query_login) is not bool or (live_account_query_login and environment != "LIVE"):
@@ -85,6 +87,10 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
                 or any(not isinstance(v, str) or not ntpath.isabs(v) for v in runtime_launcher.values())
                 or ntpath.basename(runtime_launcher["script"]) != "supervise_qmt_runtime.py"):
             raise ValueError("resident runtime launcher requires three explicit absolute paths")
+    if (type(runtime_update_identity) is not bool or runtime_update_identity and
+            not (environment == "LIVE" and resident_identity and runtime_launcher is not None
+                 and persistent_live_read_write is True)):
+        raise ValueError("runtime update identity requires a resident LIVE launcher")
     if type(native_pid) is not int or native_pid < 0 or type(windows_session) is not int or windows_session < 0:
         raise ValueError("explicit native PID and Windows session required")
     if (type(persistent_readonly) is not bool or type(persistent_simulation_read_write) is not bool
@@ -164,9 +170,24 @@ def build_source(*, native_pid, windows_session, hard_deadline_unix, read_name,
         native_executable=native_executable, runtime_launcher=runtime_launcher, execution_event_guard=execution_event_guard,
         read_fault_isolation=read_fault_isolation,
         source_identity_path=source_identity_path)
+    if runtime_update_identity:
+        settings["runtime_update_identity"] = True
     output = TEMPLATE.replace("__DUAL_SETTINGS__", repr(settings)).replace("__DUAL_PAYLOADS__", repr(payloads))
     output = output.replace("__SIM_NATIVE_EXECUTABLE__", repr(SIM_NATIVE_EXECUTABLE))
+    marker = "AQP_NATIVE_SOURCE_ID = 'AQP_NATIVE_SOURCE_ID_PLACEHOLDER'"
+    declaration = marker + "\n" if runtime_update_identity else ""
+    # 旧模型保持逐字输出，只有显式引导身份能力才插入新声明。
+    output = output.replace("__RUNTIME_SOURCE_ID_DECL__\n", declaration)
+    publication = ('        if DUAL_SHM_SETTINGS.get("runtime_update_identity") is True:\n'
+                   '            identity["runtime_update_model_id"] = AQP_NATIVE_SOURCE_ID\n'
+                   '            identity["runtime_update_contract"] = "QMT_RUNTIME_UPDATE_MODEL_V1"\n') if runtime_update_identity else ""
+    output = output.replace("__RUNTIME_UPDATE_PUBLISH__\n", publication)
     output = output.encode("ascii", "backslashreplace").decode("ascii")
+    if runtime_update_identity:
+        if output.count(marker) != 1:
+            raise ValueError("native source identity marker is ambiguous")
+        source_id = hashlib.sha256(output.encode("ascii")).hexdigest()
+        output = output.replace(marker, "AQP_NATIVE_SOURCE_ID = %r" % source_id, 1)
     ast.parse(output, feature_version=(3, 6))
     return output
 
@@ -187,6 +208,7 @@ import time
 import uuid
 
 DUAL_SHM_SETTINGS = __DUAL_SETTINGS__
+__RUNTIME_SOURCE_ID_DECL__
 _SIM_NATIVE_EXECUTABLE = __SIM_NATIVE_EXECUTABLE__
 _SOURCE_PAYLOADS = __DUAL_PAYLOADS__
 _RUNTIMES = {}
@@ -1476,6 +1498,7 @@ def init(ContextInfo):
             execution_capabilities=execution_capabilities)
         if read_write:
             identity["async_submit_contract"] = rpc_transport.ASYNC_SUBMIT_CONTRACT
+__RUNTIME_UPDATE_PUBLISH__
         if DUAL_SHM_SETTINGS["read_fault_isolation"]:
             identity["native_creation_filetime"] = _BOUND_NATIVE_CREATION_FILETIME
         identity_path = DUAL_SHM_SETTINGS["source_identity_path"]

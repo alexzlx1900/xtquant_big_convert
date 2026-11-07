@@ -339,9 +339,29 @@ def _emit_proxy_health(config, proxy, *, startup_error=""):
                           updated_at_unix=time.time()), ensure_ascii=False), flush=True)
 
 
+def _update_stop_control():
+    request = os.getenv("AQP_UPDATE_PROXY_STOP_REQUEST")
+    token = os.getenv("AQP_UPDATE_PROXY_STOP_TOKEN")
+    if request is None and token is None:
+        return None
+    if (not request or not Path(request).is_absolute() or not token
+            or re.fullmatch(r"[0-9a-f]{32}", token) is None):
+        raise ValueError("INVALID_PROXY_UPDATE_STOP_CONTROL")
+    return Path(request), {"contract": "QMT_PROXY_STOP_V1", "proxy_pid": os.getpid(), "token": token}
+
+
+def _write_update_stop_marker(path, value):
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=None, ready_observer=None):
     """显式运行政策；仅空闲只读队列检查允许有限恢复，不重发业务、不删键。"""
     config = validate_config(value)
+    update_stop = _update_stop_control()
+    update_stop_requested = False
     bounded = config["runtime_policy"] == "BOUNDED"
     persistent_live = config["environment"] == "LIVE" and config["runtime_policy"] == "PERSISTENT_LIVE_READ_WRITE"
     if (not persistent_live and (windows_session_id(os.getpid()) != config["windows_session"]
@@ -424,12 +444,23 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         phase = "READY_OBSERVER"
         _emit_proxy_health(config, proxy)
         (ready_observer or _emit_ready)(evidence)
+        if update_stop is not None:
+            _write_update_stop_marker(update_stop[0].with_name("proxy-stop-ready.json"), update_stop[1])
         stop_requested = False
         reported_error_at = None
         reported_rotation_block = False
         last_health_at = time.monotonic()
         last_health_state = None
         while not proxy.stopped:
+            if update_stop is not None:
+                try:
+                    command = json.loads(update_stop[0].read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    command = None
+                if command == update_stop[1]:
+                    update_stop_requested = True
+                    stop_requested = True
+                    break
             if stop_event is not None and stop_event.is_set():
                 stop_requested = True
                 break
@@ -541,6 +572,8 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                       elapsed_seconds=round(time.monotonic() - began, 3))
         if errors:
             result["status"] = "UNKNOWN"
+        if update_stop_requested and result["status"] == "STOP_REQUESTED" and not errors:
+            _write_update_stop_marker(update_stop[0].with_name("proxy-stop-receipt.json"), update_stop[1])
     return result
 
 
