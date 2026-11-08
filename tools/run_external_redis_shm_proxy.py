@@ -235,6 +235,15 @@ def validate_config(value, now_unix=None):
     result["runtime_policy"] = policy
     result["execution_cursor_guard_target"] = validate_execution_cursor_guard_target(
         value.get("execution_cursor_guard_target"), value["account_id"], environment)
+    result["previous_source_unknown_target"] = validate_execution_cursor_guard_target(
+        value.get("previous_source_unknown_target"), value["account_id"], environment)
+    if (result["previous_source_unknown_target"] is not None and result["previous_source_unknown_target"]
+            != {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}):
+        raise ValueError("previous-source unknown policy requires the exact VM LIVE target")
+    if result["previous_source_unknown_target"] is not None:
+        for field in ("gateway_id", "profile_id"):
+            if field in value and value[field] != result["previous_source_unknown_target"][field]:
+                raise ValueError("previous-source unknown policy conflicts with explicit runner %s" % field)
     if result["execution_cursor_guard_target"] is not None:
         for field in ("gateway_id", "profile_id"):
             if field in value and value[field] != result["execution_cursor_guard_target"][field]:
@@ -417,6 +426,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
             account_id=config["account_id"], environment=config["environment"],
             live_write_authorized=config["live_write_authorized"],
             execution_cursor_guard_target=config["execution_cursor_guard_target"],
+            previous_source_unknown_target=config["previous_source_unknown_target"],
             supervisor_write_gate=supervisor_gate,
             supervisor_rotation_channel=rotation_channel,
             receive_policy=config["receive_policy"],

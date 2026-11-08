@@ -409,9 +409,15 @@ class RedisShmReadOnlyProxy:
                  read_cache_capacity=1000, write_ledger_capacity=1000,
                  expected_windows_session_id=None, environment="SIM", start_write_blocked=None,
                  live_write_authorized=False, receive_policy="QUEUE_AND_PUBSUB",
-                 execution_cursor_guard_target=None, supervisor_write_gate=None, supervisor_rotation_channel=None):
+                 execution_cursor_guard_target=None, supervisor_write_gate=None, supervisor_rotation_channel=None,
+                 previous_source_unknown_target=None):
         validate_account_policy(account_id, environment, runtime_policy)
         execution_cursor_guard_target = validate_execution_cursor_guard_target(execution_cursor_guard_target, account_id, environment)
+        previous_source_unknown_target = validate_execution_cursor_guard_target(
+            previous_source_unknown_target, account_id, environment)
+        if (previous_source_unknown_target is not None and previous_source_unknown_target
+                != {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}):
+            raise ValueError("previous-source unknown policy requires the exact VM LIVE target")
         if not isinstance(receive_policy, str) or receive_policy not in RECEIVE_POLICIES:
             raise ValueError("explicit supported receive_policy required")
         if redis_transport.account_id != account_id:
@@ -463,6 +469,7 @@ class RedisShmReadOnlyProxy:
         self.live_write_authorized = live_write_authorized
         self.receive_policy = receive_policy
         self.execution_cursor_guard_target = copy.deepcopy(execution_cursor_guard_target)
+        self.previous_source_unknown_target = copy.deepcopy(previous_source_unknown_target)
         self._supervisor_write_gate = supervisor_write_gate
         self._supervisor_rotation_channel = supervisor_rotation_channel
         self._write_ledger_key = "aqp:redis_shm:write_ledger:%s:v1" % account_id
@@ -990,6 +997,19 @@ class RedisShmReadOnlyProxy:
             return "UNKNOWN"
         return "GAP" if data["gap"] or lost > 0 else "HEALTHY"
 
+    def _is_previous_source_binding(self, binding):
+        if self.previous_source_unknown_target is None or not isinstance(binding, dict):
+            return False
+        old_read, old_execution = binding.get("read_session_id"), binding.get("execution_session_id")
+        return (binding.get("account_id") == self.account_id and binding.get("environment") == "LIVE"
+                and binding.get("runtime_policy") == "PERSISTENT_LIVE_READ_WRITE"
+                and type(binding.get("native_pid")) is int and binding["native_pid"] > 0
+                and type(binding.get("windows_session_id")) is int and binding["windows_session_id"] >= 0
+                and binding.get("allow_order_methods") is True
+                and isinstance(old_read, str) and bool(old_read)
+                and isinstance(old_execution, str) and bool(old_execution) and old_read != old_execution
+                and not {old_read, old_execution} & {self._sessions["readonly"], self._sessions["execution"]})
+
     def _inspect_write_ledger(self):
         if not self.allow_order_methods:
             return
@@ -1035,7 +1055,8 @@ class RedisShmReadOnlyProxy:
             elif record["state"] == "NOT_EXECUTED":
                 self._validate_not_executed_record(record)
             elif record["state"] != "CONFIRMED":
-                self._block_writes("PERSISTED_WRITE_UNCONFIRMED")
+                if not self._is_previous_source_binding(record["binding"]):
+                    self._block_writes("PERSISTED_WRITE_UNCONFIRMED")
         # CID只对新异步合同生效；旧SYNC记录不要求新增索引。
         if not ASYNC_WRITE_METHODS <= self._capabilities and not has_async_records:
             return
@@ -2796,6 +2817,13 @@ class RedisShmReadOnlyProxy:
                 if (not isinstance(prior, dict) or prior.get("request_id") != prior_rid
                         or prior.get("client_order_id") != record["client_order_id"]):
                     raise ShmProtocolError("persistent async CID index has no exact original request")
+                if (self._is_previous_source_binding(prior.get("binding"))
+                        and prior.get("state") in {"CLAIMED", "UNKNOWN", "PUBLISH_PENDING", "PUBLISH_UNCONFIRMED"}):
+                    response = self._response(request, "previous source request remains unconfirmed; do not resend",
+                                              "PERSISTED_WRITE_UNCONFIRMED", unknown=True)
+                    response["data"] = dict(client_order_id=record["client_order_id"], original_request_id=prior_rid,
+                                            native_write_executed=False, automatic_retry=False)
+                    return None, response
                 reconciled = prior.get("state") == "RECONCILED"
                 if reconciled:
                     self._validate_reconciled_record(prior)
@@ -2827,6 +2855,11 @@ class RedisShmReadOnlyProxy:
                     self._block_writes("WRITE_LEDGER_CAPACITY_EXHAUSTED")
                 return encoded, None
             prior = json.loads(decode_text(claimed[1]))
+            if (isinstance(prior, dict) and prior.get("request_id") == request["request_id"]
+                    and self._is_previous_source_binding(prior.get("binding"))
+                    and prior.get("state") in {"CLAIMED", "UNKNOWN", "PUBLISH_PENDING", "PUBLISH_UNCONFIRMED"}):
+                return None, self._response(request, "previous source request remains unconfirmed; do not resend",
+                                            "PERSISTED_WRITE_UNCONFIRMED", unknown=True)
             binding_matches = isinstance(prior, dict) and prior.get("binding") == record["binding"]
             if asynchronous and isinstance(prior, dict) and prior.get("state") == "RECONCILED":
                 self._validate_reconciled_record(prior)

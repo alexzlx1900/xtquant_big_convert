@@ -800,6 +800,66 @@ def test_explicit_authorization_cannot_override_unknown_ledger_on_restart():
     assert rejected["ok"] is False and "blocked" in rejected["error"] and len(fresh.calls) == 1
 
 
+def test_vm_new_source_allows_fresh_writes_but_never_replays_old_unknown():
+    proxy, provider, _, execution = make_proxy(live_write_authorized=True, start_write_blocked=False,
+        execution_cursor_guard_target=None, supervisor_write_gate=None)
+    execution.result = dict(status="UNKNOWN", error="fixture native result unknown")
+    original = request("submit_order", rid="old-unknown")
+    assert proxy.process_request(original)["status"] == "UNKNOWN"
+    record = json.loads(provider.hashes[LEDGER]["old-unknown"])
+    record["binding"]["read_session_id"] = "retired-read"
+    record["binding"]["execution_session_id"] = "retired-execution"
+    provider.hashes[LEDGER]["old-unknown"] = json.dumps(record)
+    saved = provider.hashes[LEDGER]["old-unknown"]
+    restarted, _, _, fresh = make_proxy(provider=provider, live_write_authorized=True, start_write_blocked=False,
+        execution_cursor_guard_target=None, supervisor_write_gate=None,
+        previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"})
+    assert restarted.identity_snapshot()["write_ready"] is True
+    fresh.result = dict(status="SUBMITTED", order_sys_id="NEW_FIXTURE")
+    assert restarted.process_request(request("submit_order", rid="new-order"))["ok"] is True
+    assert provider.hashes[LEDGER]["old-unknown"] == saved
+    before = len(fresh.calls)
+    repeated = restarted.process_request(original)
+    assert repeated["ok"] is False and len(fresh.calls) == before
+    assert provider.hashes[LEDGER]["old-unknown"] == saved
+    assert restarted.process_request(request("submit_order", rid="another-new-order"))["ok"] is True
+    assert len(fresh.calls) == before + 1
+
+
+def test_vm_current_source_unknown_still_blocks_even_when_old_sources_are_allowed():
+    proxy, provider, _, execution = make_proxy(live_write_authorized=True, start_write_blocked=False,
+        execution_cursor_guard_target=None, supervisor_write_gate=None)
+    execution.result = dict(status="UNKNOWN", error="fixture native result unknown")
+    assert proxy.process_request(request("submit_order", rid="current-unknown"))["status"] == "UNKNOWN"
+    restarted, _, _, _ = make_proxy(provider=provider, live_write_authorized=True, start_write_blocked=False,
+        execution_cursor_guard_target=None, supervisor_write_gate=None,
+        previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"})
+    assert restarted.identity_snapshot()["writes_blocked"] is True
+
+
+@pytest.mark.parametrize("target", [
+    {"gateway_id": "qmt-win-001", "profile_id": "live-stock"},
+    {"gateway_id": "qmt-vm-001", "profile_id": "sim-bigqmt"},
+])
+def test_previous_source_unknown_policy_rejects_non_vm_live_targets(target):
+    with pytest.raises(ValueError):
+        RUNNER.validate_config(config(previous_source_unknown_target=target))
+
+
+def test_vm_incomplete_old_binding_remains_blocked():
+    proxy, provider, _, execution = make_proxy(live_write_authorized=True, start_write_blocked=False,
+        execution_cursor_guard_target=None, supervisor_write_gate=None)
+    execution.result = dict(status="UNKNOWN", error="fixture native result unknown")
+    assert proxy.process_request(request("submit_order", rid="old-incomplete"))["status"] == "UNKNOWN"
+    record = json.loads(provider.hashes[LEDGER]["old-incomplete"])
+    record["binding"].pop("execution_session_id")
+    provider.hashes[LEDGER]["old-incomplete"] = json.dumps(record)
+    restarted, _, _, _ = make_proxy(provider=provider, live_write_authorized=True, start_write_blocked=False,
+        execution_cursor_guard_target=None, supervisor_write_gate=None,
+        previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"})
+    assert restarted.identity_snapshot()["writes_blocked"] is True
+
+
 def test_live_authorization_flag_cannot_expand_sim_policy():
     value = config(account_id="55013746", environment="SIM", runtime_policy="PERSISTENT_SIMULATION_READ_WRITE",
                    live_write_authorized=True)
