@@ -191,7 +191,7 @@ def test_proxy_preserves_phase_evidence_on_success_and_cached_replay(proxy):
     assert len([r for r, _ in execution.calls if r["method"] == "get_positions"]) == 1
 
 
-def test_proxy_timeout_still_stops_and_records_verified_late_read_without_writes(proxy):
+def test_proxy_timeout_retains_fault_and_records_verified_late_read_without_writes(proxy):
     bridge, redis, _, execution = proxy
     failure = readonly_shm.ShmTimeoutError("response arrived after its deadline; result unconfirmed")
     failure.read_timing = {"shm_published_at_unix": 10.0, "native_finished_at_unix": 11.0,
@@ -199,7 +199,12 @@ def test_proxy_timeout_still_stops_and_records_verified_late_read_without_writes
     execution.failure = failure
     response = bridge.process_request(PROXY_FIXTURE.request())
     assert response["status"] == "UNKNOWN" and response["automatic_retry"] is False
-    assert bridge.stopped and bridge.stop_reason == "SHM_RESULT_UNCONFIRMED"
+    assert not bridge.stopped and not bridge.isolation_reason
+    assert bridge.identity_snapshot()["execution_source_state"] == "RESULT_UNKNOWN"
+    assert bridge.identity_snapshot()["write_ready"] is False
+    assert bridge.process_request(PROXY_FIXTURE.request()) == response
+    assert bridge.process_request(PROXY_FIXTURE.request(rid="next-read"))["publication_state"] == "NOT_SENT"
+    assert len(execution.calls) == 2
     assert response["read_timing"]["native_finished_at_unix"] == 11.0
     diagnostic = bridge.diagnostic_snapshot()["first_error"]["read_timing"]
     assert diagnostic["native_finished_at_unix"] == 11.0 and "unknown" not in diagnostic

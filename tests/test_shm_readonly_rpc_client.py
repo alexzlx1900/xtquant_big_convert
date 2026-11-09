@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bigqmt_signal_trader.transports.readonly_shm import (  # noqa: E402
-    ShmBusyError, ShmProtocolError, ShmReadOnlyClient, ShmTimeoutError,
+    RESPONSE_OFFSET, ShmBusyError, ShmProtocolError, ShmReadOnlyClient, ShmTimeoutError,
 )
 from bigqmt_signal_trader.transports.readonly_shm_client import (  # noqa: E402
     ShmReadOnlyRpcClient, ShmReadOnlyRpcError,
@@ -58,6 +58,38 @@ class RpcWireTest(FIXTURE.BridgeFixture):
         with pytest.raises(ShmProtocolError, match="recovery evidence"):
             client.recover_timed_out_ping(request, caught.value.sequence)
         assert client.poisoned and self.mailbox._header()[6] == caught.value.sequence - 1
+
+    def test_late_account_read_recovers_only_the_matching_frame(self):
+        client = ShmReadOnlyClient(FIXTURE.NAME, FIXTURE.ACCOUNT, region=FIXTURE.MemoryRegion(self.state))
+        self.clients.append(client)
+        request = {"schema_version": 1, "request_id": "late-read", "account_id": FIXTURE.ACCOUNT,
+                   "method": "get_positions", "params": {}, "read_expires_at_unix": time.time() + 1}
+        with pytest.raises(ShmTimeoutError) as caught:
+            client.send_request(request, timeout_seconds=.02)
+        sequence = caught.value.sequence
+        assert client.recover_timed_out_account_read(request, sequence) is False
+        assert client.poisoned and self.mailbox._header()[6] == sequence - 1
+        self.bridge.drain()
+        for changed in ({"request_id": "wrong"}, {"params": {"unexpected": True}},
+                        {"account_id": "wrong"}, {"environment": "LIVE"},
+                        {"method": "submit_order"}, {"method": "cancel_order"},
+                        {"method": "poll_execution_events"}):
+            with pytest.raises(ShmProtocolError):
+                client.recover_timed_out_account_read({**request, **changed}, sequence)
+            assert client.poisoned and self.mailbox._header()[6] == sequence - 1
+        with pytest.raises(ShmProtocolError):
+            client.recover_timed_out_account_read(request, sequence + 1)
+        header = self.mailbox._header()
+        original = client.mailbox.region.read(RESPONSE_OFFSET, header[8])
+        assert b"late-read" in original
+        client.mailbox.region.write(RESPONSE_OFFSET, original.replace(b"late-read", b"xate-read"))
+        with pytest.raises(ShmProtocolError, match="response request_id mismatch"):
+            client.recover_timed_out_account_read(request, sequence)
+        assert client.poisoned and self.mailbox._header()[6] == sequence - 1
+        client.mailbox.region.write(RESPONSE_OFFSET, original)
+        assert client.recover_timed_out_account_read(request, sequence) is True
+        assert not client.poisoned and self.mailbox._header()[6] == sequence
+        assert self.roundtrip(client, "ping")["ok"] is True
 
     def make_rpc(self):
         def native_factory(name, account):

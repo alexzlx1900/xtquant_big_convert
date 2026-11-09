@@ -3,14 +3,17 @@
 
 import asyncio
 import importlib
+import json
 import time
+from unittest import mock
 
 import pytest
 
 import test_live_redis_shm_proxy as LIVE
 import bigqmt_signal_trader.redis_shm_proxy as proxy_module
-from bigqmt_signal_trader.transports.readonly_shm import ShmTimeoutError
+from bigqmt_signal_trader.transports.readonly_shm import ShmBusyError, ShmTimeoutError
 from test_external_redis_gateway_readwrite_integration import Harness, gateway_modules
+from test_live_redis_shm_proxy import isolated_redis
 
 
 POSITION_ROUTE = "POSITION_READ_ROUTE_V1"
@@ -70,8 +73,16 @@ def test_position_route_marker_cannot_change_other_account_routing():
     assert len(read.calls) == read_count and len(execution.calls) == execution_count
 
 
-def test_live_position_timeout_isolates_execution_source_without_replay():
-    proxy, redis, read, execution = LIVE.make_proxy()
+@pytest.mark.parametrize("prior_unknown_write", [False, True])
+@pytest.mark.parametrize("prior_source_block", [False, True])
+def test_live_position_timeout_waits_for_matching_execution_reply_without_replay(isolated_redis, prior_unknown_write, prior_source_block):
+    proxy, redis, read, execution = LIVE.make_proxy(provider=isolated_redis, receive_policy="QUEUE_ONLY")
+    old_write = json.dumps({"state": "UNKNOWN", "request_id": "historical-write"})
+    if prior_unknown_write:
+        redis.hset("aqp:redis_shm:write_ledger:%s:v1" % LIVE.ACCOUNT, "historical-write", old_write)
+        proxy._block_writes("NATIVE_WRITE_RESULT_UNKNOWN")
+    if prior_source_block:
+        proxy._block_writes("EXECUTION_SOURCE_UNTRUSTED")
     request = LIVE.request("get_positions", rid="position-timeout")
     timeout = ShmTimeoutError("response arrived after its deadline; result unconfirmed")
     timeout.publication_state = "UNKNOWN"
@@ -80,6 +91,17 @@ def test_live_position_timeout_isolates_execution_source_without_replay():
     timeout.sequence = 926
     timeout.previous_unconfirmed = False
     execution.failure = timeout
+    original_send = execution.send_request
+
+    def fail_and_poison(value, timeout_seconds, **kwargs):
+        try:
+            return original_send(value, timeout_seconds, **kwargs)
+        except ShmTimeoutError:
+            execution.poisoned = True
+            raise
+
+    execution.send_request = fail_and_poison
+    proxy._check_native_process_identity = mock.Mock()
 
     result = proxy.process_request(request)
 
@@ -91,12 +113,25 @@ def test_live_position_timeout_isolates_execution_source_without_replay():
     assert proxy.stopped is False
     assert proxy.identity_snapshot()["execution_source_state"] == "RESULT_UNKNOWN"
     assert proxy.identity_snapshot()["write_ready"] is False
+    assert not proxy.isolation_reason and proxy._pending_execution_read_recovery is not None
 
     calls_after_timeout = len(execution.calls)
+    assert proxy.get_cached_response(request["request_id"]) == result
+    with pytest.raises(ShmBusyError):
+        proxy.process_request(LIVE.request("get_ticks", rid="quote-before-recovery", params={"code": "000001.SZ"}))
+    recovery = mock.Mock(return_value=False)
+    execution.recover_timed_out_account_read = recovery
+    assert proxy.poll_once() is None and proxy._pending_execution_read_recovery is not None
+    execution.poisoned, execution.failure = False, None
+    recovery.return_value = True
+    assert proxy.poll_once() is None and proxy._pending_execution_read_recovery is None
+    assert proxy.identity_snapshot()["execution_source_state"] == "HEALTHY"
+    assert proxy.identity_snapshot()["write_ready"] is False
+    assert ("NATIVE_WRITE_RESULT_UNKNOWN" in proxy._write_block_reasons) is prior_unknown_write
+    assert ("EXECUTION_SOURCE_UNTRUSTED" in proxy._write_block_reasons) is prior_source_block
+    if prior_unknown_write:
+        assert redis.hget("aqp:redis_shm:write_ledger:%s:v1" % LIVE.ACCOUNT, "historical-write") == old_write
     assert proxy.process_request(request) == result
-    assert len(execution.calls) == calls_after_timeout
-    other_position = proxy.process_request(LIVE.request("get_positions", rid="another-position"))
-    assert other_position["ok"] is False
     assert len(execution.calls) == calls_after_timeout
 
     quote = proxy.process_request(LIVE.request("get_ticks", rid="independent-quote",
@@ -104,8 +139,66 @@ def test_live_position_timeout_isolates_execution_source_without_replay():
     assert quote["ok"] is True
     assert len(execution.calls) == calls_after_timeout
     assert all(call[0]["method"] not in ("submit_order", "cancel_order") for call in execution.calls)
-    assert not redis.hashes
+    assert len(redis.hgetall("aqp:redis_shm:write_ledger:%s:v1" % LIVE.ACCOUNT)) == int(prior_unknown_write)
     assert read.closed is False
+
+
+def test_live_validated_execution_reply_after_deadline_does_not_permanently_isolate(isolated_redis):
+    proxy, _, _, execution = LIVE.make_proxy(provider=isolated_redis, receive_policy="QUEUE_ONLY")
+    proxy._check_native_process_identity = mock.Mock()
+    proxy.timeout_seconds = .04
+    original_send = execution.send_request
+
+    def slow_reply(value, timeout_seconds, **kwargs):
+        result = original_send(value, timeout_seconds, **kwargs)
+        if value["method"] == "get_positions":
+            time.sleep(.06)
+        return result
+
+    execution.send_request = slow_reply
+    original = LIVE.request("get_positions", rid="confirmed-but-late")
+    result = proxy.process_request(original)
+    assert result["status"] == "UNKNOWN" and result["automatic_retry"] is False
+    assert not proxy.isolation_reason and proxy._pending_execution_read_recovery is None
+    assert proxy.identity_snapshot()["execution_source_state"] == "HEALTHY"
+    assert original["request_id"] not in proxy._unconfirmed_read_ids["execution"]
+    assert proxy.process_request(original) == result
+
+
+def test_guarded_execution_read_never_acknowledges_changed_fault_evidence(isolated_redis):
+    proxy, _, _, execution = LIVE.make_proxy(provider=isolated_redis, receive_policy="QUEUE_ONLY")
+    original = LIVE.request("get_positions", rid="read-with-changed-evidence")
+    failure = ShmTimeoutError("late")
+    failure.publication_state, failure.previous_unconfirmed = "UNKNOWN", False
+    failure.request_id, failure.session_id, failure.sequence = original["request_id"], "execution-sid", 2
+    execution.failure = failure
+    proxy._check_native_process_identity = mock.Mock()
+    execution.recover_timed_out_account_read = mock.Mock()
+    assert proxy.process_request(original)["status"] == "UNKNOWN"
+    proxy._route_faults["execution"]["trigger_request_id"] = "different-request"
+    assert proxy.poll_once() is None and proxy.isolation_reason == "SHM_READ_RECOVERY_UNCONFIRMED"
+    execution.recover_timed_out_account_read.assert_not_called()
+    assert proxy.get_cached_response(original["request_id"])["status"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("fault", ["previous_unknown", "request_id", "session_id", "sequence", "execution_events"])
+def test_guarded_recovery_does_not_acknowledge_unproven_or_event_results(isolated_redis, fault):
+    proxy, _, _, execution = LIVE.make_proxy(provider=isolated_redis, receive_policy="QUEUE_ONLY")
+    method = "poll_execution_events" if fault == "execution_events" else "get_positions"
+    params = {"after_sequence": 0} if method == "poll_execution_events" else {}
+    original = LIVE.request(method, rid="unproven-read", params=params)
+    failure = ShmTimeoutError("late")
+    failure.publication_state = "UNKNOWN"
+    failure.previous_unconfirmed = fault == "previous_unknown"
+    failure.request_id = "different-request" if fault == "request_id" else original["request_id"]
+    failure.session_id = "different-session" if fault == "session_id" else "execution-sid"
+    failure.sequence = 0 if fault == "sequence" else 2
+    execution.failure = failure
+    response = proxy.process_request(original)
+    assert response["status"] == "UNKNOWN" and response["automatic_retry"] is False
+    assert proxy.isolation_reason == "SHM_EXECUTION_RESULT_UNCONFIRMED"
+    assert proxy._pending_execution_read_recovery is None
+    assert "read_recovery_contract" not in response
 
 
 def test_late_validated_quote_response_does_not_stop_proxy_or_replay(monkeypatch):
@@ -165,7 +258,7 @@ def test_unverifiable_read_fault_defers_execution(fault):
 def test_live_position_timeout_crosses_gateway_without_stopping_proxy(monkeypatch, gateway_modules):
     target = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
     harness = Harness(monkeypatch, gateway_modules, live=True, receive_policy="QUEUE_ONLY",
-                      execution_cursor_guard_target=target, test_supervisor_gate=True)
+                      execution_cursor_guard_target=target, test_supervisor_gate=True, guarded_candidate=True)
 
     async def scenario():
         try:
@@ -221,7 +314,7 @@ def test_live_position_timeout_crosses_gateway_without_stopping_proxy(monkeypatc
 def test_position_old_frame_can_be_verified_without_ack_or_execution_change(monkeypatch, gateway_modules):
     target = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
     harness = Harness(monkeypatch, gateway_modules, live=True, receive_policy="QUEUE_ONLY",
-                      execution_cursor_guard_target=target, test_supervisor_gate=True)
+                      execution_cursor_guard_target=target, test_supervisor_gate=True, guarded_candidate=True)
     # 跨仓测试以本地替身提供固定出生身份，不能解释为真实 Windows 进程验收。
     identity = {"native_pid": harness.source_binding["native_pid"], "native_creation_filetime": 123456,
                 "windows_session_id": 1, "executable": "fixture-native"}
@@ -292,7 +385,7 @@ def test_position_old_frame_can_be_verified_without_ack_or_execution_change(monk
 def test_gateway_router_returns_unknown_for_position_timeout_and_keeps_proxy_alive(monkeypatch, gateway_modules):
     target = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
     harness = Harness(monkeypatch, gateway_modules, live=True, receive_policy="QUEUE_ONLY",
-                      execution_cursor_guard_target=target, test_supervisor_gate=True)
+                      execution_cursor_guard_target=target, test_supervisor_gate=True, guarded_candidate=True)
 
     async def scenario():
         try:
@@ -334,7 +427,7 @@ def test_gateway_router_returns_unknown_for_position_timeout_and_keeps_proxy_ali
 def test_rotated_read_source_requires_new_position_capability_handshake(monkeypatch, gateway_modules):
     target = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
     harness = Harness(monkeypatch, gateway_modules, live=True, receive_policy="QUEUE_ONLY",
-                      execution_cursor_guard_target=target, test_supervisor_gate=True)
+                      execution_cursor_guard_target=target, test_supervisor_gate=True, guarded_candidate=True)
 
     async def scenario():
         try:

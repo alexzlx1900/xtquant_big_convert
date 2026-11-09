@@ -185,6 +185,59 @@ def test_legacy_vm_waits_for_exact_late_ping_then_resumes_new_requests(isolated_
     assert proxy.get_cached_response("late-ping") == result
 
 
+def test_vm_late_read_keeps_existing_unknown_write_and_block(isolated_redis):
+    proxy, provider, _, execution = make_proxy(provider=isolated_redis, execution_cursor_guard_target=None,
+        supervisor_write_gate=None, previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"},
+        receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
+    old_record = json.dumps({"state": "UNKNOWN", "request_id": "old-unknown-write"})
+    provider.hset(LEDGER, "old-unknown-write", old_record)
+    proxy._block_writes("NATIVE_WRITE_RESULT_UNKNOWN")
+
+    def timeout(value, timeout_seconds, **kwargs):
+        execution.poisoned = True
+        error = FIXTURE.ShmTimeoutError("response timed out")
+        error.publication_state, error.previous_unconfirmed = "UNKNOWN", False
+        error.request_id, error.session_id, error.sequence = value["request_id"], "execution-sid", 2
+        raise error
+
+    execution.send_request = timeout
+    proxy._check_native_process_identity = mock.Mock()
+    original = request("get_positions", rid="late-with-old-write")
+    assert proxy.process_request(original)["status"] == "UNKNOWN"
+
+    def confirm(*args):
+        execution.poisoned = False
+        return True
+
+    execution.recover_timed_out_account_read = mock.Mock(side_effect=confirm)
+    assert proxy.poll_once() is None and proxy._pending_execution_read_recovery is None
+    assert proxy._writes_blocked and "NATIVE_WRITE_RESULT_UNKNOWN" in proxy._write_block_reasons
+    assert provider.hget(LEDGER, "old-unknown-write") == old_record
+    assert proxy.get_cached_response(original["request_id"])["status"] == "UNKNOWN"
+
+
+def test_vm_late_read_never_acknowledges_changed_native_identity(isolated_redis):
+    proxy, _, _, execution = make_proxy(provider=isolated_redis, execution_cursor_guard_target=None,
+        supervisor_write_gate=None, previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"},
+        receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
+
+    def timeout(value, timeout_seconds, **kwargs):
+        execution.poisoned = True
+        error = FIXTURE.ShmTimeoutError("response timed out")
+        error.publication_state, error.previous_unconfirmed = "UNKNOWN", False
+        error.request_id, error.session_id, error.sequence = value["request_id"], "execution-sid", 2
+        raise error
+
+    execution.send_request = timeout
+    execution.recover_timed_out_account_read = mock.Mock()
+    original = request("get_positions", rid="late-changed-native")
+    assert proxy.process_request(original)["status"] == "UNKNOWN"
+    proxy._check_native_process_identity = mock.Mock(side_effect=FIXTURE.ShmProtocolError("native identity changed"))
+    assert proxy.poll_once() is None and proxy.isolation_reason == "SHM_READ_RECOVERY_UNCONFIRMED"
+    execution.recover_timed_out_account_read.assert_not_called()
+    assert execution.poisoned and proxy.get_cached_response(original["request_id"])["status"] == "UNKNOWN"
+
+
 def test_legacy_live_runner_stays_up_after_quote_timeout_and_rejects_later_requests(monkeypatch):
     value = config(receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
     provider = FIXTURE.FakeRedis()
@@ -225,6 +278,37 @@ def test_legacy_live_runner_stays_up_after_quote_timeout_and_rejects_later_reque
         result = future.result(timeout=3)
     assert result["status"] == "STOP_REQUESTED" and result["resources_closed"]
     assert result["writes_blocked"] is True and result["write_ready"] is False
+
+
+def test_runner_reports_read_recovery_transitions_without_waiting_for_periodic_health(monkeypatch, capsys):
+    value = config(receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
+    provider = FIXTURE.FakeRedis()
+    provider.connection_pool = SimpleNamespace(disconnect=mock.Mock())
+    stop = threading.Event()
+    monkeypatch.setattr(RUNNER, "windows_session_id", lambda pid: 1)
+
+    def factory(name, account):
+        route = "readonly" if name == value["read_name"] else "execution"
+        client = LiveClient(route)
+        client.mailbox.session_id = value["read_session_id" if route == "readonly" else "execution_session_id"]
+        return client
+
+    calls = []
+
+    def transition(proxy):
+        calls.append(1)
+        proxy._pending_execution_read_recovery = {"request": {"method": "get_positions"}} if len(calls) == 1 else None
+        if len(calls) == 2:
+            stop.set()
+        return None
+
+    monkeypatch.setattr(RUNNER.RedisShmReadOnlyProxy, "poll_once", transition)
+    result = RUNNER.run_candidate(value, lambda target: provider, factory, stop_event=stop,
+                                  ready_observer=lambda proof: None)
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if '"event": "PROXY_HEALTH"' in line]
+    assert result["status"] == "STOP_REQUESTED"
+    assert [event["status"] for event in events] == ["RUNNING", "DEGRADED", "RUNNING"]
+    assert [event["writes_blocked"] for event in events] == [False, True, False]
 
 
 def attach_fixture(monkeypatch, *, corruption=None, provider=None):
@@ -1121,11 +1205,14 @@ def test_live_runner_propagates_exact_account_and_initial_block_to_injected_reso
 def test_legacy_live_unknown_write_keeps_process_and_stops_further_consumption():
     proxy, provider, read, execution = make_proxy(
         execution_cursor_guard_target=None, supervisor_write_gate=None,
+        previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"},
         receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
     original = request("submit_order", rid="unknown-live-order")
     original["params"].pop("execution_event_guard")
     original["params"].pop("supervisor_gate_epoch")
     execution.failure = FIXTURE.ShmTimeoutError("native write result unknown")
+    execution.failure.publication_state, execution.failure.previous_unconfirmed = "UNKNOWN", False
+    execution.failure.request_id, execution.failure.session_id, execution.failure.sequence = original["request_id"], "execution-sid", 2
     response = proxy.process_request(original)
     assert response["status"] == "UNKNOWN" and response["automatic_retry"] is False
     assert not proxy.stopped and proxy.isolation_reason == "SHM_RESULT_UNCONFIRMED"
@@ -1403,12 +1490,15 @@ def test_vm_uncertain_dequeue_preservation_can_retry_its_own_lost_reply(isolated
     assert not proxy.isolation_reason and len(execution.calls) == 1
 
 
-def test_vm_late_ping_recovers_real_mailbox_and_reads_again(monkeypatch, isolated_redis):
+@pytest.mark.parametrize("timed_out_method", ["ping", "get_asset", "get_positions", "query_orders", "query_trades", "query_execution_snapshot", "get_trade_login_state"])
+@pytest.mark.parametrize("timing", ["late_frame", "acknowledged_after_deadline"])
+@pytest.mark.parametrize("guarded_candidate", [False, True])
+def test_vm_late_account_read_recovers_real_mailbox_and_reads_again(monkeypatch, isolated_redis, capsys, timed_out_method, timing, guarded_candidate):
     native_birth = 134567890123456789
     source = DUAL.Fixture(monkeypatch, account_id=ACCOUNT, environment="LIVE",
         hard_deadline_unix=None, max_seconds=0, max_requests=0, persistent_live_read_write=True,
         persistent_readonly=False, persistent_simulation_read_write=False, enable_market_rpc=True,
-        read_fault_isolation=True)
+        read_fault_isolation=True, execution_event_guard=guarded_candidate)
     source.namespace["_native_creation_filetime"] = lambda: native_birth
     source.start()
     clients = {name: ShmReadOnlyClient(source.clients[name].name, ACCOUNT, region=DUAL.Region(source.states[name]))
@@ -1420,10 +1510,15 @@ def test_vm_late_ping_recovers_real_mailbox_and_reads_again(monkeypatch, isolate
     proxy = RUNNER.RedisShmReadOnlyProxy(FIXTURE.RedisTransport(isolated_redis, account_id=ACCOUNT),
         clients["read"], clients["execution"], account_id=ACCOUNT, environment="LIVE", runtime_policy=POLICY,
         allow_order_methods=True, start_write_blocked=False, live_write_authorized=True, receive_policy="QUEUE_ONLY",
-        previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"},
+        previous_source_unknown_target=None if guarded_candidate else {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"},
+        execution_cursor_guard_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"} if guarded_candidate else None,
+        supervisor_write_gate=FIXTURE.FakeSupervisorWriteGate() if guarded_candidate else None,
         expected_readonly_session_id=clients["read"].mailbox.session_id,
         expected_execution_session_id=clients["execution"].mailbox.session_id,
         expected_native_pid=os.getpid(), expected_windows_session_id=1, timeout_seconds=1, max_requests=0)
+    if guarded_candidate:
+        # 本地模型模拟已建立的监督器句柄，不代表 VM 已启用该候选。
+        proxy._supervisor_attach_verified = True
 
     def drain():
         source.namespace["aqp_shm_readonly_adjust"](source.context)
@@ -1441,19 +1536,43 @@ def test_vm_late_ping_recovers_real_mailbox_and_reads_again(monkeypatch, isolate
     try:
         with_source(proxy.verify_identity)
         assert proxy._verified_process_identity == native
-        proxy.timeout_seconds = .03
+        proxy.timeout_seconds = .05
+        original_send = clients["execution"].send_request
+        calls = []
+
+        def monitored_send(value, timeout_seconds, **kwargs):
+            calls.append(value["request_id"])
+            result = original_send(value, timeout_seconds=timeout_seconds, **kwargs)
+            if timing == "acknowledged_after_deadline" and value["request_id"] == "late-real-read":
+                time.sleep(.08)
+            return result
+
+        monkeypatch.setattr(clients["execution"], "send_request", monitored_send)
         queue = proxy.transport.request_queue
-        isolated_redis.rpush(queue, FIXTURE.encode_rpc_request_payload(request("ping", rid="late-real-ping")))
-        response = proxy.poll_once()
-        assert response["status"] == "UNKNOWN" and proxy._pending_ping_recovery is not None
-        assert clients["execution"].poisoned and not proxy.isolation_reason
-        drain()
-        assert proxy.poll_once() is None and proxy._pending_ping_recovery is None
+        original = request(timed_out_method, rid="late-real-read")
+        isolated_redis.rpush(queue, FIXTURE.encode_rpc_request_payload(original))
+        response = proxy.poll_once() if timing == "late_frame" else with_source(proxy.poll_once)
+        assert response["status"] == "UNKNOWN" and not proxy.isolation_reason
+        health_config = dict(environment="LIVE", runtime_policy=POLICY, account_id=ACCOUNT,
+                             native_pid=os.getpid(), execution_session_id=clients["execution"].mailbox.session_id)
+        RUNNER._emit_proxy_health(health_config, proxy)
+        health = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        if timing == "late_frame":
+            assert health["status"] == "DEGRADED" and health["writes_blocked"] is True
+            assert clients["execution"].poisoned and proxy._pending_execution_read_recovery is not None
+            assert proxy.poll_once() is None and proxy._pending_execution_read_recovery is not None
+            drain()
+            assert proxy.poll_once() is None and proxy._pending_execution_read_recovery is None
+        else:
+            assert health["status"] == "RUNNING" and proxy._pending_execution_read_recovery is None
         assert not clients["execution"].poisoned
+        assert not proxy._unconfirmed_read_ids["execution"]
         proxy.timeout_seconds = 1
-        isolated_redis.rpush(queue, FIXTURE.encode_rpc_request_payload(request("get_positions", rid="after-real-ping")))
-        assert with_source(proxy.poll_once)["request_id"] == "after-real-ping"
-        assert proxy.get_cached_response("late-real-ping")["status"] == "UNKNOWN"
+        isolated_redis.rpush(queue, FIXTURE.encode_rpc_request_payload(request("get_positions", rid="after-real-read")))
+        assert with_source(proxy.poll_once)["request_id"] == "after-real-read"
+        assert proxy.get_cached_response("late-real-read")["status"] == "UNKNOWN"
+        assert proxy.process_request(original)["status"] == "UNKNOWN"
+        assert calls.count("late-real-read") == 1
         source.writes.assert_not_called()
     finally:
         proxy.close()

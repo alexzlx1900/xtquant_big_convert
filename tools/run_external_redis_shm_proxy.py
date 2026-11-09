@@ -339,12 +339,14 @@ def _emit_proxy_health(config, proxy, *, startup_error=""):
     reason = startup_error or (getattr(proxy, "isolation_reason", "") if proxy is not None else "")
     faults = getattr(proxy, "_route_faults", {}) if proxy is not None else {}
     reasons = getattr(proxy, "_write_block_reasons", ()) if proxy is not None else ()
-    degraded = ((isinstance(faults, dict) and any(faults.values()))
+    waiting_for_read = getattr(proxy, "_pending_execution_read_recovery", None) is not None
+    degraded = (waiting_for_read
+                or (isinstance(faults, dict) and any(faults.values()))
                 or any(item != "OPERATOR_WRITE_DISABLED" for item in reasons))
     print(json.dumps(dict(event="PROXY_HEALTH", status="ISOLATED" if reason else "DEGRADED" if degraded else "RUNNING",
                           reason=reason, account_id=config["account_id"], proxy_pid=os.getpid(),
                           native_pid=config["native_pid"], execution_session_id=config["execution_session_id"],
-                          writes_blocked=bool(getattr(proxy, "_writes_blocked", True)),
+                          writes_blocked=bool(waiting_for_read or getattr(proxy, "_writes_blocked", True)),
                           updated_at_unix=time.time()), ensure_ascii=False), flush=True)
 
 
@@ -506,7 +508,8 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                 faults = getattr(proxy, "_route_faults", {})
                 reasons = getattr(proxy, "_write_block_reasons", ())
                 state = (getattr(proxy, "isolation_reason", ""),
-                         bool(isinstance(faults, dict) and any(faults.values())), tuple(reasons))
+                         bool(isinstance(faults, dict) and any(faults.values())), tuple(reasons),
+                         getattr(proxy, "_pending_execution_read_recovery", None) is not None)
                 if state != last_health_state or time.monotonic() - last_health_at >= 5:
                     _emit_proxy_health(config, proxy)
                     last_health_state, last_health_at = state, time.monotonic()

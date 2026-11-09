@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from bigqmt_signal_trader.redis_shm_proxy import RedisShmReadOnlyProxy, SupervisorWriteGateError
 from bigqmt_signal_trader.transports.redis_transport import RedisTransport
 from bigqmt_signal_trader.transports.readonly_shm_client import ShmReadOnlyRpcClient
-from bigqmt_signal_trader.transports.readonly_shm import ShmProtocolError
+from bigqmt_signal_trader.transports.readonly_shm import ShmProtocolError, ShmReadOnlyClient
 from test_external_redis_dual_shm_integration import DUAL, MemoryRedis
 from test_live_redis_shm_proxy import RUNNER as LIVE_RUNNER
 from test_live_redis_shm_proxy import isolated_redis
@@ -80,7 +80,7 @@ class Harness:
                  live=False, start_write_blocked=None, live_write_authorized=False, symbols=None,
                  order_submit_mode="SYNC", redis_factory=MemoryRedis,
                  receive_policy="QUEUE_AND_PUBSUB", execution_cursor_guard_target=None,
-                 test_supervisor_gate=False):
+                 test_supervisor_gate=False, gateway_identity=None, guarded_candidate=False):
         self.allow_writes, self.unknown_submit = allow_writes, unknown_submit
         self.account = "8882152350" if live else ACCOUNT
         self.environment = "LIVE" if live else "SIM"
@@ -140,6 +140,7 @@ class Harness:
             runtime_policy=self.policy,
             receive_policy=receive_policy,
             execution_cursor_guard_target=execution_cursor_guard_target,
+            previous_source_unknown_target=gateway_identity,
             supervisor_write_gate=FixtureSupervisorWriteGate() if test_supervisor_gate else None,
         )
         if test_supervisor_gate:
@@ -169,16 +170,24 @@ class Harness:
             gateway_id="qmt-local-test", default_profile_id=self.profile_id, profiles=[self.profile],
         ))
 
+        if guarded_candidate and not (live and test_supervisor_gate and execution_cursor_guard_target == {
+                "gateway_id": "qmt-vm-001", "profile_id": "live-stock"}):
+            raise ValueError("guarded candidate fixture requires the complete VM LIVE candidate")
+
         def client_factory(**kwargs):
-            return gateway.client.RedisShmRpcClient(
+            client = gateway.client.RedisShmRpcClient(
                 account_id=self.account, environment=self.environment,
                 expected_source_policy=self.policy, allow_order_methods=allow_writes,
                 redis_config={}, timeout_seconds=1.0,
                 transport=RedisTransport(self.redis, account_id=self.account),
                 expected_source_binding=self.source_binding,
-                gateway_id=(execution_cursor_guard_target or {}).get("gateway_id"),
-                profile_id=(execution_cursor_guard_target or {}).get("profile_id"),
+                gateway_id=(gateway_identity or execution_cursor_guard_target or {}).get("gateway_id"),
+                profile_id=(gateway_identity or execution_cursor_guard_target or {}).get("profile_id"),
             )
+            if guarded_candidate:
+                # 当前 VM LIVE 保持现用非守卫模式；这里只模拟尚未部署的守卫候选。
+                client._execution_guard_required = True
+            return client
 
         self.read = gateway.readonly.BigQmtReadOnlyAdapter("qmt-local-test", self.profile, client_factory=client_factory)
         self.order = gateway.order.BigQmtOrderAdapter(
@@ -247,6 +256,72 @@ class Harness:
         self.proxy.close()
         self.source.close()
         self.pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("prior_unknown_write", [False, True])
+@pytest.mark.parametrize("timing", ["late_frame", "acknowledged_after_deadline"])
+@pytest.mark.parametrize("guarded_candidate", [False, True])
+def test_vm_late_account_read_recovers_through_gateway(monkeypatch, gateway_modules, isolated_redis, prior_unknown_write, timing, guarded_candidate):
+    target = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+    h = Harness(monkeypatch, gateway_modules, live=True, receive_policy="QUEUE_ONLY", start_write_blocked=False,
+                live_write_authorized=True,
+                redis_factory=lambda: isolated_redis, gateway_identity=None if guarded_candidate else target,
+                execution_cursor_guard_target=target if guarded_candidate else None,
+                test_supervisor_gate=guarded_candidate, guarded_candidate=guarded_candidate)
+    for source_name, route in (("read", "readonly"), ("execution", "execution")):
+        h.proxy._clients[route] = ShmReadOnlyClient(h.source.clients[source_name].name, h.account,
+                                                   region=DUAL.Region(h.source.states[source_name]))
+    # 本地进程仅模拟同一 Windows 原生来源，不能作为 VM 身份证据。
+    h.proxy._check_native_process_identity = lambda: None
+
+    async def scenario():
+        try:
+            await h.start()
+            client = h.read._get_client()
+            assert client._execution_guard_required is guarded_candidate
+            client._uncertain_write = prior_unknown_write
+            execution = h.proxy._clients["execution"]
+            original_send = execution.send_request
+            calls = []
+            late_method = "query_orders" if guarded_candidate else "get_positions"
+
+            def tracked_send(value, timeout_seconds, **kwargs):
+                calls.append(value["request_id"])
+                result = original_send(value, timeout_seconds=timeout_seconds, **kwargs)
+                if timing == "acknowledged_after_deadline" and value["request_id"] == "gateway-late-position":
+                    time.sleep(.08)
+                return result
+
+            monkeypatch.setattr(execution, "send_request", tracked_send)
+            h.proxy.timeout_seconds = .05
+            with pytest.raises(gateway_modules.client.RedisShmReadUnavailable) as failure:
+                operation = asyncio.to_thread(client.call, late_method, {}, request_id="gateway-late-position")
+                await (operation if timing == "late_frame" else h.operation(operation))
+            assert failure.value.publication_state == "UNKNOWN" and failure.value.automatic_retry is False
+            assert client.writes_blocked
+            with pytest.raises(RuntimeError, match="write gate blocked"):
+                client.call("submit_order", {})
+            assert (h.proxy._pending_execution_read_recovery is not None) is (timing == "late_frame")
+            deadline = time.monotonic() + 2
+            while h.proxy._pending_execution_read_recovery is not None and time.monotonic() < deadline:
+                h.drain()
+                await asyncio.sleep(.005)
+            assert h.proxy._pending_execution_read_recovery is None and not h.proxy.isolation_reason
+            h.proxy.timeout_seconds = 1
+            assert (await h.operation(h.read.healthcheck()))["status"] == "CONNECTED"
+            positions = await h.operation(h.read.query_positions())
+            assert len(positions) == 1 and positions[0]["symbol"] == "000001.SZ"
+            assert positions[0]["quantity"] == 100 and positions[0]["account_id"] == h.account
+            assert client.writes_blocked is prior_unknown_write
+            if prior_unknown_write:
+                assert client.write_block_reason == "PRIOR_WRITE_UNKNOWN"
+            assert calls.count("gateway-late-position") == 1
+            assert h.proxy.get_cached_response("gateway-late-position")["status"] == "UNKNOWN"
+            assert not h.submit_calls and not h.cancel_calls
+        finally:
+            await h.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("live", [False, True])
@@ -600,7 +675,7 @@ def test_identity_pending_thirteen_quotes_cross_gateway_without_touching_order(
     target = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
     h = Harness(monkeypatch, gateway_modules, live=True, symbols=symbols,
                 redis_factory=lambda: isolated_redis, receive_policy="QUEUE_ONLY",
-                execution_cursor_guard_target=target, test_supervisor_gate=True)
+                execution_cursor_guard_target=target, test_supervisor_gate=True, guarded_candidate=True)
     h.source.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge.runtime_metadata.update(
         native_callback_threading_verified=False, native_write_runtime_guard_ready=False)
 

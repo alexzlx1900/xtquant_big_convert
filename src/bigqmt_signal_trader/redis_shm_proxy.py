@@ -28,7 +28,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutErr
 from .adapters.redis_common import decode_text
 from .redis_rpc import decode_rpc_request_payload
 from .transports.readonly_shm import (
-    READY, REQUEST_CAPACITY, REQUEST_OFFSET, RESPONSE_CAPACITY, RESPONSE_OFFSET,
+    READY, RECOVERABLE_ACCOUNT_READ_METHODS, REQUEST_CAPACITY, REQUEST_OFFSET, RESPONSE_CAPACITY, RESPONSE_OFFSET,
     ShmBusyError, ShmProtocolError, ShmReadOnlyClient, ShmTimeoutError, decode_payload,
 )
 from .transports.readonly_shm_client import MARKET_RPC_METHODS, MINUTE_BATCH_CONTRACT, ShmReadOnlyRpcClient
@@ -70,6 +70,7 @@ READ_PY_CALLBACK_WITNESS_TTL_SECONDS = 3.0
 _READ_CALLBACK_WITNESS = struct.Struct("<II")
 _READ_CALLBACK_WITNESS_OFFSET = 56
 POSITION_READ_ROUTE_CONTRACT = "POSITION_READ_ROUTE_V1"
+VM_EXECUTION_READ_RECOVERY_CONTRACT = "VM_EXECUTION_READ_AUTO_RECOVERY_V1"
 EXECUTION_CURSOR_WRITE_GATE_CONTRACT = "EXECUTION_CURSOR_WRITE_GATE_V1"
 EXECUTION_CURSOR_NO_WRITE_CONTRACT = "EXECUTION_CURSOR_NO_WRITE_V1"
 SUPERVISOR_WRITE_GATE_CONTRACT = "INHERITED_SUPERVISOR_GATE_V1"
@@ -515,7 +516,7 @@ class RedisShmReadOnlyProxy:
         self._resources_closed = False
         self.stop_reason = ""
         self._isolation_reason = ""
-        self._pending_ping_recovery = None
+        self._pending_execution_read_recovery = None
         self._pending_dequeue_recovery = None
         self._uncertain_dequeue_ids = set()
         self._lock = threading.Lock()
@@ -3379,7 +3380,7 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("proxy already has an in-flight operation")
         try:
             self._ensure_open()
-            if self._pending_ping_recovery is not None or self._pending_dequeue_recovery is not None:
+            if self._pending_execution_read_recovery is not None or self._pending_dequeue_recovery is not None:
                 raise ShmBusyError("previous receive is still being verified")
             if not self._verified:
                 raise ShmProtocolError("explicit identity handshake required")
@@ -3532,6 +3533,8 @@ class RedisShmReadOnlyProxy:
                     fault_route = route
                     native_response = None
                     native_response_validated = False
+                    late_after_ack = False
+                    timed_out_read_confirmed = False
                     gate_held = False
                     readonly_guard = None
                     try:
@@ -3609,6 +3612,7 @@ class RedisShmReadOnlyProxy:
                         if binding is not None:
                             response["source_binding"] = binding
                         if time.time() >= deadline:
+                            late_after_ack = True
                             raise ShmTimeoutError("SHM response arrived after deadline")
                         data = response.get("data")
                         if request["method"] in ASYNC_WRITE_METHODS and prior_write is None:
@@ -3718,18 +3722,35 @@ class RedisShmReadOnlyProxy:
                             response = self._response(request, exc, "SHM_RESULT_UNCONFIRMED", unknown=True)
                             if read_timing is not None:
                                 response["read_timing"] = dict(read_timing)
-                            recover_ping = (self.environment == "LIVE" and self.receive_policy == "QUEUE_ONLY"
+                            recoverable_read = (self.environment == "LIVE" and self.receive_policy == "QUEUE_ONLY"
                                 and self.runtime_policy == "PERSISTENT_LIVE_READ_WRITE"
                                 and self.previous_source_unknown_target == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
-                                and request["method"] == "ping" and route == fault_route == "execution"
-                                and self._operation_phase == "SHM_FORWARD" and isinstance(exc, ShmTimeoutError)
+                                and request["method"] in RECOVERABLE_ACCOUNT_READ_METHODS | {"ping"}
+                                and route == fault_route == "execution" and isinstance(exc, ShmTimeoutError))
+                            recover_late_frame = (recoverable_read and self._operation_phase == "SHM_FORWARD"
                                 and getattr(exc, "publication_state", None) == "UNKNOWN"
                                 and getattr(exc, "previous_unconfirmed", None) is False
                                 and getattr(exc, "request_id", None) == rid
                                 and getattr(exc, "session_id", None) == self._sessions[route]
                                 and type(getattr(exc, "sequence", None)) is int and exc.sequence > 0)
-                            if recover_ping:
-                                self._pending_ping_recovery = {"request": forwarded, "sequence": exc.sequence}
+                            already_acknowledged = (recoverable_read and self._operation_phase == "SHM_RESPONSE_VALIDATE"
+                                and native_response_validated and late_after_ack)
+                            if recover_late_frame:
+                                self._pending_execution_read_recovery = {"request": forwarded, "sequence": exc.sequence}
+                                response.update(read_recovery_contract=VM_EXECUTION_READ_RECOVERY_CONTRACT,
+                                                publication_state="UNKNOWN", publication_scope="SHM",
+                                                previous_unconfirmed=False, sequence=exc.sequence)
+                            elif already_acknowledged:
+                                try:
+                                    self._check_native_process_identity()
+                                    self._check_client("execution")
+                                    timed_out_read_confirmed = True
+                                    response.update(read_recovery_contract=VM_EXECUTION_READ_RECOVERY_CONTRACT,
+                                                    publication_state="UNKNOWN", publication_scope="SHM",
+                                                    previous_unconfirmed=False, sequence=native_response["sequence"])
+                                except Exception as identity_exc:
+                                    self._record_error(identity_exc)
+                                    self._seal("SHM_READ_RECOVERY_UNCONFIRMED")
                             elif self.environment == "LIVE" and route == "readonly" and fault_route == "readonly":
                                 # 旧协议无法证明双源故障隔离；保留代理和原帧，隔离全部新请求并停写。
                                 self._mark_route_fault("readonly", "RESULT_UNKNOWN", request, "UNKNOWN",
@@ -3753,14 +3774,43 @@ class RedisShmReadOnlyProxy:
                             sequence = getattr(exc, "sequence", None) if evidence_matches else None
                             if native_response_validated:
                                 sequence = native_response.get("sequence")
+                            guarded_read = (
+                                self.environment == "LIVE" and self.runtime_policy == "PERSISTENT_LIVE_READ_WRITE"
+                                and self.receive_policy == "QUEUE_ONLY"
+                                and self.execution_cursor_guard_target == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+                                and route == fault_route == "execution" and isinstance(exc, ShmTimeoutError)
+                                and (request["method"] in RECOVERABLE_ACCOUNT_READ_METHODS
+                                     or request["method"] == "ping" and not request["params"])
+                                and self._route_faults["execution"] is None
+                                and not self._unconfirmed_read_ids["execution"])
+                            guarded_late_frame = (guarded_read and phase == "SHM_FORWARD"
+                                and getattr(exc, "publication_state", None) == "UNKNOWN"
+                                and previous_unconfirmed is False and evidence_matches
+                                and type(sequence) is int and sequence > 0)
+                            guarded_already_acknowledged = (guarded_read and phase == "SHM_RESPONSE_VALIDATE"
+                                and native_response_validated and late_after_ack
+                                and type(sequence) is int and sequence > 0)
+                            if guarded_already_acknowledged:
+                                try:
+                                    self._check_native_process_identity()
+                                    self._check_client("execution")
+                                    timed_out_read_confirmed = True
+                                    previous_unconfirmed = False
+                                except Exception as identity_exc:
+                                    self._record_error(identity_exc)
+                                    guarded_already_acknowledged = False
                             prior_state_unknown = phase == "SHM_FORWARD" and not_sent and previous_unconfirmed is None
                             protocol_fault = isinstance(exc, ShmProtocolError) and previous_unconfirmed is not True
-                            if not self.stopped and (previous_unconfirmed is True or prior_state_unknown
+                            if not guarded_already_acknowledged and not self.stopped and (previous_unconfirmed is True or prior_state_unknown
                                                      or protocol_fault or not not_sent):
                                 state = "IDENTITY_OR_PROTOCOL_ERROR" if protocol_fault else "RESULT_UNKNOWN"
+                                new_execution_block = "EXECUTION_SOURCE_UNTRUSTED" not in self._write_block_reasons
                                 self._mark_route_fault(fault_route, state, request, publication_state,
                                                        sequence=sequence, previous_unconfirmed=previous_unconfirmed)
-                                if fault_route == "execution" and (protocol_fault or self.environment == "LIVE"):
+                                if guarded_late_frame:
+                                    self._pending_execution_read_recovery = {"request": forwarded, "sequence": sequence,
+                                        "guarded": True, "clear_execution_block": new_execution_block}
+                                elif fault_route == "execution" and (protocol_fault or self.environment == "LIVE"):
                                     # 执行回调未确认时，现有只读隔离合同未证明反向独立。
                                     self._seal("SHM_IDENTITY_OR_PROTOCOL_ERROR" if protocol_fault
                                                else "SHM_EXECUTION_RESULT_UNCONFIRMED")
@@ -3779,6 +3829,8 @@ class RedisShmReadOnlyProxy:
                             response["previous_unconfirmed"] = previous_unconfirmed
                             if type(sequence) is int and sequence > 0 and previous_unconfirmed is not True:
                                 response["sequence"] = sequence
+                            if guarded_late_frame or guarded_already_acknowledged:
+                                response["read_recovery_contract"] = VM_EXECUTION_READ_RECOVERY_CONTRACT
                             if read_timing is not None:
                                 response["read_timing"] = dict(read_timing)
                     finally:
@@ -3818,7 +3870,8 @@ class RedisShmReadOnlyProxy:
                     self._processed_count += 1
                     if not is_write:
                         if response.get("status") == "UNKNOWN":
-                            self._unconfirmed_read_ids[route].add(rid)
+                            if not timed_out_read_confirmed:
+                                self._unconfirmed_read_ids[route].add(rid)
                         else:
                             self._read_expiries[rid] = deadline
             except (ShmProtocolError, ValueError, TypeError) as exc:
@@ -3977,20 +4030,37 @@ class RedisShmReadOnlyProxy:
                     return None
                 self._pending_dequeue_recovery = None
                 return None
-            if self._pending_ping_recovery is not None:
-                self._operation_phase = "SHM_PING_RECOVERY"
-                pending = self._pending_ping_recovery
+            if self._pending_execution_read_recovery is not None:
+                self._operation_phase = "SHM_READ_RECOVERY"
+                pending = self._pending_execution_read_recovery
                 try:
                     self._check_native_process_identity()
-                    done = self._clients["execution"].recover_timed_out_ping(pending["request"], pending["sequence"])
+                    if pending.get("guarded"):
+                        fault = self._route_faults["execution"]
+                        if (not isinstance(fault, dict) or fault.get("state") != "RESULT_UNKNOWN"
+                                or fault.get("session_id") != self._sessions["execution"]
+                                or fault.get("trigger_request_id") != pending["request"]["request_id"]
+                                or fault.get("sequence") != pending["sequence"]
+                                or fault.get("publication_state") != "UNKNOWN"
+                                or fault.get("previous_unconfirmed") is not False
+                                or self._unconfirmed_read_ids["execution"] != {pending["request"]["request_id"]}):
+                            raise ShmProtocolError("pending execution read recovery evidence changed")
+                    client = self._clients["execution"]
+                    recover = (client.recover_timed_out_ping if pending["request"]["method"] == "ping"
+                               else client.recover_timed_out_account_read)
+                    done = recover(pending["request"], pending["sequence"])
                 except Exception as exc:
                     self._record_error(exc)
-                    self._seal("SHM_PING_RECOVERY_UNCONFIRMED")
+                    self._seal("SHM_READ_RECOVERY_UNCONFIRMED")
                     return None
                 if not done:
                     return None
                 self._unconfirmed_read_ids["execution"].discard(pending["request"]["request_id"])
-                self._pending_ping_recovery = None
+                if pending.get("guarded"):
+                    self._route_faults["execution"] = None
+                    if pending.get("clear_execution_block"):
+                        self._remove_resolved_write_block_reasons({"EXECUTION_SOURCE_UNTRUSTED"})
+                self._pending_execution_read_recovery = None
                 return None
             restricted_reads = False
             if (self.environment == "LIVE" and self.runtime_policy == "PERSISTENT_LIVE_READ_WRITE"

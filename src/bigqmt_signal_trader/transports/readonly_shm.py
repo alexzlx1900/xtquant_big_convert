@@ -20,6 +20,10 @@ REQUEST_OFFSET = HEADER_SIZE
 RESPONSE_OFFSET = REQUEST_OFFSET + REQUEST_CAPACITY
 MAP_SIZE = RESPONSE_OFFSET + RESPONSE_CAPACITY
 INITIALIZING, READY, CLOSED, FAILED = 0, 1, 2, 3
+RECOVERABLE_ACCOUNT_READ_METHODS = frozenset((
+    "get_asset", "get_positions", "query_orders", "query_trades",
+    "query_execution_snapshot", "get_trade_login_state",
+))
 _NAME_PATTERN = re.compile(r"Local\\AQP_SHM_[A-Za-z0-9_-]{1,64}\Z")
 _HEADER = struct.Struct("<8sIIIIIIII16s8x")
 
@@ -562,31 +566,41 @@ class ShmReadOnlyClient:
 
     def recover_timed_out_ping(self, request, sequence):
         """只确认同一条已完成的心跳，不重发原请求或处理交易帧。"""
+        return self._recover_timed_out_frame(request, sequence, frozenset(("ping",)), "ping")
+
+    def recover_timed_out_account_read(self, request, sequence):
+        """确认同一条已完成的账户只读帧，旧调用结果仍保持未知。"""
+        return self._recover_timed_out_frame(request, sequence, RECOVERABLE_ACCOUNT_READ_METHODS, "account read")
+
+    def _recover_timed_out_frame(self, request, sequence, methods, description):
         if (not self.poisoned or self.mailbox.closed or not isinstance(request, dict)
-                or request.get("method") != "ping" or request.get("account_id") != self.account_id
+                or request.get("method") not in methods or request.get("account_id") != self.account_id
                 or not isinstance(request.get("request_id"), str) or type(sequence) is not int or sequence <= 0):
-            raise ShmProtocolError("timed-out ping recovery evidence is invalid")
+            raise ShmProtocolError("timed-out %s recovery evidence is invalid" % description)
         region = self.mailbox.region
         if not region.acquire(0):
             return False
         try:
             header = self.mailbox._header()
             if header[2] != READY or header[4] != sequence or header[6] != sequence - 1:
-                raise ShmProtocolError("timed-out ping mailbox identity or sequence changed")
+                raise ShmProtocolError("timed-out %s mailbox identity or sequence changed" % description)
             if header[5] != sequence:
+                if header[5] > sequence:
+                    raise ShmProtocolError("timed-out %s response sequence changed" % description)
                 return False
             if not 0 < header[7] <= REQUEST_CAPACITY or not 0 < header[8] <= RESPONSE_CAPACITY:
-                raise ShmProtocolError("timed-out ping frame length is invalid")
+                raise ShmProtocolError("timed-out %s frame length is invalid" % description)
             original = decode_payload(region.read(REQUEST_OFFSET, header[7]))
-            for field in ("schema_version", "request_id", "account_id", "method", "params", "environment"):
+            for field in ("schema_version", "request_id", "account_id", "method", "params", "environment",
+                          "position_read_route_contract"):
                 if field in request and original.get(field) != request[field]:
-                    raise ShmProtocolError("timed-out ping request identity changed")
+                    raise ShmProtocolError("timed-out %s request identity changed" % description)
             if original.get("session_id") != self.mailbox.session_id or original.get("sequence") != sequence:
-                raise ShmProtocolError("timed-out ping request session changed")
+                raise ShmProtocolError("timed-out %s request session changed" % description)
             response = decode_payload(region.read(RESPONSE_OFFSET, header[8]))
             self._validate_response(original, response)
             if "environment" in original and response.get("environment") != original["environment"]:
-                raise ShmProtocolError("timed-out ping response environment changed")
+                raise ShmProtocolError("timed-out %s response environment changed" % description)
             header[6] = sequence
             self.mailbox._write_header(header)
             self.poisoned = False
