@@ -29,6 +29,36 @@ SPEC.loader.exec_module(FIXTURE)
 class RpcWireTest(FIXTURE.BridgeFixture):
     quote_symbols = ("000001.SZ", "600000.SH")
 
+    def test_timed_out_ping_can_ack_only_its_own_late_response(self):
+        client = ShmReadOnlyClient(FIXTURE.NAME, FIXTURE.ACCOUNT, region=FIXTURE.MemoryRegion(self.state))
+        self.clients.append(client)
+        request = {"schema_version": 1, "request_id": "late-ping", "account_id": FIXTURE.ACCOUNT,
+                   "method": "ping", "params": {}, "read_expires_at_unix": time.time() + 1}
+        with pytest.raises(ShmTimeoutError) as caught:
+            client.send_request(request, timeout_seconds=.02)
+        sequence = caught.value.sequence
+        assert client.poisoned and client.recover_timed_out_ping(request, sequence) is False
+        assert self.mailbox._header()[6] == sequence - 1
+        self.bridge.drain()
+        with pytest.raises(ShmProtocolError, match="request identity changed"):
+            client.recover_timed_out_ping({**request, "request_id": "wrong"}, sequence)
+        assert client.poisoned and self.mailbox._header()[6] == sequence - 1
+        assert client.recover_timed_out_ping(request, sequence) is True
+        assert not client.poisoned and self.mailbox._header()[6] == sequence
+        assert self.roundtrip(client, "ping")["ok"] is True
+
+    def test_timed_out_non_ping_cannot_be_acknowledged_by_ping_recovery(self):
+        client = ShmReadOnlyClient(FIXTURE.NAME, FIXTURE.ACCOUNT, region=FIXTURE.MemoryRegion(self.state))
+        self.clients.append(client)
+        request = {"schema_version": 1, "request_id": "not-ping", "account_id": FIXTURE.ACCOUNT,
+                   "method": "get_positions", "params": {}, "read_expires_at_unix": time.time() + 1}
+        with pytest.raises(ShmTimeoutError) as caught:
+            client.send_request(request, timeout_seconds=.02)
+        self.bridge.drain()
+        with pytest.raises(ShmProtocolError, match="recovery evidence"):
+            client.recover_timed_out_ping(request, caught.value.sequence)
+        assert client.poisoned and self.mailbox._header()[6] == caught.value.sequence - 1
+
     def make_rpc(self):
         def native_factory(name, account):
             client = ShmReadOnlyClient(name, account, region=FIXTURE.MemoryRegion(self.state))

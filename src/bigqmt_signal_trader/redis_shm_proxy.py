@@ -42,6 +42,23 @@ EXECUTION_METHODS = frozenset((
     "ping", "get_asset", "get_positions", "query_orders", "query_trades",
     "query_execution_snapshot", "get_trade_login_state", "poll_execution_events",
 ))
+VM_QUEUE_CLAIM = """
+-- VM_QUEUE_CLAIM_V1
+if redis.call('EXISTS', KEYS[2]) ~= 0 then return -1 end
+if redis.call('LINDEX', KEYS[1], 0) ~= ARGV[1] then return 0 end
+redis.call('LPOP', KEYS[1])
+return 1
+"""
+VM_QUEUE_PRESERVE_UNCERTAIN = """
+-- VM_QUEUE_PRESERVE_UNCERTAIN_V1
+local existing = redis.call('GET', KEYS[2])
+if existing then
+    if existing == ARGV[1] then return 1 else return -1 end
+end
+redis.call('SET', KEYS[2], ARGV[1])
+if redis.call('LINDEX', KEYS[1], 0) == ARGV[1] then redis.call('LPOP', KEYS[1]) end
+return 1
+"""
 QUOTE_METHODS = frozenset(("get_ticks", "get_full_tick"))
 PURE_READ_METHODS = EXECUTION_METHODS | QUOTE_METHODS | frozenset(("get_local_data", "get_market_data_ex", "get_market_data_ex_batch"))
 RUNTIME_POLICIES = frozenset(("BOUNDED", "PERSISTENT_READONLY", "PERSISTENT_SIMULATION_READ_WRITE", "PERSISTENT_LIVE_READ_WRITE"))
@@ -498,6 +515,9 @@ class RedisShmReadOnlyProxy:
         self._resources_closed = False
         self.stop_reason = ""
         self._isolation_reason = ""
+        self._pending_ping_recovery = None
+        self._pending_dequeue_recovery = None
+        self._uncertain_dequeue_ids = set()
         self._lock = threading.Lock()
         self._poll_lock = threading.Lock()
         self._read_only_queue_cursor = 0
@@ -2497,8 +2517,10 @@ class RedisShmReadOnlyProxy:
                 self._source_identity = result
                 if self.allow_order_methods and self._source_binding() is None:
                     raise ShmProtocolError("write source requires two matching actual Windows sessions")
-                if self.execution_cursor_guard_target is not None:
+                if (self.execution_cursor_guard_target is not None
+                        or self.previous_source_unknown_target is not None):
                     self._capture_native_process_identity()
+                if self.execution_cursor_guard_target is not None:
                     self._observe_native_read_state(result["execution"], request)
                     self._last_execution_success_at = time.monotonic()
                     self._last_execution_identity_success_at = self._last_execution_success_at
@@ -3357,6 +3379,8 @@ class RedisShmReadOnlyProxy:
             raise ShmProtocolError("proxy already has an in-flight operation")
         try:
             self._ensure_open()
+            if self._pending_ping_recovery is not None or self._pending_dequeue_recovery is not None:
+                raise ShmBusyError("previous receive is still being verified")
             if not self._verified:
                 raise ShmProtocolError("explicit identity handshake required")
             if not isinstance(request, dict):
@@ -3377,6 +3401,16 @@ class RedisShmReadOnlyProxy:
             # 先拒绝无法安全寻址的请求；不写任意 custom 回复键。
             reply = self._reply_request(request)
             rid = request["request_id"]
+            if rid in self._uncertain_dequeue_ids:
+                response = self._response(request, ShmProtocolError("previous dequeue was unconfirmed; not forwarded"),
+                                          "REDIS_DEQUEUE_UNCONFIRMED", unknown=True)
+                try:
+                    self._operation_phase = "REDIS_RESPONSE_PUBLISH"
+                    self.transport.send_response(reply, response)
+                except (RedisConnectionError, RedisTimeoutError) as exc:
+                    self._record_error(exc)
+                    self._redis_retry_at = time.monotonic() + 1.0
+                return response
             reservation = None
             write_settlement = None
             confirmed_no_write = False
@@ -3684,7 +3718,19 @@ class RedisShmReadOnlyProxy:
                             response = self._response(request, exc, "SHM_RESULT_UNCONFIRMED", unknown=True)
                             if read_timing is not None:
                                 response["read_timing"] = dict(read_timing)
-                            if self.environment == "LIVE" and route == "readonly" and fault_route == "readonly":
+                            recover_ping = (self.environment == "LIVE" and self.receive_policy == "QUEUE_ONLY"
+                                and self.runtime_policy == "PERSISTENT_LIVE_READ_WRITE"
+                                and self.previous_source_unknown_target == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
+                                and request["method"] == "ping" and route == fault_route == "execution"
+                                and self._operation_phase == "SHM_FORWARD" and isinstance(exc, ShmTimeoutError)
+                                and getattr(exc, "publication_state", None) == "UNKNOWN"
+                                and getattr(exc, "previous_unconfirmed", None) is False
+                                and getattr(exc, "request_id", None) == rid
+                                and getattr(exc, "session_id", None) == self._sessions[route]
+                                and type(getattr(exc, "sequence", None)) is int and exc.sequence > 0)
+                            if recover_ping:
+                                self._pending_ping_recovery = {"request": forwarded, "sequence": exc.sequence}
+                            elif self.environment == "LIVE" and route == "readonly" and fault_route == "readonly":
                                 # 旧协议无法证明双源故障隔离；保留代理和原帧，隔离全部新请求并停写。
                                 self._mark_route_fault("readonly", "RESULT_UNKNOWN", request, "UNKNOWN",
                                                        previous_unconfirmed=None)
@@ -3914,6 +3960,38 @@ class RedisShmReadOnlyProxy:
             self._ensure_open()
             if not self._verified:
                 raise ShmProtocolError("explicit identity handshake required")
+            if self._pending_dequeue_recovery is not None:
+                if time.monotonic() < self._redis_retry_at:
+                    return None
+                self._operation_phase = "REDIS_QUEUE_PRESERVE_UNCERTAIN"
+                pending = self._pending_dequeue_recovery
+                try:
+                    result = self.transport.listen_redis.eval(VM_QUEUE_PRESERVE_UNCERTAIN, 2,
+                        self.transport.request_queue, pending["marker"], pending["raw"])
+                except (RedisConnectionError, RedisTimeoutError) as exc:
+                    self._record_error(exc)
+                    self._redis_retry_at = time.monotonic() + 1.0
+                    return None
+                if result != 1:
+                    self._seal("REDIS_QUEUE_PRESERVE_UNCERTAIN_FAILED")
+                    return None
+                self._pending_dequeue_recovery = None
+                return None
+            if self._pending_ping_recovery is not None:
+                self._operation_phase = "SHM_PING_RECOVERY"
+                pending = self._pending_ping_recovery
+                try:
+                    self._check_native_process_identity()
+                    done = self._clients["execution"].recover_timed_out_ping(pending["request"], pending["sequence"])
+                except Exception as exc:
+                    self._record_error(exc)
+                    self._seal("SHM_PING_RECOVERY_UNCONFIRMED")
+                    return None
+                if not done:
+                    return None
+                self._unconfirmed_read_ids["execution"].discard(pending["request"]["request_id"])
+                self._pending_ping_recovery = None
+                return None
             restricted_reads = False
             if (self.environment == "LIVE" and self.runtime_policy == "PERSISTENT_LIVE_READ_WRITE"
                     and self.execution_cursor_guard_target is not None):
@@ -3984,6 +4062,41 @@ class RedisShmReadOnlyProxy:
                     return None
                 if restricted_reads:
                     return self._poll_verified_read_while_identity_pending(length)
+                if (self.environment == "LIVE" and self.receive_policy == "QUEUE_ONLY"
+                        and self.runtime_policy == "PERSISTENT_LIVE_READ_WRITE"
+                        and self.execution_cursor_guard_target is None
+                        and self.previous_source_unknown_target == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}):
+                    self._operation_phase = "REDIS_QUEUE_INSPECT_HEAD"
+                    try:
+                        raw = self.transport.listen_redis.lindex(self.transport.request_queue, 0)
+                    except (RedisConnectionError, RedisTimeoutError) as exc:
+                        self._record_error(exc)
+                        self._redis_retry_at = time.monotonic() + 1.0
+                        return None
+                    if raw is None:
+                        return None
+                    marker = "aqp:redis_shm:uncertain_dequeue:%s:%s" % (self.account_id, uuid.uuid4().hex)
+                    self._operation_phase = "REDIS_QUEUE_CLAIM"
+                    try:
+                        claimed = self.transport.listen_redis.eval(VM_QUEUE_CLAIM, 2,
+                            self.transport.request_queue, marker, raw)
+                    except (RedisConnectionError, RedisTimeoutError) as exc:
+                        self._record_error(exc)
+                        try:
+                            item = json.loads(decode_rpc_request_payload(decode_text(raw)))
+                            rid = item.get("request_id") if isinstance(item, dict) else None
+                            if isinstance(rid, str) and rid:
+                                self._uncertain_dequeue_ids.add(rid)
+                        except (ValueError, TypeError, UnicodeError):
+                            pass
+                        self._pending_dequeue_recovery = {"marker": marker, "raw": raw}
+                        self._redis_retry_at = time.monotonic() + 1.0
+                        return None
+                    if claimed == 0:
+                        return None
+                    if claimed != 1:
+                        raise ShmProtocolError("queue claim outcome is invalid")
+                    return self.process_raw(raw, source="queue")
                 self._operation_phase = "REDIS_QUEUE_LPOP"
                 raw = self.transport.listen_redis.lpop(self.transport.request_queue)
                 return None if raw is None else self.process_raw(raw, source="queue")

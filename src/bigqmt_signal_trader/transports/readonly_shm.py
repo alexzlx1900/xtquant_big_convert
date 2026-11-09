@@ -560,5 +560,39 @@ class ShmReadOnlyClient:
             if response.get(field) != request.get(field):
                 raise ShmProtocolError("response %s mismatch" % field)
 
+    def recover_timed_out_ping(self, request, sequence):
+        """只确认同一条已完成的心跳，不重发原请求或处理交易帧。"""
+        if (not self.poisoned or self.mailbox.closed or not isinstance(request, dict)
+                or request.get("method") != "ping" or request.get("account_id") != self.account_id
+                or not isinstance(request.get("request_id"), str) or type(sequence) is not int or sequence <= 0):
+            raise ShmProtocolError("timed-out ping recovery evidence is invalid")
+        region = self.mailbox.region
+        if not region.acquire(0):
+            return False
+        try:
+            header = self.mailbox._header()
+            if header[2] != READY or header[4] != sequence or header[6] != sequence - 1:
+                raise ShmProtocolError("timed-out ping mailbox identity or sequence changed")
+            if header[5] != sequence:
+                return False
+            if not 0 < header[7] <= REQUEST_CAPACITY or not 0 < header[8] <= RESPONSE_CAPACITY:
+                raise ShmProtocolError("timed-out ping frame length is invalid")
+            original = decode_payload(region.read(REQUEST_OFFSET, header[7]))
+            for field in ("schema_version", "request_id", "account_id", "method", "params", "environment"):
+                if field in request and original.get(field) != request[field]:
+                    raise ShmProtocolError("timed-out ping request identity changed")
+            if original.get("session_id") != self.mailbox.session_id or original.get("sequence") != sequence:
+                raise ShmProtocolError("timed-out ping request session changed")
+            response = decode_payload(region.read(RESPONSE_OFFSET, header[8]))
+            self._validate_response(original, response)
+            if "environment" in original and response.get("environment") != original["environment"]:
+                raise ShmProtocolError("timed-out ping response environment changed")
+            header[6] = sequence
+            self.mailbox._write_header(header)
+            self.poisoned = False
+            return True
+        finally:
+            region.release()
+
     def close(self):
         self.mailbox.close()
