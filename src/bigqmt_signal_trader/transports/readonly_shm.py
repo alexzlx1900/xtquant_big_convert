@@ -572,6 +572,39 @@ class ShmReadOnlyClient:
         """确认同一条已完成的账户只读帧，旧调用结果仍保持未知。"""
         return self._recover_timed_out_frame(request, sequence, RECOVERABLE_ACCOUNT_READ_METHODS, "account read")
 
+    def recover_completed_request(self, request, sequence):
+        """只为目标实盘释放已完整回读的旧帧；不重执行业务或改写原 UNKNOWN。"""
+        if (self.account_id != "8882152350" or not isinstance(request, dict)
+                or request.get("environment") != "LIVE"):
+            raise ShmProtocolError("request-scoped completion requires the exact LIVE account")
+        return self._recover_timed_out_frame(request, sequence, frozenset((request.get("method"),)), "request")
+
+    def recover_completed_orphan(self):
+        """代理重启后只回读已完成的旧帧；在途帧仍不可覆盖。"""
+        if self.account_id != "8882152350" or self.mailbox.closed:
+            raise ShmProtocolError("orphan completion requires the exact LIVE account")
+        region = self.mailbox.region
+        if not region.acquire(0):
+            return False
+        try:
+            header = self.mailbox._header()
+            if (header[2] != READY or header[3] != self.mailbox.server_pid
+                    or header[9].hex() != self.mailbox.session_id):
+                raise ShmProtocolError("orphan mailbox identity changed")
+            if header[4] == header[6]:
+                self.poisoned = False
+                return True
+            if not 0 < header[7] <= REQUEST_CAPACITY:
+                raise ShmProtocolError("orphan request frame is invalid")
+            request = decode_payload(region.read(REQUEST_OFFSET, header[7]))
+            if request.get("account_id") != self.account_id or request.get("environment") != "LIVE":
+                raise ShmProtocolError("orphan request account/environment mismatch")
+            sequence = header[4]
+            self.poisoned = True
+        finally:
+            region.release()
+        return self.recover_completed_request(request, sequence)
+
     def _recover_timed_out_frame(self, request, sequence, methods, description):
         if (not self.poisoned or self.mailbox.closed or not isinstance(request, dict)
                 or request.get("method") not in methods or request.get("account_id") != self.account_id

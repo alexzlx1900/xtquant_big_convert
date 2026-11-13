@@ -77,6 +77,48 @@ class FakeRedis:
         self.ledger_lock = threading.Lock()
 
     def eval(self, script, key_count, *args):
+        if "VM_QUEUE_CLAIM_V1" in script:
+            queue, marker, invalid, raw, kind = args
+            self._record("eval", "dequeue", queue)
+            with self.ledger_lock:
+                values = self.queues.get(queue, [])
+                if not values or values[0] != raw:
+                    return 0
+                if kind == "invalid":
+                    self.queues[invalid] = ([raw] + self.queues.get(invalid, []))[:1000]
+                values.pop(0)
+                return 1
+        if "REQUEST_SCOPED_WRITE_V1" in script:
+            assert key_count == 3
+            ledger, business, cid_index, rid, capacity, encoded, key, cid = args
+            self._record("eval", "claim", ledger, rid)
+            if self.fail_eval == "claim":
+                raise RuntimeError("injected ledger failure")
+            with self.ledger_lock:
+                rows = self.hashes.setdefault(ledger, {})
+                if rid in rows:
+                    return [0, rows[rid]]
+                owner = self.hashes.get(business, {}).get(key) or self.hashes.get(cid_index, {}).get(cid)
+                for old_rid, raw in rows.items():
+                    try:
+                        fp = json.loads(json.loads(raw)["fingerprint"])
+                        params = fp[3]
+                        old_key = ("cancel:" + str(params.get("order_sys_id") or params.get("order_id"))
+                                   if fp[2] == "cancel_order" else
+                                   "submit:" + str(params.get("client_order_id") or params.get("remark") or params.get("user_order_id")))
+                        if key == old_key:
+                            owner = old_rid
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                if owner:
+                    return [-2, owner]
+                if len(rows) >= capacity:
+                    return [-1, ""]
+                rows[rid] = encoded
+                self.hashes.setdefault(business, {})[key] = rid
+                if cid:
+                    self.hashes.setdefault(cid_index, {})[cid] = rid
+                return [1, encoded]
         if "ROTATION_CLOSE_CLAIM_V1" in script or "ROTATION_CLOSE_SETTLE_V1" in script:
             assert key_count == 2
             key, close_key, rid, raw, pending, *remaining = args
@@ -194,6 +236,10 @@ class FakeRedis:
         self._record("lpop", queue)
         values = self.queues.get(queue, [])
         return values.pop(0) if values else None
+
+    def lindex(self, queue, index):
+        values = self.queues.get(queue, [])
+        return values[index] if 0 <= index < len(values) else None
 
     def llen(self, queue):
         self._record("llen", queue)

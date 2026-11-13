@@ -18,7 +18,10 @@ def test_completed_read_partial_fanout_failure_keeps_source_and_next_read(phase,
     proxy, provider, _, native = make_proxy(receive_policy="QUEUE_ONLY")
     original = getattr(provider, phase)
     failed = request("poll_execution_events", rid="lost-response", params={"after_sequence": 0})
-    native.result = {"events": [], "latest_sequence": 0}
+    native.result = {"events": [], "latest_sequence": 0, "oldest_sequence": 1,
+        "dropped_before_sequence": 0, "lost_sequence": 0, "gap": False, "automatic_retry": False,
+        "account_id": proxy.account_id, "environment": "LIVE", "session_id": "execution-sid",
+        "native_pid": 2852, "windows_session_id": 1}
     with mock.patch.object(provider, phase, side_effect=error("read response unavailable")):
         response = proxy.process_request(failed)
     assert response["ok"] and not proxy.stopped
@@ -66,7 +69,7 @@ def test_write_publication_timeout_still_seals_and_preserves_ledger(method):
     with mock.patch.object(provider, "rpush", side_effect=RedisTimeoutError("partial write response")):
         with pytest.raises(RedisTimeoutError):
             proxy.process_request(request(method, rid="uncertain-write"))
-    assert proxy.stopped and len(native.calls) == 2
+    assert not proxy.stopped and not proxy.isolation_reason and len(native.calls) == 2
     assert json.loads(provider.hashes[LEDGER]["uncertain-write"])["state"] == "PUBLISH_UNCONFIRMED"
     assert proxy.diagnostic_snapshot()["read_publish_failures"] == 0
     proxy.close()
@@ -76,11 +79,10 @@ def test_native_unknown_then_redis_timeout_cannot_use_read_recovery():
     proxy, provider, _, native = make_proxy(receive_policy="QUEUE_ONLY")
     native.failure = TimeoutError("native result not confirmed")
     with mock.patch.object(provider, "setex", side_effect=RedisTimeoutError("offline")):
-        with pytest.raises(RedisTimeoutError):
-            proxy.process_request(request())
-    assert proxy.stopped and proxy.stop_reason == "SHM_RESULT_UNCONFIRMED"
+        response = proxy.process_request(request())
+    assert response["status"] == "UNKNOWN" and not proxy.stopped and not proxy.isolation_reason
     assert proxy.diagnostic_snapshot()["first_error"]["error_phase"] == "SHM_FORWARD"
-    assert proxy.diagnostic_snapshot()["read_publish_failures"] == 0
+    assert proxy.diagnostic_snapshot()["read_publish_failures"] == 1
     proxy.close()
 
 

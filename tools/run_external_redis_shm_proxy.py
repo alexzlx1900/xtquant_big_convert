@@ -369,7 +369,28 @@ def _write_update_stop_marker(path, value):
 
 
 def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=None, ready_observer=None):
-    """显式运行政策；仅空闲只读队列检查允许有限恢复，不重发业务、不删键。"""
+    """VM 仅重建已关闭的通信资源；业务请求与写账本从不重发或清空。"""
+    scoped = (isinstance(value, dict) and value.get("account_id") == "8882152350" and value.get("environment") == "LIVE"
+              and value.get("runtime_policy") == "PERSISTENT_LIVE_READ_WRITE")
+    while True:
+        result = _run_candidate_once(value, redis_factory, shm_factory,
+                                     stop_event=stop_event, ready_observer=ready_observer)
+        if not scoped or result["status"] != "FAILED" or not result.get("resources_closed"):
+            return result
+        if stop_event is not None and stop_event.wait(1):
+            return result
+        if stop_event is None:
+            time.sleep(1)
+        control = _update_stop_control()
+        if control is not None and control[0].exists():
+            if json.loads(control[0].read_text(encoding="utf-8")) != control[1]:
+                raise ValueError("INVALID_PROXY_UPDATE_STOP_REQUEST")
+            _write_update_stop_marker(control[0].with_name("proxy-stop-receipt.json"), control[1])
+            return dict(result, status="STOP_REQUESTED")
+
+
+def _run_candidate_once(value, redis_factory=None, shm_factory=None, *, stop_event=None, ready_observer=None):
+    """单次通信资源生命周期；目标 VM 故障交给外层恢复，不重发金融业务。"""
     config = validate_config(value)
     update_stop = _update_stop_control()
     update_stop_requested = False
@@ -405,10 +426,14 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         redis_client = (redis_factory or create_redis_client)(config["redis"])
         transport = RedisTransport(redis_client, account_id=config["account_id"])
         factory = shm_factory or ShmReadOnlyClient
-        phase = "SHM_READ_CLIENT_CREATE"
-        clients.append(factory(config["read_name"], config["account_id"]))
-        phase = "SHM_EXECUTION_CLIENT_CREATE"
-        clients.append(factory(config["execution_name"], config["account_id"]))
+        for route in ("read", "execution"):
+            phase = "SHM_" + route.upper() + "_CLIENT_CREATE"
+            try:
+                clients.append(factory(config[route + "_name"], config["account_id"]))
+            except Exception:
+                if not (persistent_live and config["account_id"] == "8882152350"):
+                    raise
+                clients.append(None)
         phase = "PROXY_CREATE"
         if config["execution_cursor_guard_target"] is not None and config["allow_order_methods"]:
             try:
@@ -448,22 +473,43 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
             phase = "NATIVE_SUPERVISOR_ATTACH"
             proxy.attach_native_supervisor()
         phase = "IDENTITY_VERIFY"
-        proxy.verify_identity()
+        try:
+            proxy.verify_identity()
+        except Exception as exc:
+            if not proxy._request_scoped_faults:
+                raise
+            proxy._record_error(exc)
         if (config["execution_cursor_guard_target"] == {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
                 and supervisor_gate is not None and rotation_channel is not None):
             rotation_driver = ReadonlyRotationDriver(proxy)
-        evidence = dict(proxy.identity_snapshot(), status="READY", automatic_retry=False)
+        ready_announced = proxy.verified
         phase = "READY_OBSERVER"
         _emit_proxy_health(config, proxy)
-        (ready_observer or _emit_ready)(evidence)
+        if ready_announced:
+            (ready_observer or _emit_ready)(dict(proxy.identity_snapshot(), status="READY", automatic_retry=False))
         if update_stop is not None:
-            _write_update_stop_marker(update_stop[0].with_name("proxy-stop-ready.json"), update_stop[1])
+            ready_path = update_stop[0].with_name("proxy-stop-ready.json")
+            if ready_path.exists():
+                if json.loads(ready_path.read_text(encoding="utf-8")) != update_stop[1]:
+                    raise ValueError("INVALID_PROXY_UPDATE_STOP_READY")
+            else:
+                _write_update_stop_marker(ready_path, update_stop[1])
         stop_requested = False
         reported_error_at = None
         reported_rotation_block = False
         last_health_at = time.monotonic()
         last_health_state = None
+        next_client_retry = 0
         while not proxy.stopped:
+            if proxy._request_scoped_faults and time.monotonic() >= next_client_retry:
+                next_client_retry = time.monotonic() + 1
+                for index, route in enumerate(("readonly", "execution")):
+                    if proxy._clients[route] is None:
+                        try:
+                            name = config["read_name" if index == 0 else "execution_name"]
+                            clients[index] = proxy._clients[route] = factory(name, config["account_id"])
+                        except Exception as exc:
+                            proxy._record_error(exc)
             if update_stop is not None:
                 try:
                     command = json.loads(update_stop[0].read_text(encoding="utf-8"))
@@ -492,6 +538,9 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                 proxy._record_error(exc)
                 proxy._seal("RECEIVE_LOOP_FAILED")
                 response = None
+            if proxy.verified and not ready_announced:
+                (ready_observer or _emit_ready)(dict(proxy.identity_snapshot(), status="READY", automatic_retry=False))
+                ready_announced = True
             if rotation_driver is not None and not getattr(proxy, "isolation_reason", ""):
                 rotation_driver.step()
                 if rotation_driver.blocked and not reported_rotation_block:
@@ -534,7 +583,7 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
         if proxy is not None:
             result["processed_requests"] = proxy.processed_count
         if persistent_live:
-            # 启动或运行异常只隔离本账户；不重新连接、握手、取件或重发。
+            # 目标 VM 关闭旧通信资源后交给外层恢复；金融账本及未确认结果始终保留。
             if proxy is not None:
                 proxy._seal("RUNNER_FAILURE")
             reason = (getattr(proxy, "isolation_reason", "") if proxy is not None else "") or "RUNNER_" + phase
@@ -542,8 +591,9 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                 _emit_proxy_health(config, proxy, startup_error=reason)
             except Exception:
                 pass
-            while stop_event is None or not stop_event.is_set():
-                time.sleep(0.2)
+            if config["account_id"] != "8882152350":
+                while stop_event is None or not stop_event.is_set():
+                    time.sleep(0.2)
     finally:
         if proxy is not None:
             diagnostics = proxy.diagnostic_snapshot()
@@ -572,6 +622,8 @@ def run_candidate(value, redis_factory=None, shm_factory=None, *, stop_event=Non
                     except Exception as exc:
                         errors.append(type(exc).__name__)
         for client in clients:
+            if client is None:
+                continue
             try:
                 client.close()
             except Exception as exc:

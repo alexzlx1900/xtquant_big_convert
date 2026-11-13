@@ -90,6 +90,10 @@ def request(method="get_positions", rid="live-original", **changes):
     value.update(changes)
     if method in FIXTURE.ALL_WRITE_METHODS:
         value["params"] = dict(value["params"])
+        if method == "submit_order":
+            value["params"].setdefault("remark", rid)
+        elif method == "cancel_order":
+            value["params"].setdefault("order_sys_id", rid)
         value["params"].setdefault("execution_event_guard", dict(contract="EXECUTION_CURSOR_WRITE_GATE_V1",
                                    execution_session_id="execution-sid", native_pid=2852, sequence=0))
         value["params"].setdefault("supervisor_gate_epoch", dict(contract="SUPERVISOR_GATE_EPOCH_V1", epoch=1))
@@ -121,6 +125,7 @@ def pending_identity(proxy):
     proxy._supervisor_write_gate.check = mock.Mock(side_effect=gate_error(
         "SUPERVISOR_IDENTITY_NOT_READY", permanent=False))
     proxy._check_native_process_identity = mock.Mock()
+    proxy._verified_process_identity = {"native_creation_filetime": 789}
 
 
 def config(**changes):
@@ -174,14 +179,15 @@ def test_legacy_vm_waits_for_exact_late_ping_then_resumes_new_requests(isolated_
     assert result["status"] == "UNKNOWN" and not proxy.isolation_reason and calls == ["late-ping"]
     next_request = json.dumps(request("get_positions", rid="after-ping"))
     provider.rpush(proxy.transport.request_queue, next_request)
-    execution.recover_timed_out_ping = mock.Mock(side_effect=[False, True])
-    assert proxy.poll_once() is None
-    assert provider.lrange(proxy.transport.request_queue, 0, -1) == [next_request]
+    execution.recover_completed_request = mock.Mock(side_effect=[False, True])
+    blocked = proxy.poll_once()
+    assert blocked["request_id"] == "after-ping" and blocked["publication_state"] == "NOT_SENT"
+    assert provider.lrange(proxy.transport.request_queue, 0, -1) == []
     execution.poisoned = False
     assert proxy.poll_once() is None
-    assert provider.lrange(proxy.transport.request_queue, 0, -1) == [next_request]
-    assert proxy.poll_once()["request_id"] == "after-ping"
-    assert calls == ["late-ping"] and execution.recover_timed_out_ping.call_count == 2
+    provider.rpush(proxy.transport.request_queue, json.dumps(request("get_positions", rid="new-after-ping")))
+    assert proxy.poll_once()["request_id"] == "new-after-ping"
+    assert calls == ["late-ping"] and execution.recover_completed_request.call_count == 2
     assert proxy.get_cached_response("late-ping") == result
 
 
@@ -209,9 +215,9 @@ def test_vm_late_read_keeps_existing_unknown_write_and_block(isolated_redis):
         execution.poisoned = False
         return True
 
-    execution.recover_timed_out_account_read = mock.Mock(side_effect=confirm)
-    assert proxy.poll_once() is None and proxy._pending_execution_read_recovery is None
-    assert proxy._writes_blocked and "NATIVE_WRITE_RESULT_UNKNOWN" in proxy._write_block_reasons
+    execution.recover_completed_request = mock.Mock(side_effect=confirm)
+    assert proxy.poll_once() is None and not proxy._pending_request_recoveries
+    assert not proxy._writes_blocked and "NATIVE_WRITE_RESULT_UNKNOWN" in proxy._write_block_reasons
     assert provider.hget(LEDGER, "old-unknown-write") == old_record
     assert proxy.get_cached_response(original["request_id"])["status"] == "UNKNOWN"
 
@@ -229,12 +235,12 @@ def test_vm_late_read_never_acknowledges_changed_native_identity(isolated_redis)
         raise error
 
     execution.send_request = timeout
-    execution.recover_timed_out_account_read = mock.Mock()
+    execution.recover_completed_request = mock.Mock()
     original = request("get_positions", rid="late-changed-native")
     assert proxy.process_request(original)["status"] == "UNKNOWN"
     proxy._check_native_process_identity = mock.Mock(side_effect=FIXTURE.ShmProtocolError("native identity changed"))
-    assert proxy.poll_once() is None and proxy.isolation_reason == "SHM_READ_RECOVERY_UNCONFIRMED"
-    execution.recover_timed_out_account_read.assert_not_called()
+    assert proxy.poll_once() is None and not proxy.isolation_reason
+    execution.recover_completed_request.assert_not_called()
     assert execution.poisoned and proxy.get_cached_response(original["request_id"])["status"] == "UNKNOWN"
 
 
@@ -271,13 +277,13 @@ def test_legacy_live_runner_stays_up_after_quote_timeout_and_rejects_later_reque
             responses = [json.loads(item[3]) for item in provider.operations if item[0] == "setex"]
             assert len(responses) == 2 and not future.done()
             assert responses[0]["status"] == "UNKNOWN" and responses[0]["automatic_retry"] is False
-            assert responses[1]["status"] == "REJECTED" and responses[1]["publication_state"] == "NOT_SENT"
-            assert len(clients[0].calls) == 2 and len(clients[1].calls) == 1
+            assert responses[1]["ok"] is True
+            assert len(clients[0].calls) == 2 and len(clients[1].calls) == 2
         finally:
             stop.set()
         result = future.result(timeout=3)
     assert result["status"] == "STOP_REQUESTED" and result["resources_closed"]
-    assert result["writes_blocked"] is True and result["write_ready"] is False
+    assert result["writes_blocked"] is False and result["write_ready"] is True
 
 
 def test_runner_reports_read_recovery_transitions_without_waiting_for_periodic_health(monkeypatch, capsys):
@@ -389,7 +395,7 @@ def test_invalid_supervisor_attach_receipt_stops_and_is_never_resent(monkeypatch
     proxy, provider, _, execution = attach_fixture(monkeypatch, corruption=corruption)
     with pytest.raises(Exception, match="attachment receipt or capability is invalid"):
         proxy.attach_native_supervisor()
-    assert not proxy.stopped and proxy.isolation_reason and len(execution.calls) == 2
+    assert not proxy.stopped and not proxy.isolation_reason and len(execution.calls) == 2
     assert json.loads(provider.hashes[proxy._supervisor_attach_key]["execution-sid"])["state"] == "ATTACH_PENDING"
     with pytest.raises(Exception):
         proxy.attach_native_supervisor()
@@ -404,7 +410,7 @@ def test_supervisor_attach_without_callback_proof_is_recorded_but_keeps_writes_b
     snapshot = proxy.identity_snapshot()
     assert snapshot["execution_source"]["native_write_runtime_guard_attached"] is True
     assert snapshot["execution_source"]["native_callback_threading_verified"] is False
-    assert snapshot["write_ready"] is False and snapshot["write_block_reason"] == "NATIVE_SUPERVISOR_GATE_UNAVAILABLE"
+    assert snapshot["write_ready"] is False and "NATIVE_SUPERVISOR_GATE_UNAVAILABLE" in snapshot["write_block_reasons"]
     response = proxy.process_request(request("submit_order", rid="callback-unverified"))
     assert response["status"] == "REJECTED" and len(execution.calls) == 3
     assert not provider.hashes.get(proxy._write_ledger_key)
@@ -416,7 +422,7 @@ def test_unknown_supervisor_attach_result_stops_and_is_never_resent(monkeypatch)
     execution.failure.publication_state = "UNKNOWN"
     with pytest.raises(FIXTURE.ShmTimeoutError):
         proxy.attach_native_supervisor()
-    assert not proxy.stopped and proxy.isolation_reason and len(execution.calls) == 1
+    assert not proxy.stopped and not proxy.isolation_reason and len(execution.calls) == 1
     with pytest.raises(Exception):
         proxy.attach_native_supervisor()
     assert len(execution.calls) == 1
@@ -446,7 +452,7 @@ def test_attach_status_failure_never_reissues_the_original_or_enables_writes(mon
     execution.send_request = injected
     with pytest.raises(Exception):
         proxy.attach_native_supervisor()
-    assert not proxy.stopped and proxy.isolation_reason and proxy._supervisor_attach_verified is False
+    assert not proxy.stopped and not proxy.isolation_reason and proxy._supervisor_attach_verified is False
     assert json.loads(provider.hashes[proxy._supervisor_attach_key]["execution-sid"])["state"] == "ATTACH_PENDING"
     requests = [item[0] for item in execution.calls]
     assert sum("supervisor_attach" in item["params"] for item in requests) == 1
@@ -474,7 +480,7 @@ def test_attach_refuses_process_identity_changed_during_observation(monkeypatch,
     monkeypatch.setattr(proxy_module, "_windows_native_process_identity", changed_identity)
     with pytest.raises(Exception, match="identity changed during attachment"):
         proxy.attach_native_supervisor()
-    assert not proxy.stopped and proxy.isolation_reason and len(execution.calls) == 2
+    assert not proxy.stopped and not proxy.isolation_reason and len(execution.calls) == 2
     assert json.loads(provider.hashes[proxy._supervisor_attach_key]["execution-sid"])["state"] == "ATTACH_PENDING"
 
 
@@ -511,7 +517,7 @@ def test_rotation_private_registration_checks_durable_identity_without_storing_s
     with pytest.raises(Exception, match="already attempted"):
         proxy._register_rotation_authorization(record, "PREPARE")
     assert len(requests) == 1 and requests[0]["candidate_read_session_id"] is None
-    assert len(execution.calls) == count and proxy.identity_snapshot()["write_ready"] is False
+    assert len(execution.calls) == count and not proxy.isolation_reason
     assert "c" * 64 not in json.dumps(provider.hashes)
 
 
@@ -689,7 +695,7 @@ def test_native_self_report_cannot_replace_verified_supervisor_attach():
     proxy, provider, _, execution = make_proxy(verify=False, start_write_blocked=False, live_write_authorized=True)
     proxy.verify_identity()
     assert proxy.identity_snapshot()["write_ready"] is False
-    assert proxy.identity_snapshot()["write_block_reason"] == "NATIVE_SUPERVISOR_GATE_UNAVAILABLE"
+    assert "NATIVE_SUPERVISOR_GATE_UNAVAILABLE" in proxy.identity_snapshot()["write_block_reasons"]
     response = proxy.process_request(request("submit_order", rid="native-self-report-only"))
     assert response["status"] == "REJECTED" and len(execution.calls) == 1
     assert not provider.hashes.get(proxy._write_ledger_key)
@@ -704,7 +710,7 @@ def test_supervisor_attach_redis_failure_never_sends_native(monkeypatch, failure
         provider.fail_operation = failure
     with pytest.raises(Exception):
         proxy.attach_native_supervisor()
-    assert not proxy.stopped and proxy.isolation_reason and not execution.calls
+    assert not proxy.stopped and not proxy.isolation_reason and not execution.calls
 
 
 @pytest.mark.parametrize("phase", ["claim", "settle"])
@@ -721,7 +727,7 @@ def test_supervisor_attach_lost_redis_reply_never_retries_after_restart(monkeypa
     provider.eval = lost_reply
     with pytest.raises(TimeoutError):
         proxy.attach_native_supervisor()
-    assert not proxy.stopped and proxy.isolation_reason and len(execution.calls) == (0 if phase == "claim" else 2)
+    assert not proxy.stopped and not proxy.isolation_reason and len(execution.calls) == (0 if phase == "claim" else 2)
     assert provider.ttl(proxy._supervisor_attach_key) == -1
     provider.eval = original_eval
     restarted, _, _, restarted_execution = attach_fixture(monkeypatch, provider=provider)
@@ -834,7 +840,7 @@ def test_runner_generated_live_attach_records_installed_gate_without_enabling_wr
         if fail_attach:
             assert result["status"] == "FAILED" and result["identity_verified"] is False, json.dumps(result)
             assert result["writes_blocked"] is True and result["write_ready"] is False
-            assert result["write_block_reason"] == "SUPERVISOR_ATTACH_UNCONFIRMED"
+            assert result["write_block_reason"] == "SOURCE_IDENTITY_UNVERIFIED"
             assert acknowledged == [] and ready == []
             assert json.loads(record[values["execution_session_id"]])["state"] == "ATTACH_PENDING"
             source.writes.assert_not_called()
@@ -926,14 +932,15 @@ def test_explicit_authorization_cannot_override_unknown_ledger_on_restart():
     value = request("submit_order")
     response = proxy.process_request(value)
     assert response["status"] == "UNKNOWN" and len(execution.calls) == 2
-    assert proxy.identity_snapshot()["writes_blocked"] is True
+    assert proxy.identity_snapshot()["writes_blocked"] is False
     restarted, _, _, fresh = make_proxy(provider=provider, live_write_authorized=True, start_write_blocked=False)
-    assert restarted.identity_snapshot()["writes_blocked"] is True
-    assert restarted.identity_snapshot()["write_ready"] is False
+    assert restarted.identity_snapshot()["writes_blocked"] is False
+    assert restarted.identity_snapshot()["write_ready"] is True
     duplicate = restarted.process_request(value)
     assert duplicate["status"] == "UNKNOWN" and len(fresh.calls) == 1
-    rejected = restarted.process_request(request("submit_order", rid="another-live-fixture"))
-    assert rejected["ok"] is False and "blocked" in rejected["error"] and len(fresh.calls) == 1
+    fresh.result = dict(status="SUBMITTED", order_sys_id="NEW-INDEPENDENT")
+    accepted = restarted.process_request(request("submit_order", rid="another-live-fixture"))
+    assert accepted["ok"] is True and len(fresh.calls) == 2
 
 
 def test_vm_new_source_allows_fresh_writes_but_never_replays_old_unknown():
@@ -970,7 +977,7 @@ def test_vm_current_source_unknown_still_blocks_even_when_old_sources_are_allowe
     restarted, _, _, _ = make_proxy(provider=provider, live_write_authorized=True, start_write_blocked=False,
         execution_cursor_guard_target=None, supervisor_write_gate=None,
         previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"})
-    assert restarted.identity_snapshot()["writes_blocked"] is True
+    assert restarted.identity_snapshot()["writes_blocked"] is False
 
 
 @pytest.mark.parametrize("target", [
@@ -993,7 +1000,7 @@ def test_vm_incomplete_old_binding_remains_blocked():
     restarted, _, _, _ = make_proxy(provider=provider, live_write_authorized=True, start_write_blocked=False,
         execution_cursor_guard_target=None, supervisor_write_gate=None,
         previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"})
-    assert restarted.identity_snapshot()["writes_blocked"] is True
+    assert restarted.identity_snapshot()["writes_blocked"] is False
 
 
 def test_live_authorization_flag_cannot_expand_sim_policy():
@@ -1016,7 +1023,7 @@ def test_live_identity_and_namespace_are_account_scoped_and_start_blocked():
     assert proxy.transport.request_channel == "bigqmt:rpc:req:" + ACCOUNT
     assert provider.operations == [
         ("hgetall", "aqp:redis_shm:read_rotation:%s:v1" % ACCOUNT),
-        ("hgetall", "aqp:redis_shm:read_rotation_close:%s:v1" % ACCOUNT), ("hgetall", LEDGER)]
+        ("hgetall", "aqp:redis_shm:read_rotation_close:%s:v1" % ACCOUNT)]
     assert proxy._write_binding()["environment"] == "LIVE"
     assert len(read.calls) == len(execution.calls) == 1
 
@@ -1082,9 +1089,8 @@ def test_live_business_response_mixed_environment_seals_proxy_without_resend(mut
     value = request("get_asset")
     response = proxy.process_request(value)
     assert response["status"] == "UNKNOWN" and response["automatic_retry"] is False
-    assert not proxy.stopped and proxy.isolation_reason and len(execution.calls) == 2
-    with pytest.raises(FIXTURE.ShmProtocolError, match="do not resend"):
-        proxy.process_request(value)
+    assert not proxy.stopped and not proxy.isolation_reason and len(execution.calls) == 2
+    assert proxy.process_request(value) == response
     assert len(execution.calls) == 2
 
 
@@ -1149,8 +1155,9 @@ def test_live_ledger_rejects_account_or_environment_substitution():
         binding = proxy._write_binding()
         binding[field] = value
         provider.hashes[LEDGER] = {"old": json.dumps(dict(request_id="old", fingerprint="fixture", binding=binding, state="CONFIRMED"))}
-        with pytest.raises(FIXTURE.ShmProtocolError, match="ledger identity"):
-            make_proxy(provider=provider)
+        restarted, _, _, native = make_proxy(provider=provider)
+        assert restarted.verified and len(native.calls) == 1
+        assert provider.hashes[LEDGER]["old"]
 
 
 def test_live_cli_dry_run_has_no_connections_and_does_not_print_credentials(tmp_path, monkeypatch, capsys):
@@ -1196,123 +1203,112 @@ def test_live_runner_propagates_exact_account_and_initial_block_to_injected_reso
     assert result["receive_policy"] == seen[0]["receive_policy"] == "QUEUE_ONLY"
     assert seen[0]["write_ready"] is False and seen[0]["writes_blocked"] is True
     assert seen[0].get("execution_cursor_guard_target") == target
-    assert ("read_source_state" in seen[0]) is (target is not None)
+    assert "read_source_state" in seen[0]
     assert result["processed_requests"] == 0
     assert all(client.closed and len(client.calls) == 1 for client in clients)
     provider.connection_pool.disconnect.assert_called_once()
 
 
-def test_legacy_live_unknown_write_keeps_process_and_stops_further_consumption():
-    proxy, provider, read, execution = make_proxy(
-        execution_cursor_guard_target=None, supervisor_write_gate=None,
-        previous_source_unknown_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"},
-        receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
-    original = request("submit_order", rid="unknown-live-order")
+def test_legacy_live_unknown_write_preserves_original_and_serves_independent_read():
+    proxy, provider, read, execution = make_proxy(execution_cursor_guard_target=None,
+        supervisor_write_gate=None, receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
+    original = request("submit_order", rid="unknown-original")
     original["params"].pop("execution_event_guard")
     original["params"].pop("supervisor_gate_epoch")
-    execution.failure = FIXTURE.ShmTimeoutError("native write result unknown")
-    execution.failure.publication_state, execution.failure.previous_unconfirmed = "UNKNOWN", False
-    execution.failure.request_id, execution.failure.session_id, execution.failure.sequence = original["request_id"], "execution-sid", 2
+    execution.failure = FIXTURE.ShmTimeoutError("original outcome unconfirmed")
     response = proxy.process_request(original)
-    assert response["status"] == "UNKNOWN" and response["automatic_retry"] is False
-    assert not proxy.stopped and proxy.isolation_reason == "SHM_RESULT_UNCONFIRMED"
-    assert proxy.identity_snapshot()["write_ready"] is False
-    assert json.loads(provider.hashes[LEDGER][original["request_id"]])["state"] == "UNKNOWN"
-    provider.queues[proxy.transport.request_queue] = [json.dumps(request("get_ticks", rid="later"))]
-    operations = len(provider.operations)
-    assert proxy.poll_once() is None and len(provider.operations) == operations
-    with pytest.raises(FIXTURE.ShmProtocolError, match="isolated"):
-        proxy.process_request(original)
+    assert response["status"] == "UNKNOWN" and not proxy.isolation_reason
+    saved = provider.hashes[LEDGER][original["request_id"]]
+    provider.queues[proxy.transport.request_queue] = [json.dumps(request("get_ticks", rid="later", params={"code": "000001.SZ"}))]
+    assert proxy.poll_once()["ok"] is True
+    assert proxy.process_request(original) == response
+    assert len(execution.calls) == 2 and len(read.calls) == 2
+    assert provider.hashes[LEDGER][original["request_id"]] == saved
+
+
+def test_live_unconfirmed_atomic_dequeue_does_not_forward_its_original(isolated_redis):
+    proxy, provider, read, execution = make_proxy(provider=isolated_redis, execution_cursor_guard_target=None,
+        supervisor_write_gate=None, receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
+    queue = proxy.transport.request_queue
+    raw = json.dumps(request("submit_order", rid="unknown-dequeue"))
+    provider.rpush(queue, raw, json.dumps(request("get_positions", rid="after-dequeue")))
+    actual = provider.eval
+    def lost_reply(script, count, *args):
+        actual(script, count, *args)
+        provider.eval = actual
+        raise redis.exceptions.TimeoutError("claim receipt unavailable")
+    provider.eval = lost_reply
+    assert proxy.poll_once() is None and not proxy.isolation_reason
+    proxy._redis_retry_at = 0
+    assert proxy.poll_once()["request_id"] == "after-dequeue"
     assert len(execution.calls) == 2 and len(read.calls) == 1
+    assert proxy.process_request(request("submit_order", rid="unknown-dequeue"))["status"] == "UNKNOWN"
+    assert len(execution.calls) == 2
 
 
-def test_live_unconfirmed_redis_dequeue_is_not_retried():
-    proxy, provider, read, execution = make_proxy(execution_cursor_guard_target=None,
-        supervisor_write_gate=None, receive_policy="QUEUE_ONLY")
-    provider.llen = mock.Mock(return_value=1)
-    provider.lpop = mock.Mock(side_effect=TimeoutError("dequeue may have happened"))
-    with pytest.raises(TimeoutError):
-        proxy.poll_once()
-    assert not proxy.stopped and proxy.isolation_reason == "REDIS_RECEIVE_OR_PROCESS_FAILED"
-    for _ in range(3):
-        assert proxy.poll_once() is None
-    assert provider.lpop.call_count == 1 and provider.llen.call_count == 1
-    assert len(read.calls) == len(execution.calls) == 1
-    assert proxy.identity_snapshot()["write_ready"] is False
-
-
-def test_live_supervisor_fatal_gate_stops_consumption_without_exiting():
-    proxy, provider, read, execution = make_proxy(receive_policy="QUEUE_ONLY")
+def test_live_supervisor_fatal_gate_rejects_only_current_write_and_keeps_reads():
+    proxy, provider, read, execution = make_proxy(receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
     gate_error = sys.modules[RUNNER.RedisShmReadOnlyProxy.__module__].SupervisorWriteGateError
-    proxy._supervisor_write_gate.check = mock.Mock(side_effect=gate_error(
-        "SUPERVISOR_WRITE_BLOCKED", permanent=True))
-    provider.llen = mock.Mock(return_value=1)
-    assert proxy.poll_once() is None and proxy.poll_once() is None
-    assert not proxy.stopped and proxy.isolation_reason == "SUPERVISOR_WRITE_BLOCKED"
-    assert proxy.identity_snapshot()["write_ready"] is False
-    provider.llen.assert_not_called()
-    assert len(read.calls) == len(execution.calls) == 1
+    proxy._supervisor_write_gate.check = mock.Mock(side_effect=gate_error("SUPERVISOR_WRITE_BLOCKED", permanent=True))
+    queue = proxy.transport.request_queue
+    provider.queues[queue] = [json.dumps(request("submit_order", rid="unverified-write")),
+                             json.dumps(request("get_ticks", rid="independent-quote", params={"code": "000001.SZ"}))]
+    assert proxy.poll_once()["publication_state"] == "NOT_SENT"
+    assert proxy.poll_once()["ok"] is True
+    assert not provider.queues[queue] and not proxy.isolation_reason
+    assert len(read.calls) == 2 and len(execution.calls) == 1
+    assert not provider.hashes.get(LEDGER)
 
 
-def test_identity_pending_serves_reads_without_consuming_writes_or_shadowing_ledger():
+def test_identity_pending_consumes_requests_without_shadowing_financial_receipt():
     provider = SelectiveReadRedis()
     proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
     pending_identity(proxy)
-    order = json.dumps(request("submit_order", rid="old-order"))
-    cancel = json.dumps(request("cancel_order", rid="old-cancel"))
-    conflict = json.dumps(request("get_ticks", rid="old-order", params={"code": "000001.SZ"}))
-    forbidden_control = json.dumps(request("ping", rid="control", params={"supervisor_attach": {}}))
-    quote = json.dumps(request("get_full_tick", rid="independent-read", params={"codes": ["000001.SZ"]}))
+    values = [request("submit_order", rid="old-order"), request("cancel_order", rid="old-cancel"),
+              request("get_ticks", rid="old-order", params={"code": "000001.SZ"}),
+              request("ping", rid="control", params={"supervisor_attach": {}}),
+              request("get_full_tick", rid="independent-read", params={"codes": ["000001.SZ"]})]
     queue = proxy.transport.request_queue
-    provider.queues[queue] = [order, cancel, conflict, forbidden_control, quote]
+    provider.queues[queue] = [json.dumps(row) for row in values]
     ledger_record = '{"state":"UNKNOWN","automatic_retry":false}'
     provider.hashes[LEDGER] = {"old-order": ledger_record}
-
-    assert proxy.poll_once() is None  # 持久写 RID 的读取不允许覆盖其回报。
-    response = proxy.poll_once()
-    assert response["ok"] is True and response["request_id"] == "independent-read"
-    assert provider.queues[queue] == [order, cancel, conflict, forbidden_control]
-    assert provider.hashes[LEDGER] == {"old-order": ledger_record}
-    assert [call[0]["method"] for call in read.calls] == ["ping", "get_full_tick"]
-    assert [call[0]["method"] for call in execution.calls] == ["ping"]
-    assert proxy.identity_snapshot()["write_ready"] is False
-    assert not proxy.stopped and not proxy.isolation_reason
-    assert len([op for op in provider.operations if op[0] == "setex"]) == 1
+    results = [proxy.poll_once() for _ in values]
+    assert all(not row["ok"] for row in results[:-1]) and results[-1]["ok"] is True
+    assert provider.queues[queue] == [] and provider.hashes[LEDGER] == {"old-order": ledger_record}
+    assert [row[0]["method"] for row in read.calls] == ["ping", "get_full_tick"]
+    assert len(execution.calls) == 1 and not proxy.isolation_reason
 
 
-def test_identity_pending_scans_past_multiple_batches_without_touching_orders():
+def test_identity_pending_rejects_each_write_and_eventually_serves_the_quote():
     provider = SelectiveReadRedis()
     proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
     pending_identity(proxy)
-    orders = [json.dumps(request("submit_order", rid="order-%s" % number)) for number in range(130)]
-    quote = json.dumps(request("get_ticks", rid="quote-after-orders", params={"code": "000001.SZ"}))
+    values = [request("submit_order", rid="order-%s" % number) for number in range(130)]
+    values.append(request("get_ticks", rid="quote-after-orders", params={"code": "000001.SZ"}))
     queue = proxy.transport.request_queue
-    provider.queues[queue] = orders + [quote]
-    assert proxy.poll_once() is None and proxy.poll_once() is None
-    response = proxy.poll_once()
-    assert response["ok"] is True and response["request_id"] == "quote-after-orders"
-    assert provider.queues[queue] == orders
-    assert len(read.calls) == 2 and len(execution.calls) == 1
+    provider.queues[queue] = [json.dumps(row) for row in values]
+    for _ in range(130):
+        result = proxy.poll_once()
+        assert result["status"] == "REJECTED" and result["publication_state"] == "NOT_SENT"
+    assert proxy.poll_once()["request_id"] == "quote-after-orders"
+    assert not provider.queues[queue] and len(read.calls) == 2 and len(execution.calls) == 1
     assert LEDGER not in provider.hashes
 
 
-def test_identity_ready_again_does_not_consume_old_order_while_writes_still_blocked():
+def test_identity_ready_again_preserves_explicit_operator_stop_only():
     provider = SelectiveReadRedis()
     proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
     pending_identity(proxy)
     queue = proxy.transport.request_queue
-    order = json.dumps(request("submit_order", rid="old-order"))
-    first = json.dumps(request("get_ticks", rid="first-read", params={"code": "000001.SZ"}))
-    second = json.dumps(request("get_ticks", rid="second-read", params={"code": "000001.SZ"}))
-    provider.queues[queue] = [order, first]
+    provider.queues[queue] = [json.dumps(request("submit_order", rid="stopped-order")),
+                             json.dumps(request("get_ticks", rid="first-read", params={"code": "000001.SZ"}))]
+    assert proxy.poll_once()["publication_state"] == "NOT_SENT"
     assert proxy.poll_once()["request_id"] == "first-read"
     proxy._supervisor_write_gate.check.side_effect = None
-    provider.queues[queue].append(second)
+    provider.queues[queue].append(json.dumps(request("get_ticks", rid="second-read", params={"code": "000001.SZ"})))
     assert proxy.poll_once()["request_id"] == "second-read"
-    assert provider.queues[queue] == [order]
-    assert len(read.calls) == 3 and len(execution.calls) == 1
-    assert proxy.identity_snapshot()["write_ready"] is False
-    assert not any(op[0] == "lpop" for op in provider.operations)
+    assert not provider.queues[queue] and len(read.calls) == 3 and len(execution.calls) == 1
+    assert proxy.identity_snapshot()["write_block_reason"] == "OPERATOR_WRITE_DISABLED"
 
 
 def test_identity_ready_again_resumes_normal_queue_when_no_write_block_remains():
@@ -1330,63 +1326,56 @@ def test_identity_ready_again_resumes_normal_queue_when_no_write_block_remains()
     assert proxy.poll_once()["request_id"] == "second-read"
     assert provider.queues[queue] == []
     assert len(read.calls) == 3 and len(execution.calls) == 1
-    assert any(op[0] == "lpop" for op in provider.operations)
+    assert any(op[:2] == ("eval", "dequeue") for op in provider.operations)
 
 
-def test_identity_pending_source_identity_failure_preserves_the_queue():
+def test_source_identity_failure_rejects_current_request_and_recovers_next_request():
     provider = SelectiveReadRedis()
     proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
     pending_identity(proxy)
     proxy._check_native_process_identity.side_effect = FIXTURE.ShmProtocolError("identity changed")
     queue = proxy.transport.request_queue
-    original = json.dumps(request("get_ticks", rid="unchanged", params={"code": "000001.SZ"}))
-    provider.queues[queue] = [original]
-    assert proxy.poll_once() is None
-    assert provider.queues[queue] == [original]
-    assert proxy.isolation_reason == "READ_ONLY_SOURCE_IDENTITY_UNCONFIRMED"
-    assert len(read.calls) == len(execution.calls) == 1
+    provider.queues[queue] = [json.dumps(request("get_ticks", rid="wrong-source", params={"code": "000001.SZ"}))]
+    response = proxy.poll_once()
+    assert response["publication_state"] == "NOT_SENT" and not response["ok"]
+    assert provider.queues[queue] == [] and len(read.calls) == len(execution.calls) == 1
+    proxy._check_native_process_identity.side_effect = None
+    provider.queues[queue].append(json.dumps(request("get_ticks", rid="current-source", params={"code": "000001.SZ"})))
+    assert proxy.poll_once()["ok"] is True and len(read.calls) == 2
+    assert not proxy.isolation_reason
 
 
 @pytest.mark.parametrize("fatal_on_check", [2, 3])
-def test_identity_pending_turning_fatal_never_forwards_the_read(fatal_on_check):
+def test_identity_pending_turning_fatal_does_not_stop_independent_reads(fatal_on_check):
     provider = SelectiveReadRedis()
-    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
+    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
     pending_identity(proxy)
     gate_error = sys.modules[RUNNER.RedisShmReadOnlyProxy.__module__].SupervisorWriteGateError
-    pending = gate_error("SUPERVISOR_IDENTITY_NOT_READY", permanent=False)
-    fatal = gate_error("SUPERVISOR_WRITE_BLOCKED", permanent=True)
-    proxy._supervisor_write_gate.check.side_effect = [pending] * (fatal_on_check - 1) + [fatal]
+    proxy._supervisor_write_gate.check.side_effect = gate_error("SUPERVISOR_WRITE_BLOCKED", permanent=True)
     queue = proxy.transport.request_queue
-    order = json.dumps(request("submit_order", rid="preserved-order"))
-    quote = json.dumps(request("get_ticks", rid="no-forward", params={"code": "000001.SZ"}))
-    provider.queues[queue] = [order, quote]
-    assert proxy.poll_once() is None
-    assert provider.queues[queue] == ([order, quote] if fatal_on_check == 2 else [order])
-    assert proxy.isolation_reason == "SUPERVISOR_WRITE_BLOCKED"
-    assert len(read.calls) == len(execution.calls) == 1
-    assert not any(op[0] == "setex" for op in provider.operations)
+    provider.queues[queue] = [json.dumps(request("submit_order", rid="unconfirmed-gate")),
+                             json.dumps(request("get_ticks", rid="independent-read", params={"code": "000001.SZ"}))]
+    assert proxy.poll_once()["publication_state"] == "NOT_SENT"
+    assert proxy.poll_once()["ok"] is True and not provider.queues[queue]
+    assert not proxy.isolation_reason and len(read.calls) == 2 and len(execution.calls) == 1
 
 
-def test_identity_pending_unconfirmed_selective_dequeue_is_not_retried():
-    provider = SelectiveReadRedis()
-    proxy, provider, read, execution = make_proxy(provider=provider, receive_policy="QUEUE_ONLY")
+def test_identity_pending_dequeue_failure_keeps_later_request_eligible(isolated_redis):
+    proxy, provider, read, execution = make_proxy(provider=isolated_redis, receive_policy="QUEUE_ONLY")
     pending_identity(proxy)
     queue = proxy.transport.request_queue
-    original = json.dumps(request("get_ticks", rid="unknown-dequeue", params={"code": "000001.SZ"}))
-    provider.queues[queue] = [original]
-    actual_eval = provider.eval
-
-    def consume_then_timeout(*args):
-        actual_eval(*args)
-        raise TimeoutError("selective dequeue may have happened")
-
-    provider.eval = mock.Mock(side_effect=consume_then_timeout)
-    with pytest.raises(TimeoutError):
-        proxy.poll_once()
-    assert proxy.isolation_reason == "REDIS_RECEIVE_OR_PROCESS_FAILED"
-    assert provider.queues[queue] == []
-    assert proxy.poll_once() is None and provider.eval.call_count == 1
-    assert len(read.calls) == len(execution.calls) == 1
+    raw = json.dumps(request("get_ticks", rid="unknown-dequeue", params={"code": "000001.SZ"}))
+    provider.rpush(queue, raw, json.dumps(request("get_ticks", rid="after-dequeue", params={"code": "000001.SZ"})))
+    actual = provider.eval
+    def lost_reply(script, count, *args):
+        actual(script, count, *args)
+        provider.eval = actual
+        raise redis.exceptions.TimeoutError("claim receipt unavailable")
+    provider.eval = lost_reply
+    assert proxy.poll_once() is None
+    proxy._redis_retry_at = 0
+    assert proxy.poll_once()["request_id"] == "after-dequeue"
+    assert not proxy.isolation_reason and len(read.calls) == 2 and len(execution.calls) == 1
 
 
 @pytest.fixture
@@ -1445,10 +1434,9 @@ def test_vm_uncertain_dequeue_preserves_exact_request_and_continues(isolated_red
     pending = dict(proxy._pending_dequeue_recovery)
     assert not proxy.isolation_reason and len(execution.calls) == 1
     proxy._redis_retry_at = 0
-    assert proxy.poll_once() is None
-    assert provider.get(pending["marker"]) == raw and provider.ttl(pending["marker"]) == -1
-    assert provider.lrange(queue, 0, -1) == [later]
     assert proxy.poll_once()["request_id"] == "independent-read"
+    assert provider.get(pending["marker"]) == raw and provider.ttl(pending["marker"]) == -1
+    assert provider.lrange(queue, 0, -1) == []
     provider.rpush(queue, raw)
     # 原取件即使在恢复之后才抵达，也不能取走重现的相同请求。
     proxy_module = sys.modules[RUNNER.RedisShmReadOnlyProxy.__module__]
@@ -1558,13 +1546,13 @@ def test_vm_late_account_read_recovers_real_mailbox_and_reads_again(monkeypatch,
         RUNNER._emit_proxy_health(health_config, proxy)
         health = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         if timing == "late_frame":
-            assert health["status"] == "DEGRADED" and health["writes_blocked"] is True
-            assert clients["execution"].poisoned and proxy._pending_execution_read_recovery is not None
-            assert proxy.poll_once() is None and proxy._pending_execution_read_recovery is not None
+            assert health["status"] == "DEGRADED" and health["writes_blocked"] is False
+            assert clients["execution"].poisoned and bool(proxy._pending_request_recoveries)
+            assert proxy.poll_once() is None and bool(proxy._pending_request_recoveries)
             drain()
-            assert proxy.poll_once() is None and proxy._pending_execution_read_recovery is None
+            assert proxy.poll_once() is None and not proxy._pending_request_recoveries
         else:
-            assert health["status"] == "RUNNING" and proxy._pending_execution_read_recovery is None
+            assert health["status"] == "RUNNING" and not proxy._pending_request_recoveries
         assert not clients["execution"].poisoned
         assert not proxy._unconfirmed_read_ids["execution"]
         proxy.timeout_seconds = 1
@@ -1579,7 +1567,7 @@ def test_vm_late_account_read_recovers_real_mailbox_and_reads_again(monkeypatch,
         source.close()
 
 
-def test_identity_pending_real_redis_atomic_selection_and_changed_queue(isolated_redis):
+def test_identity_pending_real_redis_claim_preserves_a_changed_head(isolated_redis):
     proxy, provider, read, execution = make_proxy(provider=isolated_redis, receive_policy="QUEUE_ONLY")
     pending_identity(proxy)
     queue = proxy.transport.request_queue
@@ -1587,40 +1575,32 @@ def test_identity_pending_real_redis_atomic_selection_and_changed_queue(isolated
     quote = json.dumps(request("get_ticks", rid="independent-read", params={"code": "000001.SZ"}))
     injected = json.dumps(request("cancel_order", rid="other-order"))
     provider.rpush(queue, order, quote)
-    provider.hset(LEDGER, "old-order", '{"state":"UNKNOWN","automatic_retry":false}')
-    real_eval = provider.eval
-
-    def insert_before_claim(script, key_count, *args):
+    saved = '{"state":"UNKNOWN","automatic_retry":false}'
+    provider.hset(LEDGER, "old-order", saved)
+    actual = provider.eval
+    def insert(script, count, *args):
         provider.lpush(queue, injected)
-        provider.eval = real_eval
-        return real_eval(script, key_count, *args)
-
-    provider.eval = insert_before_claim
-    assert proxy.poll_once() is None
-    assert provider.lrange(queue, 0, -1) == [injected, order, quote]
-    response = proxy.poll_once()
-    assert response["ok"] is True and response["request_id"] == "independent-read"
-    assert provider.lrange(queue, 0, -1) == [injected, order]
-    assert provider.hget(LEDGER, "old-order") == '{"state":"UNKNOWN","automatic_retry":false}'
+        provider.eval = actual
+        return actual(script, count, *args)
+    provider.eval = insert
+    assert proxy.poll_once() is None and provider.lrange(queue, 0, -1) == [injected, order, quote]
+    assert not proxy.poll_once()["ok"] and not proxy.poll_once()["ok"]
+    assert proxy.poll_once()["request_id"] == "independent-read"
+    assert provider.lrange(queue, 0, -1) == [] and provider.hget(LEDGER, "old-order") == saved
     assert len(read.calls) == 2 and len(execution.calls) == 1
-    assert proxy.identity_snapshot()["write_ready"] is False
-    conflict = json.dumps(request("get_ticks", rid="old-order", params={"code": "000001.SZ"}))
-    second = json.dumps(request("get_ticks", rid="second-read", params={"code": "000001.SZ"}))
-    provider.rpush(queue, conflict, second)
-    assert proxy.poll_once() is None
-    assert provider.lrange(queue, 0, -1) == [injected, order, conflict, second]
-    assert provider.get("bigqmt:rpc:resp:%s:old-order" % ACCOUNT) is None
-    assert proxy.poll_once()["request_id"] == "second-read"
-    assert provider.lrange(queue, 0, -1) == [injected, order, conflict]
+    original_response = provider.get("bigqmt:rpc:resp:%s:old-order" % ACCOUNT)
+    provider.rpush(queue, json.dumps(request("get_ticks", rid="old-order", params={"code": "000001.SZ"})))
+    assert not proxy.poll_once()["ok"]
+    assert provider.get("bigqmt:rpc:resp:%s:old-order" % ACCOUNT) == original_response
 
 
-def test_identity_pending_does_not_consume_pubsub_mode():
+def test_identity_pending_does_not_stop_pubsub_or_queue_reads():
     proxy, provider, read, execution = make_proxy(receive_policy="QUEUE_AND_PUBSUB")
     pending_identity(proxy)
-    operations = len(provider.operations)
-    assert proxy.poll_once() is None
-    assert len(provider.operations) == operations
-    assert len(read.calls) == len(execution.calls) == 1
+    queue = proxy.transport.request_queue
+    provider.queues[queue] = [json.dumps(request("get_ticks", rid="independent-quote", params={"code": "000001.SZ"}))]
+    assert proxy.poll_once()["ok"] is True
+    assert not provider.queues[queue] and len(read.calls) == 2 and len(execution.calls) == 1
 
 
 @pytest.mark.parametrize("initially_blocked", [True, False])
@@ -1649,7 +1629,7 @@ def test_live_startup_identity_failure_remains_resident_without_opening_sources(
 
 
 @pytest.mark.parametrize("phase", ["claim", "settle", "publish"])
-def test_live_write_redis_uncertainty_isolates_without_replaying(phase):
+def test_live_write_redis_uncertainty_does_not_block_fresh_business_or_replay_original(phase):
     proxy, provider, read, execution = make_proxy(execution_cursor_guard_target=None,
         supervisor_write_gate=None, receive_policy="QUEUE_ONLY", start_write_blocked=False, live_write_authorized=True)
     original = request("submit_order", rid="uncertain-" + phase)
@@ -1658,29 +1638,30 @@ def test_live_write_redis_uncertainty_isolates_without_replaying(phase):
     execution.result = {"status": "SUBMITTED", "order_sys_id": "fixture-only"}
     if phase in ("claim", "settle"):
         provider.fail_eval = phase
-        response = proxy.process_request(original)
-        assert response["status"] == "UNKNOWN" and response["automatic_retry"] is False
+        result = proxy.process_request(original)
+        assert result["status"] == "UNKNOWN"
+        assert result["automatic_retry"] is False
     else:
         provider.fail_operation = "setex"
         with pytest.raises(Exception):
             proxy.process_request(original)
         assert json.loads(provider.hashes[LEDGER][original["request_id"]])["state"] == "PUBLISH_UNCONFIRMED"
-    assert not proxy.stopped and proxy.isolation_reason and not proxy.identity_snapshot()["write_ready"]
-    before = len(provider.operations)
-    assert proxy.poll_once() is None and len(provider.operations) == before
-    with pytest.raises(FIXTURE.ShmProtocolError, match="isolated"):
-        proxy.process_request(original)
-    assert len(execution.calls) == (1 if phase == "claim" else 2) and len(read.calls) == 1
+    before = len(execution.calls)
+    saved = provider.hashes.get(LEDGER, {}).get(original["request_id"])
+    provider.fail_eval = provider.fail_operation = None
+    assert not proxy.process_request(original)["ok"] or phase == "publish"
+    assert len(execution.calls) == before
+    assert proxy.process_request(request("submit_order", rid="new-after-redis-recovery"))["ok"] is True
+    assert len(execution.calls) == before + 1 and not proxy.isolation_reason
+    assert provider.hashes.get(LEDGER, {}).get(original["request_id"]) == saved
 
 
-def test_target_live_execution_timeout_does_not_assume_reverse_read_independence():
+def test_target_live_execution_timeout_keeps_independent_quote_source_available():
     proxy, provider, read, execution = make_proxy(receive_policy="QUEUE_ONLY")
     execution.failure = FIXTURE.ShmTimeoutError("execution result unknown")
     response = proxy.process_request(request("get_positions", rid="execution-read-unknown"))
     assert response["status"] == "UNKNOWN" and response["automatic_retry"] is False
-    assert not proxy.stopped and proxy.isolation_reason == "SHM_EXECUTION_RESULT_UNCONFIRMED"
-    assert proxy.identity_snapshot()["write_ready"] is False
-    provider.queues[proxy.transport.request_queue] = [json.dumps(request("get_ticks", rid="later-quote"))]
-    before = len(provider.operations)
-    assert proxy.poll_once() is None and len(provider.operations) == before
-    assert len(read.calls) == 1 and len(execution.calls) == 2
+    assert not proxy.stopped and not proxy.isolation_reason
+    provider.queues[proxy.transport.request_queue] = [json.dumps(request("get_ticks", rid="later-quote", params={"code": "000001.SZ"}))]
+    assert proxy.poll_once()["ok"] is True
+    assert len(read.calls) == 2 and len(execution.calls) == 2

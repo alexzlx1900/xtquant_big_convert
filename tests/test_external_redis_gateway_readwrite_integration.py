@@ -202,8 +202,8 @@ class Harness:
         if self.unknown_submit:
             raise RuntimeError("fixture native submission outcome is unknown")
         row = SimpleNamespace(
-            m_strAccountID=self.account, m_strOrderSysID="7620", m_strInstrumentID="000001",
-            m_strExchangeID="SZ", m_strRemark=REMARK, m_strStrategyName="",
+            m_strAccountID=self.account, m_strOrderSysID=str(7620 + len(self.orders)), m_strInstrumentID="000001",
+            m_strExchangeID="SZ", m_strRemark=str(args[9]) if len(args) > 9 else REMARK, m_strStrategyName="",
             m_nOffsetFlag=48, m_nOpType=23, m_nOrderStatus=50,
             m_nVolumeTotalOriginal=100, m_nVolumeTraded=0, m_dLimitPrice=11.42,
             m_dTradedPrice=0.0, m_nOrderPriceType=50,
@@ -298,23 +298,22 @@ def test_vm_late_account_read_recovers_through_gateway(monkeypatch, gateway_modu
                 operation = asyncio.to_thread(client.call, late_method, {}, request_id="gateway-late-position")
                 await (operation if timing == "late_frame" else h.operation(operation))
             assert failure.value.publication_state == "UNKNOWN" and failure.value.automatic_retry is False
-            assert client.writes_blocked
-            with pytest.raises(RuntimeError, match="write gate blocked"):
-                client.call("submit_order", {})
-            assert (h.proxy._pending_execution_read_recovery is not None) is (timing == "late_frame")
+            assert not client.writes_blocked
+            with pytest.raises(RuntimeError, match="original request is unconfirmed"):
+                client.call(late_method, {}, request_id="gateway-late-position")
+            assert bool(h.proxy._pending_request_recoveries) is (timing == "late_frame")
             deadline = time.monotonic() + 2
-            while h.proxy._pending_execution_read_recovery is not None and time.monotonic() < deadline:
+            while h.proxy._pending_request_recoveries and time.monotonic() < deadline:
                 h.drain()
                 await asyncio.sleep(.005)
-            assert h.proxy._pending_execution_read_recovery is None and not h.proxy.isolation_reason
+            assert not h.proxy._pending_request_recoveries and not h.proxy.isolation_reason
             h.proxy.timeout_seconds = 1
             assert (await h.operation(h.read.healthcheck()))["status"] == "CONNECTED"
             positions = await h.operation(h.read.query_positions())
             assert len(positions) == 1 and positions[0]["symbol"] == "000001.SZ"
             assert positions[0]["quantity"] == 100 and positions[0]["account_id"] == h.account
-            assert client.writes_blocked is prior_unknown_write
-            if prior_unknown_write:
-                assert client.write_block_reason == "PRIOR_WRITE_UNKNOWN"
+            assert not client.writes_blocked and client._uncertain_write is prior_unknown_write
+            assert client.write_block_reason == ""
             assert calls.count("gateway-late-position") == 1
             assert h.proxy.get_cached_response("gateway-late-position")["status"] == "UNKNOWN"
             assert not h.submit_calls and not h.cancel_calls
@@ -564,6 +563,7 @@ def test_live_explicit_future_activation_confirms_order_and_deduplicates_same_ri
 def test_live_unknown_native_submission_blocks_second_order_and_keeps_account_reads(monkeypatch, gateway_modules):
     h = Harness(monkeypatch, gateway_modules, live=True, unknown_submit=True,
                 live_write_authorized=True, start_write_blocked=False)
+    h.order.gateway_id = "qmt-vm-001"
 
     async def run():
         order = dict(profile_id=h.profile_id, account_id=h.account, symbol=CODE,
@@ -572,14 +572,15 @@ def test_live_unknown_native_submission_blocks_second_order_and_keeps_account_re
             await h.start()
             result = await h.operation(h.order.submit_order(order, profile_id=h.profile_id))
             assert result.status == "UNKNOWN" and len(h.submit_calls) == 1
-            assert h.proxy.identity_snapshot()["writes_blocked"] is True
+            assert h.proxy.identity_snapshot()["writes_blocked"] is False
             record = json.loads(next(iter(h.redis.hashes["aqp:redis_shm:write_ledger:%s:v1" % h.account].values())))
             assert record["state"] == "UNKNOWN" and record["binding"]["environment"] == "LIVE"
             asset = await h.operation(h.read.query_asset())
             assert asset["source_evidence"]["environment"] == "LIVE"
-            with pytest.raises(Exception, match="UNKNOWN|blocked|disabled|stopped"):
-                await h.operation(h.order.submit_order(dict(order, client_order_id="native-second"), profile_id=h.profile_id))
-            assert len(h.submit_calls) == 1 and not h.cancel_calls
+            h.unknown_submit = False
+            independent = await h.operation(h.order.submit_order(dict(order, client_order_id="native-second"), profile_id=h.profile_id))
+            assert independent.status == "ACCEPTED"
+            assert len(h.submit_calls) == 2 and not h.cancel_calls
         finally:
             await h.close()
 
@@ -602,15 +603,16 @@ def test_live_quote_timeout_keeps_proxy_and_gateway_path_alive_without_resend(mo
                 await asyncio.sleep(0.01)
             assert h.proxy._route_faults["readonly"]["state"] == "RESULT_UNKNOWN"
             assert not h.proxy.stopped and not h.pump.done()
-            assert h.proxy.identity_snapshot()["write_ready"] is False
+            assert h.proxy.identity_snapshot()["write_ready"] is True
             pending = h.source.clients["read"].mailbox._header()
             assert pending[4] == before[4] + 1 and pending[6] == before[6]
-            with pytest.raises(Exception):
-                await h.operation(h.read.query_asset())
+            asset = await h.operation(h.read.query_asset())
+            assert asset["source_evidence"]["environment"] == "LIVE"
             health = await h.operation(h.multi.healthcheck(profile_id=h.profile_id))
-            assert health["status"] == "NOT_CONNECTED"
-            assert health["read_provider_health"]["status"] == "ERROR"
-            assert health["order_provider_health"]["write_readiness"] != "WRITE_RUNTIME_READY"
+            assert health["status"] == "CONNECTED"
+            assert health["order_provider_health"]["write_readiness"] == "WRITE_RUNTIME_READY"
+            proof = await h.operation(asyncio.to_thread(h.read._get_client().call, "ping", {}))
+            assert proof["read_source_state"] == "RESULT_UNKNOWN" and proof["read_source_fault"]
             assert h.source.clients["read"].mailbox._header()[4:7] == pending[4:7]
             assert not h.submit_calls and not h.cancel_calls
         finally:
@@ -696,9 +698,11 @@ def test_identity_pending_thirteen_quotes_cross_gateway_without_touching_order(
             quotes = await h.operation(h.read.query_quotes(symbols))
             assert set(quotes) == set(symbols) and len(quotes) == 13
             assert all(quote["last_price"] == 11.47 for quote in quotes.values())
-            assert h.redis.lrange(queue, 0, -1) == [queued_order]
+            assert h.redis.lrange(queue, 0, -1) == []
+            rejected = json.loads(h.redis.get("bigqmt:rpc:resp:%s:old-order" % h.account))
+            assert rejected["status"] == "REJECTED" and rejected["publication_state"] == "NOT_SENT"
             for method in ("submit_order", "cancel_order"):
-                with pytest.raises(RuntimeError, match="write gate blocked"):
+                with pytest.raises(Exception, match="unverified|disabled|required|blocked|supervisor"):
                     await asyncio.to_thread(h.read._get_client().call, method, {})
             assert not h.submit_calls and not h.cancel_calls
             assert h.proxy.identity_snapshot()["write_ready"] is False

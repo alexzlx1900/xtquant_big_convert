@@ -73,8 +73,36 @@ class MemoryRedis:
 
     def eval(self, script, numkeys, key, *args):
         """原子Hash容量门与CAS；匹配Redis语义，不模拟代理业务路由。"""
-        assert numkeys in (1, 2)
+        assert numkeys in (1, 2, 3)
         with self.lock:
+            if "VM_QUEUE_CLAIM_V1" in script:
+                marker, invalid, raw, kind = args
+                if marker in self.values:
+                    return -1
+                rows = self.lists.get(key, [])
+                if not rows or rows[0] != raw:
+                    return 0
+                if kind == "invalid":
+                    self.lists[invalid] = ([raw] + self.lists.get(invalid, []))[:1000]
+                rows.pop(0)
+                return 1
+            if "REQUEST_SCOPED_WRITE_V1" in script:
+                business, cid_index, rid, capacity, encoded, business_key, cid = args
+                if any(name in self.ttls for name in (key, business, cid_index)):
+                    return [-3, ""]
+                rows = self.hashes.setdefault(key, {})
+                if rid in rows:
+                    return [0, rows[rid]]
+                owner = self.hashes.get(business, {}).get(business_key) or self.hashes.get(cid_index, {}).get(cid)
+                if owner:
+                    return [-2, owner]
+                if len(rows) >= capacity:
+                    return [-1, ""]
+                rows[rid] = encoded
+                self.hashes.setdefault(business, {})[business_key] = rid
+                if cid:
+                    self.hashes.setdefault(cid_index, {})[cid] = rid
+                return [1, encoded]
             if "ROTATION_CLOSE_CLAIM_V1" in script or "ROTATION_CLOSE_SETTLE_V1" in script:
                 close_key, rid, raw, pending, *remaining = args
                 values, close = self.hashes.get(key, {}), self.hashes.get(close_key, {})
@@ -180,6 +208,11 @@ class MemoryRedis:
         with self.lock:
             values = self.lists.get(key, [])
             return values.pop(0) if values else None
+
+    def lindex(self, key, index):
+        with self.lock:
+            rows = self.lists.get(key, [])
+            return rows[index] if 0 <= index < len(rows) else None
 
     def llen(self, key):
         with self.lock:

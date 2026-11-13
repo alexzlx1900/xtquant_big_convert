@@ -156,6 +156,7 @@ def test_candidate_loop_schedules_rotation_and_never_retries_unknown(monkeypatch
     monkeypatch.setattr(RUNNER.InheritedRotationChannel, "from_environment", lambda: channel)
     monkeypatch.setattr(RUNNER, "RedisShmReadOnlyProxy", lambda **kwargs: proxy)
     proxy.verified, proxy.stop_reason, proxy.processed_count = True, "", 0
+    proxy._request_scoped_faults = False  # 本测试隔离验收换代调度器；资源恢复另有真实代理闭环。
     proxy.attach_native_supervisor = mock.Mock()
     proxy.verify_identity = mock.Mock()
     proxy._block_writes = mock.Mock()

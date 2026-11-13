@@ -44,6 +44,8 @@ def model(monkeypatch):
         execution_cursor_guard_target={"gateway_id": "qmt-vm-001", "profile_id": "live-stock"},
         supervisor_write_gate=LIVE.FIXTURE.FakeSupervisorWriteGate())
     proxy._supervisor_attach_verified = True  # 仅本地替身，不代表实机监督授权。
+    # 本组隔离验收见证本身；自动 ACK 在下方专门调用真实恢复方法验收。
+    proxy._recover_completed_requests = lambda: None
 
     def drive(function, *, drive_read=True):
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -112,6 +114,22 @@ def late_read_with_nested_execution(native, proxy, *, force_zero_depth=False):
         assert future.done()
     runtime["aqp_shm_readonly_adjust"] = callback
     return original, observations
+
+
+def test_vm_automatic_ack_waits_for_actual_callback_return_and_preserves_original_unknown(model):
+    native, proxy, drive = model
+    original, result = late_read_with_nested_execution(native, proxy)
+    read = native.clients["read"].mailbox
+    before = read._header()[6]
+    RedisShmReadOnlyProxy._recover_completed_requests(proxy)
+    assert read._header()[6] == before and proxy._pending_request_recoveries
+    native.namespace["aqp_shm_rpc_adjust"](native.context)
+    assert proxy._readonly_callback_finished() is True
+    RedisShmReadOnlyProxy._recover_completed_requests(proxy)
+    assert read._header()[6] == read._header()[4] and not proxy._pending_request_recoveries
+    assert proxy.get_cached_response(original["request_id"]) == result["old_result"]
+    assert drive(lambda: proxy.process_request(LIVE.request("ping", rid="new-after-release")))["ok"] is True
+    native.writes.assert_not_called()
 
 
 def test_published_response_tail_reentry_is_blocked_then_later_callback_recovers(model):

@@ -99,6 +99,7 @@ class ShmRpcBridge:
         self._async_pending_capacity = async_pending_capacity
         self._async_confirmation_timeout_seconds = async_confirmation_timeout_seconds
         self._async_write_block_reason = ""
+        self._business_claims = {}
         self._read_replay_expiries = {}
         self._active_write_event_guard = None
         self._active_supervisor_gate_epoch = None
@@ -119,6 +120,11 @@ class ShmRpcBridge:
     def _callback_thread(self):
         if threading.get_ident() != self._thread:
             raise ShmProtocolError("QMT callback thread required")
+
+    @property
+    def _request_scoped_faults(self):
+        return (self.account_id == "8882152350" and self.environment == "LIVE"
+                and self.persistent_live_read_write)
 
     def _async_data(self, request, status, *, native_write_executed=False, error=""):
         params = request.get("params") or {}
@@ -214,7 +220,7 @@ class ShmRpcBridge:
         return data
 
     def _block_async_writes(self, reason, record=None):
-        if not self._async_write_block_reason:
+        if not self._request_scoped_faults and not self._async_write_block_reason:
             self._async_write_block_reason = reason
         records = list(self._async_pending.values()) if record is None else [record]
         for pending in records:
@@ -226,6 +232,24 @@ class ShmRpcBridge:
                 data.clear()
                 data.update(self._async_data(pending["request"], "UNKNOWN",
                     native_write_executed=pending["native_write_executed"], error=reason))
+
+    def _claim_business(self, request):
+        params, method = request["params"], request["method"]
+        if method == "cancel_order":
+            original = params.get("order_sys_id") or params.get("order_sysid") or params.get("order_id")
+            if not isinstance(original, (str, int)) or isinstance(original, bool) or not str(original).strip():
+                raise ShmProtocolError("explicit original order identity required")
+            key = "cancel:" + str(original)
+        else:
+            cid = params.get("client_order_id") or params.get("remark") or params.get("user_order_id") or params.get("order_remark")
+            validate_async_submit_params(dict(params, client_order_id=cid))
+            key = "submit:" + cid
+        if key in self._business_claims:
+            return self._business_claims[key]
+        if len(self._business_claims) >= self._replay_capacity:
+            raise ShmProtocolError("retained business claims reached their bounded capacity")
+        self._business_claims[key] = request["request_id"]
+        return None
 
     def _refresh_async_pending(self):
         now = time.monotonic()
@@ -890,6 +914,18 @@ class ShmRpcBridge:
                     if self._active_write_event_guard is not None:
                         raise ExecutionEventGuardRejected("EXECUTION_EVENT_CURSOR_NOT_CURRENT")
                     self._check_execution_event_guard(params.get("execution_event_guard"))
+                if self._request_scoped_faults and method in ALL_WRITE_METHODS:
+                    owner = self._claim_business(request)
+                    if owner is not None:
+                        same_request = owner == request["request_id"]
+                        status, executed = ("UNKNOWN", None) if same_request else ("BLOCKED", False)
+                        data = (self._async_data(request, status, native_write_executed=executed, error="BUSINESS_ALREADY_CLAIMED")
+                                if method in ASYNC_WRITE_METHODS else dict(status=status, error="BUSINESS_ALREADY_CLAIMED",
+                                    native_write_executed=executed, automatic_retry=False, order_sys_id="", result=None))
+                        data["original_request_id"] = owner
+                        response.update(ok=True, data=data)
+                        self._finish(sequence, request, response, fingerprint)
+                        return self.poll_once()
                 if method in ASYNC_WRITE_METHODS:
                     self._active_write_event_guard = params.get("execution_event_guard")
                     self._active_supervisor_gate_epoch = params.get("supervisor_gate_epoch")
@@ -905,7 +941,8 @@ class ShmRpcBridge:
                     business_params["account_id"] = self.account_id
                     if method == "submit_order":
                         business_params.setdefault("signal_id", rid)
-                        business_params.setdefault("remark", "shm:%s" % rid)
+                        business_params.setdefault("remark", (business_params.get("client_order_id") or business_params.get("user_order_id")
+                            or business_params.get("order_remark")) if self._request_scoped_faults else "shm:%s" % rid)
                         validate = getattr(self.handlers.order_gateway, "validate_submit_params", None)
                         if callable(validate):
                             validate(business_params)

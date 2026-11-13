@@ -638,7 +638,10 @@ class NativeShmRpcRuntime:
         try:
             if self.bridge.poll_once():
                 self.requests += 1
-        except Exception:
+        except Exception as exc:
+            if self.bridge._request_scoped_faults:
+                self.last_callback_error = "%s: %s" % (type(exc).__name__, exc)
+                return
             self.close("callback_error")
             raise
 

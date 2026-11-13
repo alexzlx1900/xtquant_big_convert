@@ -1110,8 +1110,10 @@ class ShmReadOnlyBridge:
             return
         if threading.get_ident() != self.callback_thread_id:
             raise ReadOnlyRequestError("WRONG_CALLBACK_THREAD", "mailbox polling requires the original QMT callback thread")
+        request_scoped = (self.account_id == "8882152350" and self.environment == "LIVE" and self.persistent_readonly)
+        incoming = None
         try:
-            if (self.rotation_continuity_guard is not None
+            if (not request_scoped and self.rotation_continuity_guard is not None
                     and self.rotation_continuity_guard() is not True):
                 raise ReadOnlyRequestError("EXECUTION_CONTINUITY_UNKNOWN", "read result is unconfirmed")
             if self.persistent_readonly and self.pending is None and self.mailbox.region.acquire(0):
@@ -1134,12 +1136,12 @@ class ShmReadOnlyBridge:
                 if incoming is None:
                     return
                 sequence, request = incoming
-                if (self.rotation_continuity_guard is not None
+                if (not request_scoped and self.rotation_continuity_guard is not None
                         and self.rotation_continuity_guard() is not True):
                     raise ReadOnlyRequestError("EXECUTION_CONTINUITY_UNKNOWN", "read result is unconfirmed")
                 self.pending = (sequence, self.process_request(request, sequence=sequence))
             sequence, response = self.pending
-            if self.rotation_continuity_guard is None:
+            if self.rotation_continuity_guard is None or request_scoped:
                 published = self.mailbox.publish_response(sequence, response)
             else:
                 published = self.mailbox.publish_response(
@@ -1150,6 +1152,16 @@ class ShmReadOnlyBridge:
                 if not self.persistent_readonly and self.request_count >= READONLY_MAX_REQUESTS:
                     self.close("request_limit")
         except Exception as exc:
+            if request_scoped:
+                self.last_callback_error = "%s: %s" % (type(exc).__name__, exc)
+                if self.pending is None and incoming is not None:
+                    sequence, request = incoming
+                    self.pending = (sequence, dict(schema_version=1, request_id=request.get("request_id"),
+                        account_id=self.account_id, environment=self.environment, method=request.get("method"),
+                        session_id=self.mailbox.session_id, sequence=sequence, ok=False, data=None,
+                        error=str(exc), server_error=type(exc).__name__, status="UNKNOWN", automatic_retry=False,
+                        handled_at=_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                return
             self.failed = True
             print("AQP_SHM_READONLY_ERROR %s: %s" % (type(exc).__name__, exc))
             if not self.preserve_failed_mailbox:
