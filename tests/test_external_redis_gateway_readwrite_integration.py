@@ -140,7 +140,8 @@ class Harness:
             runtime_policy=self.policy,
             receive_policy=receive_policy,
             execution_cursor_guard_target=execution_cursor_guard_target,
-            previous_source_unknown_target=gateway_identity,
+            previous_source_unknown_target=(gateway_identity if gateway_identity and
+                gateway_identity.get("gateway_id") == "qmt-vm-001" else None),
             supervisor_write_gate=FixtureSupervisorWriteGate() if test_supervisor_gate else None,
         )
         if test_supervisor_gate:

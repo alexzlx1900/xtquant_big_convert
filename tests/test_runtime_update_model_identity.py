@@ -53,3 +53,20 @@ def test_identity_is_opt_in_and_requires_a_resident_live_launcher():
                    dict(native_pid=123, native_executable=None, source_identity_path=None)):
         with pytest.raises(ValueError):
             BUILDER.build_source(**settings(**change))
+
+
+def test_win_model_identity_tracks_its_config_without_changing_existing_trade_contract():
+    launcher = dict(python=r"D:\miniconda3\envs\qmt_310\python.exe",
+                    script=r"C:\AQP\win-fixture\aqp_windows_gateway\supervise_qmt_runtime.py",
+                    config=r"C:\AQP\win-fixture\prepared\supervisor.json")
+    arguments = settings(windows_session=2, runtime_launcher=launcher, execution_event_guard=False,
+                         read_fault_isolation=False)
+    source = BUILDER.build_source(**arguments)
+    actual = literal(source, "DUAL_SHM_SETTINGS")
+    assert actual["runtime_launcher"] == launcher and actual["windows_session"] == 2
+    assert actual["execution_event_guard"] is False and actual["read_fault_isolation"] is False
+    assert actual["persistent_live_read_write"] is True
+    assert BUILDER.build_source(**arguments) == source
+    changed = BUILDER.build_source(**{**arguments, "runtime_launcher": {
+        **launcher, "config": r"C:\AQP\win-fixture\another\supervisor.json"}})
+    assert literal(changed, "AQP_NATIVE_SOURCE_ID") != literal(source, "AQP_NATIVE_SOURCE_ID")

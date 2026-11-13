@@ -12,10 +12,10 @@ from test_live_redis_shm_proxy import isolated_redis
 TARGET = {"gateway_id": "qmt-vm-001", "profile_id": "live-stock"}
 
 
-def harness(monkeypatch, gateway, provider, **kwargs):
-    h = Harness(monkeypatch, gateway, live=True, receive_policy="QUEUE_ONLY", start_write_blocked=False,
-                live_write_authorized=True, gateway_identity=TARGET, redis_factory=lambda: provider, **kwargs)
-    h.order.gateway_id = h.read.gateway_id = h.multi.gateway_id = TARGET["gateway_id"]
+def harness(monkeypatch, gateway, provider, *, target=TARGET, start_write_blocked=False, **kwargs):
+    h = Harness(monkeypatch, gateway, live=True, receive_policy="QUEUE_ONLY", start_write_blocked=start_write_blocked,
+                live_write_authorized=True, gateway_identity=target, redis_factory=lambda: provider, **kwargs)
+    h.order.gateway_id = h.read.gateway_id = h.multi.gateway_id = target["gateway_id"]
     for source, route in (("read", "readonly"), ("execution", "execution")):
         h.proxy._clients[route] = ShmReadOnlyClient(h.source.clients[source].name, h.account,
                                                    region=DUAL.Region(h.source.states[source]))
@@ -28,9 +28,11 @@ def order(h, cid):
                 quantity=100, price_type=11, price=11.42, client_order_id=cid)
 
 
-@pytest.mark.parametrize("mode", ["SYNC", "ASYNC"])
-def test_unknown_original_does_not_disable_independent_native_submission(monkeypatch, gateway_modules, isolated_redis, mode):
-    h = harness(monkeypatch, gateway_modules, isolated_redis, unknown_submit=True, order_submit_mode=mode)
+@pytest.mark.parametrize("gateway_id,mode", [("qmt-vm-001", "SYNC"), ("qmt-vm-001", "ASYNC"),
+                                              ("qmt-win-001", "ASYNC")])
+def test_unknown_original_does_not_disable_independent_native_submission(monkeypatch, gateway_modules, isolated_redis, gateway_id, mode):
+    target = {"gateway_id": gateway_id, "profile_id": "live-stock"}
+    h = harness(monkeypatch, gateway_modules, isolated_redis, target=target, unknown_submit=True, order_submit_mode=mode)
 
     async def run():
         try:
@@ -66,8 +68,10 @@ def test_unknown_original_does_not_disable_independent_native_submission(monkeyp
     asyncio.run(run())
 
 
-def test_late_native_write_releases_only_its_frame_without_resending_unknown_business(monkeypatch, gateway_modules, isolated_redis):
-    h = harness(monkeypatch, gateway_modules, isolated_redis)
+@pytest.mark.parametrize("gateway_id,mode", [("qmt-vm-001", "SYNC"), ("qmt-win-001", "ASYNC")])
+def test_late_native_write_releases_only_its_frame_without_resending_unknown_business(monkeypatch, gateway_modules, isolated_redis, gateway_id, mode):
+    h = harness(monkeypatch, gateway_modules, isolated_redis,
+                target={"gateway_id": gateway_id, "profile_id": "live-stock"}, order_submit_mode=mode)
     native_gateway = h.source.namespace["_RUNTIMES"]["execution"]["_SERVER"].bridge.handlers.order_gateway
     submit = native_gateway.passorder
     def slow_submit(*args):
@@ -88,7 +92,7 @@ def test_late_native_write_releases_only_its_frame_without_resending_unknown_bus
             h.proxy.timeout_seconds = 1
             monkeypatch.setattr(native_gateway, "passorder", submit)
             result = await h.operation(h.order.submit_order(order(h, "new-after-late-write"), profile_id=h.profile_id))
-            assert result.status == "ACCEPTED" and len(h.submit_calls) == 2
+            assert result.status == ("ACCEPTED" if mode == "SYNC" else "PENDING_ASYNC") and len(h.submit_calls) == 2
             for rid, raw in saved.items():
                 assert isolated_redis.hget(ledger, rid) == raw
             assert not h.proxy._pending_request_recoveries
@@ -97,12 +101,14 @@ def test_late_native_write_releases_only_its_frame_without_resending_unknown_bus
     asyncio.run(run())
 
 
-def test_native_publication_exception_after_submission_preserves_unknown_and_continues(monkeypatch, gateway_modules, isolated_redis):
-    h = harness(monkeypatch, gateway_modules, isolated_redis)
+@pytest.mark.parametrize("gateway_id,mode", [("qmt-vm-001", "SYNC"), ("qmt-win-001", "ASYNC")])
+def test_native_publication_exception_after_submission_preserves_unknown_and_continues(monkeypatch, gateway_modules, isolated_redis, gateway_id, mode):
+    h = harness(monkeypatch, gateway_modules, isolated_redis,
+                target={"gateway_id": gateway_id, "profile_id": "live-stock"}, order_submit_mode=mode)
     runtime = h.source.namespace["_RUNTIMES"]["execution"]["_SERVER"]
     finish, failures = runtime.bridge._finish, []
     def interrupted_finish(sequence, request, response, fingerprint):
-        if request["method"] == "submit_order" and not failures:
+        if request["method"] == ("submit_order" if mode == "SYNC" else "submit_order_async") and not failures:
             failures.append(request["request_id"])
             raise RuntimeError("fixture publication interrupted after native submission")
         return finish(sequence, request, response, fingerprint)
@@ -114,15 +120,17 @@ def test_native_publication_exception_after_submission_preserves_unknown_and_con
             assert first.status == "UNKNOWN" and len(h.submit_calls) == 1
             assert runtime.closed is False and failures
             second = await h.operation(h.order.submit_order(order(h, "new-after-publication-error"), profile_id=h.profile_id))
-            assert second.status == "ACCEPTED" and len(h.submit_calls) == 2
+            assert second.status == ("ACCEPTED" if mode == "SYNC" else "PENDING_ASYNC") and len(h.submit_calls) == 2
             assert not h.proxy.isolation_reason
         finally:
             await h.close()
     asyncio.run(run())
 
 
-def test_inflight_quote_does_not_veto_execution_and_completed_frame_is_released(monkeypatch, gateway_modules, isolated_redis):
-    h = harness(monkeypatch, gateway_modules, isolated_redis)
+@pytest.mark.parametrize("gateway_id,mode", [("qmt-vm-001", "SYNC"), ("qmt-win-001", "ASYNC")])
+def test_inflight_quote_does_not_veto_execution_and_completed_frame_is_released(monkeypatch, gateway_modules, isolated_redis, gateway_id, mode):
+    h = harness(monkeypatch, gateway_modules, isolated_redis,
+                target={"gateway_id": gateway_id, "profile_id": "live-stock"}, order_submit_mode=mode)
 
     async def run():
         try:
@@ -137,7 +145,7 @@ def test_inflight_quote_does_not_veto_execution_and_completed_frame_is_released(
             assert "readonly" in h.proxy._pending_request_recoveries
             pending = h.proxy._clients["readonly"].mailbox._header()[4:7]
             placed = await h.operation(h.order.submit_order(order(h, "during-read-fault"), profile_id=h.profile_id))
-            assert placed.status == "ACCEPTED" and len(h.submit_calls) == 1
+            assert placed.status == ("ACCEPTED" if mode == "SYNC" else "PENDING_ASYNC") and len(h.submit_calls) == 1
             assert h.proxy._clients["readonly"].mailbox._header()[4:7] == pending
             monkeypatch.setitem(h.source.namespace, "aqp_shm_readonly_adjust", drain_read)
             deadline = time.monotonic() + 2
