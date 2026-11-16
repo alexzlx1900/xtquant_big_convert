@@ -189,7 +189,7 @@ def test_native_cash_flow_fields_survive_execution_bridge_roundtrip():
         assert response["ok"] is True
         assert response["data"]["asset"]["account_id"] == ACCOUNT
         assert response["data"]["asset"]["native_cash_flow"] == {
-            "status": "UNKNOWN",
+            "status": "QMT_NATIVE",
             "fields": {"m_dDeposit": 300.0, "m_dWithdraw": 0.0,
                        "m_dCashIn": 300.0, "m_strTradingDate": "20261106"},
         }

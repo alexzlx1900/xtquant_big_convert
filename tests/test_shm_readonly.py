@@ -934,7 +934,7 @@ class Win32FailurePathTest(unittest.TestCase):
 
 
 class AccountReadTest(BridgeFixture):
-    def test_native_cash_flow_fields_survive_roundtrip_without_claiming_validation(self):
+    def test_native_cash_flow_fields_survive_roundtrip_with_native_source(self):
         self.query.return_value = [account_row(m_dDeposit=0.0, m_dWithdraw=125.5,
                                                m_dCashIn=-125.5, m_strTradingDate="20261106")]
         response = self.roundtrip(self.client(), "get_asset")
@@ -942,7 +942,7 @@ class AccountReadTest(BridgeFixture):
         asset = response["data"]["asset"]
         self.assertEqual(asset["account_id"], ACCOUNT)
         self.assertEqual(asset["native_cash_flow"], {
-            "status": "UNKNOWN",
+            "status": "QMT_NATIVE",
             "fields": {"m_dDeposit": 0.0, "m_dWithdraw": 125.5,
                        "m_dCashIn": -125.5, "m_strTradingDate": "20261106"},
         })
@@ -954,7 +954,7 @@ class AccountReadTest(BridgeFixture):
         response = self.roundtrip(self.client(), "get_asset")
         self.assertTrue(response["ok"])
         self.assertEqual(response["data"]["asset"]["native_cash_flow"], {
-            "status": "UNKNOWN",
+            "status": "QMT_NATIVE",
             "fields": {"m_dDeposit": None, "m_dWithdraw": None,
                        "m_dCashIn": None, "m_strTradingDate": None},
         })

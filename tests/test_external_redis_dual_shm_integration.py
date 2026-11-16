@@ -355,7 +355,7 @@ def test_cash_flow_observation_survives_execution_source_and_redis_proxy(monkeyp
         assert response["ok"] is True
         assert response["data"]["asset"]["account_id"] == ACCOUNT
         assert response["data"]["asset"]["native_cash_flow"] == {
-            "status": "UNKNOWN",
+            "status": "QMT_NATIVE",
             "fields": {"m_dDeposit": 0.0, "m_dWithdraw": 125.5,
                        "m_dCashIn": -125.5, "m_strTradingDate": "20261106"},
         }
