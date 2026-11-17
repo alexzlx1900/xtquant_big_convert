@@ -30,7 +30,9 @@ QUOTE_SUBSCRIPTION_CONTRACT = "SCOPED_TICK_CAPTURE_V1"
 QUOTE_SUBSCRIPTION_LIMIT = 128
 HISTORY_PAYLOAD_LIMIT_BYTES = 8 * 1024 * 1024 - 16384
 MINUTE_BATCH_CONTRACT = "SCOPED_MINUTE_HISTORY_BATCH_V1"
-MINUTE_BATCH_MAX_SYMBOLS = 50
+MINUTE_BATCH_MAX_SYMBOLS = 1000
+MINUTE_BATCH_MAX_ROWS = 200000
+MINUTE_DOWNLOAD_MAX_SYMBOLS = 50
 READ_ROTATION_EVIDENCE_CONTRACT = "READ_ROTATION_EVIDENCE_V1"
 READ_PY_CALLBACK_RETURNED_CONTRACT = "READ_PY_CALLBACK_RETURNED_V1"
 _READ_CALLBACK_WITNESS = struct.Struct("<II")
@@ -191,6 +193,7 @@ class ShmReadOnlyBridge:
         self.mailbox.mark_ready()
 
     def process_request(self, request, sequence=None):
+        started_monotonic = time.monotonic()
         started_at_unix = time.time() if self.preserve_failed_mailbox else None
         fields = request if isinstance(request, dict) else {}
         request_id = fields.get("request_id")
@@ -284,7 +287,10 @@ class ShmReadOnlyBridge:
                         data["read_py_callback_returned_contract"] = READ_PY_CALLBACK_RETURNED_CONTRACT
                 if self.market_enabled:
                     data.update(minute_history_batch_contract=MINUTE_BATCH_CONTRACT,
-                                minute_history_batch_max_symbols=MINUTE_BATCH_MAX_SYMBOLS)
+                                minute_history_batch_max_symbols=MINUTE_BATCH_MAX_SYMBOLS,
+                                minute_history_batch_max_rows=MINUTE_BATCH_MAX_ROWS,
+                                minute_history_batch_max_response_bytes=HISTORY_PAYLOAD_LIMIT_BYTES,
+                                minute_history_download_max_symbols=MINUTE_DOWNLOAD_MAX_SYMBOLS)
             elif method in ("get_local_data", "get_market_data_ex", "download_history_data", "get_market_data_ex_batch", "download_history_data_batch", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"):
                 data = self.market_request(method, params, deadline=expires_at)
                 data.update(account_id=self.account_id, session_id=self.mailbox.session_id,
@@ -411,6 +417,9 @@ class ShmReadOnlyBridge:
         print("AQP_SHM_READONLY_RPC " + json.dumps({
             "request_id": response["request_id"], "method": response["method"], "sequence": response["sequence"],
             "ok": response["ok"], "error": response["error"], "callback_thread_id": threading.get_ident(),
+            "duration_ms": round((time.monotonic() - started_monotonic) * 1000, 3),
+            "native_timing": (response.get("data") or {}).get("source_evidence", {}).get("native_timing")
+                if method == "get_market_data_ex_batch" and isinstance(response.get("data"), dict) else None,
         }, sort_keys=True))
         return response
 
@@ -684,13 +693,14 @@ class ShmReadOnlyBridge:
         allowed |= {"incrementally"} if download else {"count", "dividend_type", "fill_data", "subscribe"}
         symbols, start, end = params.get("symbols"), params.get("start_time"), params.get("end_time")
         length = 8 if download else 14
+        symbol_limit = MINUTE_DOWNLOAD_MAX_SYMBOLS if download else MINUTE_BATCH_MAX_SYMBOLS
         if (set(params) - allowed or not isinstance(symbols, list)
-                or not 1 <= len(symbols) <= MINUTE_BATCH_MAX_SYMBOLS
+                or not 1 <= len(symbols) <= symbol_limit
                 or any(not self._history_symbol(code) for code in symbols)
                 or len(set(symbols)) != len(symbols) or params.get("period") != "1m"
                 or any(not isinstance(v, str) or len(v) != length or not all("0" <= c <= "9" for c in v) for v in (start, end))
                 or start > end or start[:8] != end[:8]):
-            raise ReadOnlyRequestError("INVALID_PARAMS", "minute batch requires 1-50 explicit unique symbols and one bounded 1m day")
+            raise ReadOnlyRequestError("INVALID_PARAMS", "minute batch requires explicit unique symbols within its advertised capacity and one bounded 1m day")
         try:
             for value in (start, end):
                 _dt.datetime.strptime(value, "%Y%m%d" if download else "%Y%m%d%H%M%S")
@@ -700,9 +710,10 @@ class ShmReadOnlyBridge:
             if type(params.get("incrementally")) not in (bool, type(None)):
                 raise ReadOnlyRequestError("INVALID_PARAMS", "incrementally must be boolean or null")
         elif (type(params.get("count")) is not int or not 1 <= params["count"] <= 301
+              or len(symbols) * params["count"] > MINUTE_BATCH_MAX_ROWS
               or params.get("dividend_type") != "none" or params.get("fill_data") is not False
               or params.get("subscribe") is not False):
-            raise ReadOnlyRequestError("INVALID_PARAMS", "minute batch requires count 1-301, none/False/False")
+            raise ReadOnlyRequestError("INVALID_PARAMS", "minute batch requires count 1-301 within the total row budget, none/False/False")
         return list(symbols)
 
     def _history_batch_request(self, params):
@@ -710,9 +721,11 @@ class ShmReadOnlyBridge:
         native = getattr(self.context, "get_market_data_ex", None)
         if not callable(native):
             raise ReadOnlyRequestError("CAPABILITY_MISSING", "native batch history is unavailable")
+        native_started = time.monotonic()
         raw = native(["open", "high", "low", "close", "volume", "amount"], symbols,
                      period="1m", start_time=params["start_time"], end_time=params["end_time"],
                      count=params["count"], dividend_type="none", fill_data=False, subscribe=False)
+        native_finished = time.monotonic()
         if raw is not None and (not isinstance(raw, dict) or set(raw) - set(symbols)):
             raise ReadOnlyRequestError("HISTORY_SHAPE_INVALID", "native batch escaped its symbol whitelist")
         results = {}
@@ -727,7 +740,11 @@ class ShmReadOnlyBridge:
                   "source_evidence": {"native_method": "get_market_data_ex", "native_call_count": 1,
                                       "requested_symbols": symbols, "start_time": params["start_time"],
                                       "end_time": params["end_time"], "count": params["count"],
-                                      "dividend_type": "none", "fill_data": False, "subscribe": False}}
+                                      "dividend_type": "none", "fill_data": False, "subscribe": False,
+                                      "native_timing": {
+                                          "symbols": len(symbols),
+                                          "sdk_read_ms": round((native_finished - native_started) * 1000, 3),
+                                          "normalization_ms": round((time.monotonic() - native_finished) * 1000, 3)}}}
         return result
 
     def _download_batch_request(self, params, deadline):

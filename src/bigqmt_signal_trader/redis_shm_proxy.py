@@ -31,7 +31,7 @@ from .transports.readonly_shm import (
     READY, RECOVERABLE_ACCOUNT_READ_METHODS, REQUEST_CAPACITY, REQUEST_OFFSET, RESPONSE_CAPACITY, RESPONSE_OFFSET,
     ShmBusyError, ShmProtocolError, ShmReadOnlyClient, ShmTimeoutError, decode_payload,
 )
-from .transports.readonly_shm_client import MARKET_RPC_METHODS, MINUTE_BATCH_CONTRACT, ShmReadOnlyRpcClient
+from .transports.readonly_shm_client import MARKET_RPC_METHODS, ShmReadOnlyRpcClient
 from .transports.redis_transport import _is_redis_timeout
 from .transports.shm_rpc import (
     ALL_WRITE_METHODS, ASYNC_SUBMIT_CONTRACT, ASYNC_WRITE_METHODS, WRITE_METHODS, validate_async_submit_params,
@@ -2740,9 +2740,7 @@ class RedisShmReadOnlyProxy:
             ShmReadOnlyRpcClient._market_params(method, params)
             if method in {"get_market_data_ex_batch", "download_history_data_batch"}:
                 source = self._source_identity.get("readonly", {})
-                if (source.get("minute_history_batch_contract") != MINUTE_BATCH_CONTRACT
-                        or source.get("minute_history_batch_max_symbols") != 50):
-                    raise ShmProtocolError("explicit verified minute batch contract required")
+                ShmReadOnlyRpcClient._validate_minute_batch_source(source, method, params)
         if method == "get_asset" and type(params.get("include_source_evidence", False)) is not bool:
             raise ShmProtocolError("include_source_evidence must be boolean")
         if method == "poll_execution_events" and (type(params.get("after_sequence")) is not int or params["after_sequence"] < 0):

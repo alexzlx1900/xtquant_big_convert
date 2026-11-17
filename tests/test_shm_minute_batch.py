@@ -84,6 +84,31 @@ class MinuteBatchTests(HISTORY.FIXTURE.BridgeFixture):
             self.assertEqual(item["native_pid"], self.mailbox.server_pid)
             self.assertEqual(item["session_id"], self.mailbox.session_id)
 
+    def test_expanded_batch_crosses_real_mailbox_client_with_one_native_call(self):
+        codes = ['%06d.SZ' % index for index in range(1, 251)]
+        self.context.get_market_data_ex.return_value = {code: HISTORY.frame() for code in codes}
+        def factory(name, account):
+            native = HISTORY.ShmReadOnlyClient(name, account, region=HISTORY.FIXTURE.MemoryRegion(self.state))
+            self.clients.append(native)
+            return native
+        client = HISTORY.ShmReadOnlyRpcClient(name=HISTORY.FIXTURE.NAME,
+            account_id=HISTORY.FIXTURE.ACCOUNT, client_factory=factory)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            for function, args, kwargs in (
+                (client.verify_identity, (), {'expected_session_id':self.mailbox.session_id, 'expected_native_pid':self.mailbox.server_pid}),
+                (client.call, ('get_market_data_ex_batch', read_params(symbols=codes)), {}),
+            ):
+                future = executor.submit(function, *args, **kwargs)
+                deadline = time.monotonic() + 3
+                while not future.done() and time.monotonic() < deadline:
+                    self.bridge.drain()
+                    time.sleep(0.001)
+                reply = future.result(timeout=1)
+        assert list(reply['results']) == codes
+        self.context.get_market_data_ex.assert_called_once()
+        self.bridge.history_downloader.assert_not_called()
+        client.close()
+
     def test_response_limit_includes_per_symbol_identity_and_outer_envelope(self):
         bare = self.bridge._history_batch_request(read_params())
         limit = len(json.dumps(bare, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")) + 1
@@ -93,13 +118,32 @@ class MinuteBatchTests(HISTORY.FIXTURE.BridgeFixture):
         self.assertEqual(result["server_error"], "HISTORY_PAYLOAD_TOO_LARGE")
         self.assertIsNone(result["data"])
 
-    def test_maximum_50_symbols_and_301_rows_budget_is_explicit(self):
-        codes = ["%06d.SZ" % index for index in range(1, 51)]
-        self.context.get_market_data_ex.return_value = {code: HISTORY.frame() for code in codes}
+    def test_dynamic_read_sizes_use_one_native_call_and_keep_all_results(self):
+        for size, count in ((51, 301), (137, 301), (250, 301), (500, 301), (1000, 100)):
+            codes = ["%06d.SZ" % index for index in range(1, size + 1)]
+            self.context.get_market_data_ex.reset_mock()
+            self.context.get_market_data_ex.return_value = {code: HISTORY.frame() for code in codes}
+            result = self.process("get_market_data_ex_batch", params=read_params(symbols=codes, count=count))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(list(result["data"]["results"]), codes)
+            self.context.get_market_data_ex.assert_called_once()
+            self.assertEqual(result["data"]["source_evidence"]["native_timing"]["symbols"], size)
+
+    def test_source_advertises_resource_limits_and_separate_download_capacity(self):
+        value = self.process("ping")["data"]
+        self.assertEqual(value["minute_history_batch_max_symbols"], 1000)
+        self.assertEqual(value["minute_history_batch_max_rows"], 200000)
+        self.assertEqual(value["minute_history_batch_max_response_bytes"], self.ns["HISTORY_PAYLOAD_LIMIT_BYTES"])
+        self.assertEqual(value["minute_history_download_max_symbols"], 50)
+
+    def test_row_and_download_budgets_reject_before_any_native_effect(self):
+        codes = ["%06d.SZ" % index for index in range(1, 666)]
         result = self.process("get_market_data_ex_batch", params=read_params(symbols=codes))
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(len(result["data"]["results"]), 50)
-        self.context.get_market_data_ex.assert_called_once()
+        self.assertEqual(result["server_error"], "INVALID_PARAMS")
+        self.context.get_market_data_ex.assert_not_called()
+        result = self.process("download_history_data_batch", params=download_params(symbols=codes[:51]))
+        self.assertEqual(result["server_error"], "INVALID_PARAMS")
+        self.bridge.history_downloader.assert_not_called()
 
     def test_missing_native_and_known_empty_are_distinct(self):
         self.context.get_market_data_ex.return_value = None

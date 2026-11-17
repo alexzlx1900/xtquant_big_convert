@@ -23,13 +23,17 @@ def parameters(method):
     return {**result, "start_time": "20261022", "end_time": "20261022", "incrementally": None}
 
 
-def make_proxy(advertise=True):
+def make_proxy(advertise=True, capacity=50):
     proxy, redis, readonly, execution = FIXTURE.RedisShmReadOnlyProxyTest().make_proxy(verify=False, market=True)
     original = readonly.send_request
     def send(request, timeout_seconds):
         response = original(request, timeout_seconds)
         if advertise and request["method"] == "ping":
-            response["data"].update(minute_history_batch_contract=CONTRACT, minute_history_batch_max_symbols=50)
+            response["data"].update(minute_history_batch_contract=CONTRACT, minute_history_batch_max_symbols=capacity)
+            if capacity > 50:
+                response["data"].update(minute_history_batch_max_rows=200000,
+                    minute_history_batch_max_response_bytes=8 * 1024 * 1024 - 16384,
+                    minute_history_download_max_symbols=50)
         return response
     readonly.send_request = send
     readonly.result = {"status": "REQUESTED", "completion_confirmed": False}
@@ -69,3 +73,46 @@ def test_download_batch_keeps_shorter_original_deadline_instead_of_resetting_bud
     assert result["ok"] is True
     assert 1 < readonly.calls[-1][1] <= 2
     assert readonly.calls[-1][0]["read_expires_at_unix"] == request["read_expires_at_unix"]
+
+
+@pytest.mark.parametrize('size', [51, 137, 250, 500])
+def test_dynamic_read_is_forwarded_once_with_verified_expanded_source_capacity(size):
+    proxy, _redis, readonly, execution = make_proxy(capacity=1000)
+    params = parameters(METHODS[0])
+    params['symbols'] = ['%06d.SZ' % index for index in range(1, size + 1)]
+    request = FIXTURE.request(method=METHODS[0], params=params)
+    request['read_expires_at_unix'] = time.time() + 60
+    result = proxy.process_request(request)
+    assert result['ok'] is True
+    assert len(readonly.calls) == 2 and len(execution.calls) == 1
+    assert readonly.calls[-1][0]['params']['symbols'] == params['symbols']
+
+
+def test_legacy_source_and_row_budget_block_expanded_read_before_forward():
+    for capacity, size in ((50, 51), (1000, 665)):
+        proxy, _redis, readonly, _execution = make_proxy(capacity=capacity)
+        params = parameters(METHODS[0])
+        params['symbols'] = ['%06d.SZ' % index for index in range(1, size + 1)]
+        result = proxy.process_request(FIXTURE.request(method=METHODS[0], params=params))
+        assert result['ok'] is False
+        assert len(readonly.calls) == 1
+
+
+def test_expanded_read_source_does_not_expand_download_request_authority():
+    proxy, _redis, readonly, _execution = make_proxy(capacity=1000)
+    params = parameters(METHODS[1])
+    params['symbols'] = ['%06d.SZ' % index for index in range(1, 52)]
+    result = proxy.process_request(FIXTURE.request(method=METHODS[1], params=params))
+    assert result['ok'] is False and len(readonly.calls) == 1
+
+
+@pytest.mark.parametrize('field,bad', [
+    ('minute_history_batch_max_symbols', True),
+    ('minute_history_batch_max_rows', None),
+    ('minute_history_batch_max_response_bytes', 16 * 1024 * 1024),
+])
+def test_forged_expanded_capacity_is_rejected_before_forward(field, bad):
+    proxy, _redis, readonly, _execution = make_proxy(capacity=1000)
+    proxy._source_identity['readonly'][field] = bad
+    result = proxy.process_request(FIXTURE.request(method=METHODS[0], params=parameters(METHODS[0])))
+    assert result['ok'] is False and len(readonly.calls) == 1

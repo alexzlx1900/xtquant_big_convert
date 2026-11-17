@@ -12,6 +12,10 @@ from .readonly_shm import ShmBusyError, ShmProtocolError, ShmReadOnlyClient, val
 MARKET_RPC_METHODS = frozenset(("get_local_data", "get_market_data_ex", "download_history_data",
     "get_market_data_ex_batch", "download_history_data_batch", "subscribe_quote", "poll_quote_events", "unsubscribe_quote"))
 MINUTE_BATCH_CONTRACT = "SCOPED_MINUTE_HISTORY_BATCH_V1"
+MINUTE_BATCH_MAX_SYMBOLS = 1000
+MINUTE_BATCH_MAX_ROWS = 200000
+MINUTE_BATCH_MAX_RESPONSE_BYTES = 8 * 1024 * 1024 - 16384
+MINUTE_DOWNLOAD_MAX_SYMBOLS = 50
 
 
 READONLY_RPC_METHODS = frozenset((
@@ -108,6 +112,23 @@ class ShmReadOnlyRpcClient:
         return dict(capture_id=identity, trade_date=day, start_time=start, end_time=end, symbols=sorted(symbols))
 
     @staticmethod
+    def _validate_minute_batch_source(source, method, values):
+        download = method == "download_history_data_batch"
+        capacity = source.get("minute_history_download_max_symbols", source.get("minute_history_batch_max_symbols")) if download else source.get("minute_history_batch_max_symbols")
+        ceiling = MINUTE_DOWNLOAD_MAX_SYMBOLS if download else MINUTE_BATCH_MAX_SYMBOLS
+        if (source.get("minute_history_batch_contract") != MINUTE_BATCH_CONTRACT
+                or type(capacity) is not int or not 1 <= capacity <= ceiling
+                or len(values["symbols"]) > capacity):
+            raise ShmProtocolError("explicit minute batch contract and sufficient source capacity required")
+        if not download:
+            rows = source.get("minute_history_batch_max_rows", capacity * 301 if capacity <= 50 else None)
+            size = source.get("minute_history_batch_max_response_bytes", MINUTE_BATCH_MAX_RESPONSE_BYTES if capacity <= 50 else None)
+            if (type(rows) is not int or not 1 <= rows <= MINUTE_BATCH_MAX_ROWS
+                    or type(size) is not int or not 1 <= size <= MINUTE_BATCH_MAX_RESPONSE_BYTES
+                    or len(values["symbols"]) * values["count"] > rows):
+                raise ShmProtocolError("explicit minute batch row/response budgets required")
+
+    @staticmethod
     def _market_params(method, values):
         if method in ("get_market_data_ex_batch", "download_history_data_batch"):
             download = method == "download_history_data_batch"
@@ -115,12 +136,13 @@ class ShmReadOnlyRpcClient:
             allowed |= {"incrementally"} if download else {"count", "dividend_type", "fill_data", "subscribe"}
             symbols, start, end = values.get("symbols"), values.get("start_time"), values.get("end_time")
             length = 8 if download else 14
-            if (set(values) - allowed or not isinstance(symbols, list) or not 1 <= len(symbols) <= 50
+            ceiling = MINUTE_DOWNLOAD_MAX_SYMBOLS if download else MINUTE_BATCH_MAX_SYMBOLS
+            if (set(values) - allowed or not isinstance(symbols, list) or not 1 <= len(symbols) <= ceiling
                     or any(not isinstance(code, str) for code in symbols)
                     or len(set(symbols)) != len(symbols) or values.get("period") != "1m"
                     or any(not isinstance(v, str) or len(v) != length or not all("0" <= c <= "9" for c in v) for v in (start, end))
                     or start > end or start[:8] != end[:8]):
-                raise ShmProtocolError("minute batch requires 1-50 explicit symbols and one 1m day")
+                raise ShmProtocolError("minute batch requires explicit symbols within its resource capacity and one 1m day")
             for code in symbols:
                 ShmReadOnlyRpcClient._quote_params({"code": code})
             try:
@@ -132,6 +154,7 @@ class ShmReadOnlyRpcClient:
                 if type(values.get("incrementally")) not in (bool, type(None)):
                     raise ShmProtocolError("batch incrementally must be boolean or null")
             elif (type(values.get("count")) is not int or not 1 <= values["count"] <= 301
+                  or len(symbols) * values["count"] > MINUTE_BATCH_MAX_ROWS
                   or values.get("dividend_type") != "none" or values.get("fill_data") is not False
                   or values.get("subscribe") is not False):
                 raise ShmProtocolError("batch history requires count 1-301 and none/False/False")
@@ -218,6 +241,8 @@ class ShmReadOnlyRpcClient:
         self._capabilities = frozenset(capabilities)
         self._minute_batch_contract = result.get("minute_history_batch_contract")
         self._minute_batch_max_symbols = result.get("minute_history_batch_max_symbols")
+        self._minute_batch_budgets = {key: result[key] for key in (
+            "minute_history_batch_max_rows", "minute_history_batch_max_response_bytes", "minute_history_download_max_symbols") if key in result}
         return result
 
     def call(self, method, params=None, *, account_id=None, timeout_seconds=None,
@@ -240,9 +265,10 @@ class ShmReadOnlyRpcClient:
             values = self._market_params(method, values)
             if self._verified_identity is None or method not in self._capabilities:
                 raise ShmProtocolError("explicit identity handshake and advertised capability required")
-            if method.endswith("_batch") and (getattr(self, "_minute_batch_contract", None) != MINUTE_BATCH_CONTRACT
-                    or getattr(self, "_minute_batch_max_symbols", None) != 50):
-                raise ShmProtocolError("explicit minute batch contract required")
+            if method.endswith("_batch"):
+                self._validate_minute_batch_source({**getattr(self, "_minute_batch_budgets", {}),
+                    "minute_history_batch_contract": getattr(self, "_minute_batch_contract", None),
+                    "minute_history_batch_max_symbols": getattr(self, "_minute_batch_max_symbols", None)}, method, values)
         timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         self._validate_timeout(timeout)
         if not self._lock.acquire(False):
