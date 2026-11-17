@@ -103,8 +103,10 @@ def load_config_snapshot(path):
     return values
 
 
-def build_source(config_values=None):
+def build_source(config_values=None, isolated=False):
     """生成原接口内嵌源码；显式配置候选始终禁写，不读取磁盘回退。"""
+    if type(isolated) is not bool or (isolated and config_values is None):
+        raise ValueError("isolated candidate requires explicit configuration")
     sources = collect_package(PACKAGE_DIR, os.path.join(SRC_DIR, "src"))
     extra = {}
     for name in ("bigqmt_signal_trader_strategy.py",
@@ -116,6 +118,8 @@ def build_source(config_values=None):
     embedded = embed_block(sources, extra)
 
     template = TEMPLATE.replace("__EMBEDDED_SOURCES_BLOCK__", embedded)
+    if isolated:
+        template = template.replace("_ISOLATED_EMBEDDED = False", "_ISOLATED_EMBEDDED = True")
     if config_values is not None:
         account = config_values.get("BIGQMT_ACCOUNT_ID")
         account_type = config_values.get("BIGQMT_ACCOUNT_TYPE", "STOCK")
@@ -248,6 +252,63 @@ _ORIGINAL_IMPORT = _builtins.__import__
 _ORIGINAL_IMPORT_MODULE = _importlib.import_module
 _ORIGINAL_RELOAD = _importlib.reload
 _EMBEDDED_OWNER = object()
+_ISOLATED_EMBEDDED = False
+_EMBEDDED_MODULES = {} if _ISOLATED_EMBEDDED else sys.modules
+
+
+class _ScopedModules:
+    """Private view: writes and removals never touch the process registry."""
+    def __init__(self):
+        self.hidden = set()
+
+    def get(self, name, default=None):
+        if name in self.hidden:
+            return default
+        if _is_local_module(name):
+            return _EMBEDDED_MODULES.get(name, default)
+        return _EMBEDDED_MODULES.get(name, sys.modules.get(name, default))
+
+    def __getitem__(self, name):
+        missing = object()
+        value = self.get(name, missing)
+        if value is missing:
+            raise KeyError(name)
+        return value
+
+    def __setitem__(self, name, value):
+        self.hidden.discard(name)
+        _EMBEDDED_MODULES[name] = value
+
+    def __delitem__(self, name):
+        if name not in self:
+            raise KeyError(name)
+        _EMBEDDED_MODULES.pop(name, None)
+        self.hidden.add(name)
+
+    def __contains__(self, name):
+        marker = object()
+        return self.get(name, marker) is not marker
+
+    def __iter__(self):
+        names = set(_EMBEDDED_MODULES)
+        names.update(name for name in sys.modules if not _is_local_module(name))
+        return iter(names - self.hidden)
+
+    def __len__(self):
+        return sum(1 for unused in self)
+
+    def pop(self, name, default=None):
+        value = self.get(name, default)
+        if name in self:
+            del self[name]
+        return value
+
+
+_SCOPED_SYS = types.ModuleType("sys")
+_SCOPED_SYS.__dict__.update(sys.__dict__)
+_SCOPED_SYS.modules = _ScopedModules()
+_SCOPED_IMPORTLIB = types.ModuleType("importlib")
+_SCOPED_IMPORTLIB.__dict__.update(_importlib.__dict__)
 
 # QMT runs the strategy via exec, where __file__ may be absent; fall back safely.
 _STRATEGY_FILE_DIR = os.path.dirname(os.path.abspath(globals().get("__file__", os.getcwd())))
@@ -290,7 +351,7 @@ def _set_parent_attribute(name, module):
 
 
 def _load_local_module(name):
-    existing = sys.modules.get(name)
+    existing = _EMBEDDED_MODULES.get(name)
     if existing is not None:
         if getattr(existing, "__bigqmt_embedded_owner__", None) is not _EMBEDDED_OWNER:
             raise ImportError("foreign local module conflicts with embedded candidate: %s" % name)
@@ -311,7 +372,7 @@ def _load_local_module(name):
     module_builtins["__import__"] = _local_import
     module.__dict__["__builtins__"] = module_builtins
     module.__dict__["__bigqmt_load_local_module"] = _load_local_module
-    sys.modules[name] = module
+    _EMBEDDED_MODULES[name] = module
     # QMT native allowlist rejects the root package eager exports.
     if name == "bigqmt_signal_trader":
         return module
@@ -319,7 +380,7 @@ def _load_local_module(name):
         source = _base64.b64decode(_EMBEDDED_SOURCES[source_path])
         exec(compile(source, source_path, "exec"), module.__dict__)
     except Exception:
-        sys.modules.pop(name, None)
+        _EMBEDDED_MODULES.pop(name, None)
         raise
     _set_parent_attribute(name, module)
     return module
@@ -327,6 +388,8 @@ def _load_local_module(name):
 
 def _local_import(name, module_globals=None, module_locals=None, fromlist=(), level=0):
     absolute_name = _resolve_name(name, module_globals, level)
+    if _ISOLATED_EMBEDDED and absolute_name in ("sys", "importlib"):
+        return _SCOPED_SYS if absolute_name == "sys" else _SCOPED_IMPORTLIB
     if not _is_local_module(absolute_name):
         return _ORIGINAL_IMPORT(name, module_globals, module_locals, fromlist, level)
     module = _load_local_module(absolute_name)
@@ -354,12 +417,14 @@ def _local_reload(module):
 
 
 def _clear_local_modules():
-    for name in list(sys.modules):
+    for name in list(_EMBEDDED_MODULES):
         if _is_local_module(name):
-            sys.modules.pop(name, None)
+            _EMBEDDED_MODULES.pop(name, None)
 
 
 def _stop_previous_rpc_service():
+    if _ISOLATED_EMBEDDED:
+        return
     previous = sys.modules.get("bigqmt_signal_trader_strategy")
     reset = getattr(previous, "reset_app", None)
     if not callable(reset):
@@ -373,8 +438,12 @@ def _stop_previous_rpc_service():
 
 _stop_previous_rpc_service()
 _clear_local_modules()
-_importlib.import_module = _local_import_module
-_importlib.reload = _local_reload
+if _ISOLATED_EMBEDDED:
+    _SCOPED_IMPORTLIB.import_module = _local_import_module
+    _SCOPED_IMPORTLIB.reload = _local_reload
+else:
+    _importlib.import_module = _local_import_module
+    _importlib.reload = _local_reload
 print("[bigqmt_shell] all-in-one strategy embedded sources=%d" % len(_EMBEDDED_SOURCES))
 
 
