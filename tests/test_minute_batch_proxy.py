@@ -41,7 +41,7 @@ def make_proxy(advertise=True, capacity=50):
     return proxy, redis, readonly, execution
 
 
-@pytest.mark.parametrize("method,budget", [(METHODS[0], 15), (METHODS[1], 60)])
+@pytest.mark.parametrize("method,budget", [(METHODS[0], 60), (METHODS[1], 60)])
 def test_batch_is_forwarded_once_to_readonly_with_its_scoped_deadline(method, budget):
     proxy, _redis, readonly, execution = make_proxy()
     request = FIXTURE.request(method=method, params=parameters(method))
@@ -86,6 +86,32 @@ def test_dynamic_read_is_forwarded_once_with_verified_expanded_source_capacity(s
     assert result['ok'] is True
     assert len(readonly.calls) == 2 and len(execution.calls) == 1
     assert readonly.calls[-1][0]['params']['symbols'] == params['symbols']
+
+
+@pytest.mark.parametrize("budget,elapsed,ok", [(60, 17, True), (22, 17, True), (16, 17, False)])
+def test_dynamic_read_actual_proxy_preserves_caller_deadline_and_never_resends(monkeypatch, budget, elapsed, ok):
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    proxy, _redis, readonly, _execution = make_proxy(capacity=1000)
+    request = FIXTURE.request(method=METHODS[0], params=parameters(METHODS[0]))
+    request["read_expires_at_unix"] = clock[0] + budget
+    original = readonly.send_request
+
+    def delayed(request, timeout_seconds):
+        result = original(request, timeout_seconds)
+        clock[0] += elapsed
+        return result
+
+    readonly.send_request = delayed
+    result = proxy.process_request(request)
+    assert result["ok"] is ok
+    assert readonly.calls[-1][1] == budget
+    assert readonly.calls[-1][0]["read_expires_at_unix"] == request["read_expires_at_unix"]
+    assert len(readonly.calls) == 2
+    if not ok:
+        assert result["status"] == "UNKNOWN" and result["automatic_retry"] is False
+        assert proxy.process_request(request) == result
+        assert len(readonly.calls) == 2
 
 
 def test_legacy_source_and_row_budget_block_expanded_read_before_forward():

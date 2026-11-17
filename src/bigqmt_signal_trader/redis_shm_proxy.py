@@ -3690,13 +3690,13 @@ class RedisShmReadOnlyProxy:
                     expires = request.get("read_expires_at_unix", now + self.timeout_seconds)
                     if type(expires) not in (int, float) or not math.isfinite(expires) or expires <= now:
                         raise ShmProtocolError("read request is expired or has an invalid deadline")
-                    # 读取最多 15 秒、显式下载批次最多 60 秒；消费前已耗时
+                    # 单证券读取最多 15 秒、批量读取及显式下载最多 60 秒；消费前已耗时
                     # 仍由调用方原始绝对截止扣除，其他方法保留原预算。
                     request_budget = self.timeout_seconds
                     if "read_expires_at_unix" in request:
-                        if request["method"] in {"get_market_data_ex", "get_market_data_ex_batch"}:
+                        if request["method"] == "get_market_data_ex":
                             request_budget = 15.0
-                        elif request["method"] == "download_history_data_batch":
+                        elif request["method"] in {"get_market_data_ex_batch", "download_history_data_batch"}:
                             request_budget = 60.0
                     deadline = min(expires, now + request_budget)
                     if self.deadline_unix is not None:
