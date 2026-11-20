@@ -337,3 +337,24 @@ def test_cancelled_capture_never_releases_ownership_after_a_failed_terminal_read
         assert [event["sequence"] for event in clean_tail["events"]] == [32, 33]
         assert consumed.poll(cb)["ok"] is True
         assert consumed.subscribe(A, capture(capture_id="next-clean-capture"))["ok"] is True
+
+def test_managed_minute_after_confirmed_capture_preserves_scoped_tail_and_ownership(source):
+    value = source()
+    value.context.get_all_subscription = lambda: {
+        handle: code for code, handle in value.native_subscribes if handle not in value.native_cancels
+    }
+    sid = value.subscribe(A, capture())["data"]["subscription_id"]
+    value.callbacks[A]({A: tick()})
+    assert not value.subscribe(B, period="1m")["ok"]
+    assert value.cancel(sid)["ok"]
+    assert not value.subscribe(B, period="1m")["ok"]
+    tail = value.poll(sid)["data"]["events"]
+    assert len(tail) == 1
+    assert not value.subscribe(B)["ok"]
+    minute = value.subscribe(B, period="1m")["data"]
+    assert value.poll()["data"]["subscription_id"] == minute["subscription_id"]
+    assert not value.subscribe(B, capture(capture_id="next"))["ok"]
+    cancelled = value.cancel(minute["subscription_id"])["data"]
+    assert cancelled["subscriptions_before"] == cancelled["subscriptions_after"] == 0
+    assert value.poll(sid)["data"]["events"] == tail
+    assert value.poll()["data"]["active_subscription_count"] == 0

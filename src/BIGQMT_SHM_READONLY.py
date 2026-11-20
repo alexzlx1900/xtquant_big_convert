@@ -1016,7 +1016,8 @@ class ShmReadOnlyBridge:
                 return self._subscribe_capture(params)
             if self.capture_subscriptions and not self._capture_finished():
                 raise ReadOnlyRequestError("SUBSCRIPTION_ACTIVE", "legacy and scoped subscriptions cannot mix")
-            if self.capture_subscriptions:
+            # 已确认退订并交付尾部的逐笔记录仍可按原 SID 查询。1m 使用独立句柄，无逐笔回调。
+            if self.capture_subscriptions and params.get("period") != "1m":
                 raise ReadOnlyRequestError("CAPTURE_CONFLICT", "retained scoped records require a new explicit capture")
             if (set(params) - {"account_id", "code", "period", "result_type", "dividend_type"}
                     or not self._history_symbol(params.get("code"))
@@ -1069,7 +1070,7 @@ class ShmReadOnlyBridge:
         if method == "poll_quote_events":
             if "subscription_id" in params:
                 return self._poll_capture(params)
-            if self.capture_subscriptions:
+            if self.capture_subscriptions and self.subscription is None:
                 if not self._capture_finished():
                     raise ReadOnlyRequestError("SUBSCRIPTION_ACTIVE", "scoped events require an explicit subscription_id")
                 if set(params) - {"account_id", "after_sequence"} or type(params.get("after_sequence")) is not int or params["after_sequence"] != 0:
